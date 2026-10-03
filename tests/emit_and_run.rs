@@ -755,6 +755,29 @@ fn a_concern_class_reference_survives_the_copy_into_its_controller() {
         .assert_passes();
 }
 
+/// A controller declared `< ActionController::API` checks clean and
+/// loads: ingest records the one runtime controller base as its parent.
+#[test]
+fn an_action_controller_api_controller_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/api/pings_controller.rb",
+            "class Api::PingsController < ActionController::API\n  def show\n    render json: {id: params[:id].to_s, ip: request.remote_ip}\n  end\nend\n",
+        )
+        .edit(
+            "config/routes.rb",
+            "  resources :articles do",
+            "  get \"/api/pings/:id\", to: \"api/pings#show\"\n  resources :articles do",
+        )
+        .write(
+            "test/controllers/api/pings_controller_test.rb",
+            "require \"test_helper\"\n\nclass Api::PingsControllerTest < ActionDispatch::IntegrationTest\n  test \"an API controller renders json\" do\n    get \"/api/pings/7\"\n    assert_response :success\n    assert_equal \"7\", JSON.parse(response.body)[\"id\"]\n  end\nend\n",
+        )
+        // The emit names the file after the full class name.
+        .run_test("test/controllers/api_pings_controller_test.rb")
+        .assert_passes();
+}
+
 /// Integer serialization is not blindly String#to_i: nonnumeric labels
 /// must not alias an existing row zero. Invalid IDs still count toward the
 /// array finder's required cardinality, except when pagination excludes them.

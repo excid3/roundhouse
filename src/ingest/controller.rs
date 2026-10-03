@@ -97,6 +97,19 @@ pub fn ingest_controller(source: &[u8], file: &str) -> IngestResult<Option<Contr
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
+    // `ActionController::API` is Rails' controller base without the view
+    // layer. The emitted runtime has one controller base and the
+    // lowering and emitters already treat the two names alike, so the
+    // parent is recorded as that base: the analyzer then finds
+    // `request`, `params` and `render` on an API controller, and the
+    // emitted class has a superclass that exists.
+    let parent = parent.map(|p| {
+        if p.0.as_str() == "ActionController::API" {
+            ClassId(Symbol::from("ActionController::Base"))
+        } else {
+            p
+        }
+    });
 
     let mut comments = collect_comments(&result);
     drain_comments_before(&mut comments, class.location().start_offset());
