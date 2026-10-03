@@ -987,7 +987,15 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // to COUNT for strict targets; Relation.exists? forms moved to
     // connection.rb reopen. last_page? requires non-empty short page.
     // This probe sees the connection reopen's new self-sends.
-    const CEILING: usize = 1400;
+    // 2026-10-05 1400 -> 1409, +9, MEASURED (token_for.rb 30 -> 39):
+    // TokenFor.value_data and .id_data, and generate's `expires_in > 0`
+    // guard — reads of parameters (`id`, `value`, `expires_in`) this
+    // probe leaves as TyVars where token_for.rbs declares them; the
+    // full-context gate in runtime_src_integration counts no new sites.
+    // What it buys: an app's own `generates_token_for` declarations in
+    // Rails' token format, unexpiring ones included (Jumpstart Pro's
+    // email-change confirmation).
+    const CEILING: usize = 1409;
 
     assert!(
         all_untyped.len() <= CEILING,

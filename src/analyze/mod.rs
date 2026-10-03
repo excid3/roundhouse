@@ -6528,19 +6528,19 @@ fn register_has_secure_password(
 /// Register the methods `generates_token_for :purpose` (Rails 7.1)
 /// generates: `record.generate_token_for(:purpose)` answers a signed
 /// String, `Model.find_by_token_for(:purpose, token)` the record or
-/// nil, and the bang form the record (raising). One declaration is
-/// enough — the purpose is an argument, not part of the method name.
+/// nil, and the bang form the record (raising). One claimed
+/// declaration is enough — the purpose is an argument, not part of the
+/// method name.
 fn register_generates_token_for(
     body: &[ModelBodyItem],
     methods: &mut HashMap<Symbol, Ty>,
     class_methods: &mut HashMap<Symbol, Ty>,
     self_ty: &Ty,
 ) {
-    let declared = body.iter().any(|item| {
-        let ModelBodyItem::Unknown { expr, .. } = item else { return false };
-        matches!(&*expr.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "generates_token_for")
-    });
-    if !declared {
+    // Only the declarations lower::generates_token_for expands: typing
+    // one it leaves unclaimed would quiet `check` over a method nothing
+    // defines.
+    if crate::lower::generates_token_for::token_for_decls(body).is_empty() {
         return;
     }
     methods.entry(Symbol::from("generate_token_for")).or_insert(Ty::Str);

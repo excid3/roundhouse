@@ -2929,6 +2929,7 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 /// classifier doesn't claim, and most of what lands there really does
 /// belong to the module rather than to its includers.
 const CONCERN_MODEL_MACROS: &[&str] = &[
+    "generates_token_for",
     "has_one_attached",
     "has_rich_text",
     "has_secure_token",

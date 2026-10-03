@@ -640,6 +640,16 @@ fn report_unclaimed_unknowns(model: &Model) {
         {
             continue;
         }
+        // `generates_token_for :purpose, expires_in: D do … end` —
+        // claimed by lower::generates_token_for for the forms it
+        // expands; asked by span for the same reason.
+        if name == "generates_token_for"
+            && crate::lower::generates_token_for::token_for_decls(&model.body)
+                .iter()
+                .any(|d| d.span == expr.span)
+        {
+            continue;
+        }
         // `has_json :col, key: <literal>, …` — claimed by
         // lower::has_json's shared method synthesis. A declaration
         // carrying a schema entry that pass cannot expand (a
@@ -1078,6 +1088,10 @@ pub(crate) fn build_methods(
     // the fold appends, and the macro's assignment belongs ahead of a
     // callback the model declares below it (Rails' declaration order).
     crate::lower::secure_token::push_secure_token_methods(&mut methods, model);
+    // `generates_token_for` — the token methods, over the TokenFor
+    // runtime. After the user methods, so a model's own
+    // `generate_token_for` wins.
+    crate::lower::generates_token_for::push_token_for_methods(&mut methods, model);
     push_callback_methods(&mut methods, model);
 
     // File-grain catch-all (mirrors view_to_library's
