@@ -52,14 +52,18 @@
 //!
 //! ## Claimed and declined
 //!
-//! Claimed: a Symbol purpose, an optional `expires_in:` that folds to
-//! seconds, and an optional block without parameters. Anything else — a
-//! computed purpose or expiry, `expires_at:`, a block taking the record
-//! as a parameter — stays unclaimed and keeps its unsupported warning:
-//! half an expansion is worse than none. So does every declaration on
-//! a model whose key is not an Integer `id`. `token_for_decls` is the
-//! one place that decides, and `report_unclaimed_unknowns` asks `claims`
-//! by span.
+//! Claimed: a plain Symbol purpose (`:email_change`, not `:"a-b"`), an
+//! optional `expires_in:` that folds to seconds, and an optional block
+//! without parameters. Anything else — a computed expiry,
+//! `expires_at:`, a block taking the record as a parameter — stays
+//! unclaimed and keeps its unsupported warning: half an expansion is
+//! worse than none. The methods dispatch on a purpose passed at
+//! runtime, so it is all or nothing per model: a purpose whose LAST
+//! declaration is unclaimed (Rails keeps the last), a computed purpose,
+//! or a key that is not an Integer `id` declines the whole model, and
+//! every declaration on it warns.
+//! `token_for_decls` is the one place that decides, and
+//! `report_unclaimed_unknowns` asks `claims` by span.
 
 use super::model_to_library::fn_sig;
 use crate::dialect::{MethodDef, Model, ModelBodyItem};
@@ -78,29 +82,64 @@ pub(crate) struct TokenForDecl {
     pub(crate) span: Span,
 }
 
-/// The declarations `model` gets token methods for: the claimable ones,
-/// one per purpose. A later declaration of a purpose replaces an
-/// earlier one, as Rails' `token_definitions.merge` does. None at all
-/// for a model whose key is not an Integer `id`: the payload is
-/// `[id, …]` with the id as a JSON number, and Rails writes a uuid or
-/// other String key as a JSON string the runtime does not read back.
-pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
-    if !integer_id(model) {
-        return Vec::new();
-    }
-    let mut out: Vec<TokenForDecl> = Vec::new();
-    for d in parse_decls(&model.body) {
-        out.retain(|kept| kept.purpose != d.purpose);
-        out.push(d);
-    }
-    out
+/// One `generates_token_for` call, in source order: one this pass can
+/// expand, or one it cannot (and the purpose it names, when that is a
+/// literal Symbol).
+enum Declared {
+    Expandable(TokenForDecl),
+    Unsupported { purpose: Option<Symbol> },
 }
 
-/// Whether the declaration at `span` is one this pass handles, either
-/// expanded or superseded by a later declaration of its purpose, which
-/// is what Rails does with it too. `report_unclaimed_unknowns` asks.
+/// The declarations `model` gets token methods for, one per purpose:
+/// Rails keeps the LAST declaration of a purpose
+/// (`token_definitions.merge`). All or nothing. The methods dispatch on
+/// a purpose the caller passes at runtime, so a purpose whose last
+/// declaration this pass cannot expand would leave a typed
+/// `generate_token_for(:that)` raising in the emitted app. An earlier
+/// form must not stand in for it either. That declines the whole model,
+/// as do a computed purpose (it could replace any of them) and a key
+/// that is not an Integer `id`: the payload is `[id, …]` with the id as
+/// a JSON number, and Rails writes a uuid or other String key as a JSON
+/// string the runtime does not read back.
+pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
+    model_decls(model).unwrap_or_default()
+}
+
+/// Whether the declaration at `span` is one this pass handles: an
+/// expandable form on a model it does not decline, including one a
+/// later declaration supersedes, which Rails discards too.
+/// `report_unclaimed_unknowns` asks.
 pub(crate) fn claims(model: &Model, span: Span) -> bool {
-    integer_id(model) && parse_decls(&model.body).iter().any(|d| d.span == span)
+    model_decls(model).is_some()
+        && parse_decls(&model.body)
+            .iter()
+            .any(|d| matches!(d, Declared::Expandable(decl) if decl.span == span))
+}
+
+/// The last declaration of each purpose, or `None` when the model is
+/// declined whole (see `token_for_decls`).
+fn model_decls(model: &Model) -> Option<Vec<TokenForDecl>> {
+    if !integer_id(model) {
+        return None;
+    }
+    let mut last: Vec<TokenForDecl> = Vec::new();
+    let mut unsupported: Vec<Symbol> = Vec::new();
+    for d in parse_decls(&model.body) {
+        match d {
+            Declared::Expandable(decl) => {
+                last.retain(|kept| kept.purpose != decl.purpose);
+                unsupported.retain(|p| *p != decl.purpose);
+                last.push(decl);
+            }
+            Declared::Unsupported { purpose: Some(purpose) } => {
+                last.retain(|kept| kept.purpose != purpose);
+                unsupported.retain(|p| *p != purpose);
+                unsupported.push(purpose);
+            }
+            Declared::Unsupported { purpose: None } => return None,
+        }
+    }
+    unsupported.is_empty().then_some(last)
 }
 
 fn integer_id(model: &Model) -> bool {
@@ -108,8 +147,17 @@ fn integer_id(model: &Model) -> bool {
     named_id && model.attributes.fields.get(&Symbol::from("id")).is_none_or(|t| *t == Ty::Int)
 }
 
-/// Every declaration in `body` in a form this pass can expand.
-fn parse_decls(body: &[ModelBodyItem]) -> Vec<TokenForDecl> {
+/// A purpose the synthesized source can spell as a bare Symbol literal
+/// (`when :email_change`) and inside a method name. A quoted one
+/// (`:"share-link"`) would come out as other Ruby, so it stays unlowered.
+fn plain_purpose(purpose: &Symbol) -> bool {
+    let mut chars = purpose.as_str().chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every `generates_token_for` call in `body`, in source order.
+fn parse_decls(body: &[ModelBodyItem]) -> Vec<Declared> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
@@ -159,9 +207,12 @@ fn parse_decls(body: &[ModelBodyItem]) -> Vec<TokenForDecl> {
                 }
             },
         };
-        if let (true, Some(purpose)) = (ok, purpose) {
-            out.push(TokenForDecl { purpose, expires_in, value, span: expr.span });
-        }
+        out.push(match purpose {
+            Some(purpose) if ok && plain_purpose(&purpose) => {
+                Declared::Expandable(TokenForDecl { purpose, expires_in, value, span: expr.span })
+            }
+            purpose => Declared::Unsupported { purpose },
+        });
     }
     out
 }
