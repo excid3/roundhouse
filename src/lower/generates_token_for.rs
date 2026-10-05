@@ -56,8 +56,10 @@
 //! seconds, and an optional block without parameters. Anything else — a
 //! computed purpose or expiry, `expires_at:`, a block taking the record
 //! as a parameter — stays unclaimed and keeps its unsupported warning:
-//! half an expansion is worse than none. `token_for_decls` is the one
-//! place that decides, and `report_unclaimed_unknowns` asks it by span.
+//! half an expansion is worse than none. So does every declaration on
+//! a model whose key is not an Integer `id`. `token_for_decls` is the
+//! one place that decides, and `report_unclaimed_unknowns` asks `claims`
+//! by span.
 
 use super::model_to_library::fn_sig;
 use crate::dialect::{MethodDef, Model, ModelBodyItem};
@@ -76,8 +78,38 @@ pub(crate) struct TokenForDecl {
     pub(crate) span: Span,
 }
 
-/// The declarations in `body` this pass expands.
-pub(crate) fn token_for_decls(body: &[ModelBodyItem]) -> Vec<TokenForDecl> {
+/// The declarations `model` gets token methods for: the claimable ones,
+/// one per purpose. A later declaration of a purpose replaces an
+/// earlier one, as Rails' `token_definitions.merge` does. None at all
+/// for a model whose key is not an Integer `id`: the payload is
+/// `[id, …]` with the id as a JSON number, and Rails writes a uuid or
+/// other String key as a JSON string the runtime does not read back.
+pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
+    if !integer_id(model) {
+        return Vec::new();
+    }
+    let mut out: Vec<TokenForDecl> = Vec::new();
+    for d in parse_decls(&model.body) {
+        out.retain(|kept| kept.purpose != d.purpose);
+        out.push(d);
+    }
+    out
+}
+
+/// Whether the declaration at `span` is one this pass handles, either
+/// expanded or superseded by a later declaration of its purpose, which
+/// is what Rails does with it too. `report_unclaimed_unknowns` asks.
+pub(crate) fn claims(model: &Model, span: Span) -> bool {
+    integer_id(model) && parse_decls(&model.body).iter().any(|d| d.span == span)
+}
+
+fn integer_id(model: &Model) -> bool {
+    let named_id = model.primary_key.as_ref().is_none_or(|k| k.as_str() == "id");
+    named_id && model.attributes.fields.get(&Symbol::from("id")).is_none_or(|t| *t == Ty::Int)
+}
+
+/// Every declaration in `body` in a form this pass can expand.
+fn parse_decls(body: &[ModelBodyItem]) -> Vec<TokenForDecl> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
@@ -137,7 +169,7 @@ pub(crate) fn token_for_decls(body: &[ModelBodyItem]) -> Vec<TokenForDecl> {
 /// Synthesize the model's token methods from its declarations and
 /// append them to `methods`; a method the model writes itself wins.
 pub(crate) fn push_token_for_methods(methods: &mut Vec<MethodDef>, model: &Model) {
-    let decls = token_for_decls(&model.body);
+    let decls = token_for_decls(model);
     if decls.is_empty() {
         return;
     }

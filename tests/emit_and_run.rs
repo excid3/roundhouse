@@ -1649,6 +1649,23 @@ fn a_generated_token_finds_its_record_until_its_value_changes() {
         .assert_passes();
 }
 
+/// Declaring a purpose twice keeps the last declaration, as Rails'
+/// `token_definitions.merge` does: the token carries the second block's
+/// value, so changing the first block's value leaves it valid.
+#[test]
+fn a_redeclared_token_purpose_uses_the_last_declaration() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  generates_token_for :share do\n    title\n  end\n  generates_token_for :share, expires_in: 1.hour do\n    body\n  end\n",
+        )
+        .run_ruby(
+            "a = Article.create!(title: \"Hello\", body: \"Body text here\")\ntoken = a.generate_token_for(:share)\na.update!(title: \"Changed\")\nraise \"first declaration used\" unless Article.find_by_token_for(:share, token)&.id == a.id\na.update!(body: \"Other body text\")\nraise \"last declaration ignored\" unless Article.find_by_token_for(:share, token).nil?\nputs \"PASS redeclared\"",
+        )
+        .assert_passes();
+}
+
 /// The tokens are Rails' own: ones minted by Rails 8.1.4 for the same
 /// declarations verify here, with `SECRET_KEY_BASE=test-secret` and the
 /// clock at 2100-01-01 so the day's expiry is still ahead:

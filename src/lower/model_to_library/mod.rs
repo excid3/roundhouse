@@ -643,11 +643,7 @@ fn report_unclaimed_unknowns(model: &Model) {
         // `generates_token_for :purpose, expires_in: D do … end` —
         // claimed by lower::generates_token_for for the forms it
         // expands; asked by span for the same reason.
-        if name == "generates_token_for"
-            && crate::lower::generates_token_for::token_for_decls(&model.body)
-                .iter()
-                .any(|d| d.span == expr.span)
-        {
+        if name == "generates_token_for" && crate::lower::generates_token_for::claims(model, expr.span) {
             continue;
         }
         // `has_json :col, key: <literal>, …` — claimed by
