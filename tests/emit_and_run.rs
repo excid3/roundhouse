@@ -1625,14 +1625,10 @@ fn a_keyword_bundle_reaches_a_keyword_callee_from_an_included_concern() {
         .assert_passes();
 }
 
-/// `generates_token_for :purpose, expires_in: D do <value> end` (Rails
-/// 7.1), synthesized over `ActiveRecord::TokenFor`: a token finds its
-/// record, stops verifying when the block's value changes (Rails'
-/// contract), rejects tampering and a wrong purpose, the bang form
-/// raises InvalidSignature as Rails' does, and the declaration is
-/// honored from a concern's `included do` too.
-#[test]
-fn a_generated_token_finds_its_record_until_its_value_changes() {
+/// real-blog's Article with two token purposes declared from a concern's
+/// `included do`: `:share` (a day's expiry, the title as its value) and
+/// `:plain` (the id alone, never expiring).
+fn article_with_shareable_tokens() -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .write(
             "app/models/concerns/shareable.rb",
@@ -1643,6 +1639,17 @@ fn a_generated_token_finds_its_record_until_its_value_changes() {
             "class Article < ApplicationRecord\n",
             "class Article < ApplicationRecord\n  include Shareable\n",
         )
+}
+
+/// `generates_token_for :purpose, expires_in: D do <value> end` (Rails
+/// 7.1), synthesized over `ActiveRecord::TokenFor`: a token finds its
+/// record, stops verifying when the block's value changes (Rails'
+/// contract), rejects tampering and a wrong purpose, the bang form
+/// raises InvalidSignature as Rails' does, and the declaration is
+/// honored from a concern's `included do` too.
+#[test]
+fn a_generated_token_finds_its_record_until_its_value_changes() {
+    article_with_shareable_tokens()
         .run_ruby(
             "a = Article.create!(title: \"Hello\", body: \"Body text here\")\ntoken = a.generate_token_for(:share)\nraise \"find\" unless Article.find_by_token_for(:share, token)&.id == a.id\nraise \"bang\" unless Article.find_by_token_for!(:share, token).id == a.id\nraise \"purpose\" unless Article.find_by_token_for(:plain, token).nil?\nraise \"tamper\" unless Article.find_by_token_for(:share, token + \"x\").nil?\nplain = a.generate_token_for(:plain)\nraise \"plain\" unless Article.find_by_token_for(:plain, plain)&.id == a.id\na.update!(title: \"Changed\")\nraise \"stale\" unless Article.find_by_token_for(:share, token).nil?\nraise \"plain survives\" unless Article.find_by_token_for(:plain, plain)&.id == a.id\nbegin\n  Article.find_by_token_for!(:share, token)\n  raise \"no raise\"\nrescue ActiveSupport::MessageVerifier::InvalidSignature\nend\nputs \"PASS token_for\"",
         )
@@ -1679,16 +1686,7 @@ fn a_redeclared_token_purpose_uses_the_last_declaration() {
 /// all Rails' choices.
 #[test]
 fn a_generated_token_minted_by_rails_verifies() {
-    emit_and_run::real_blog()
-        .write(
-            "app/models/concerns/shareable.rb",
-            "module Shareable\n  extend ActiveSupport::Concern\n\n  included do\n    generates_token_for :share, expires_in: 1.day do\n      title\n    end\n    generates_token_for :plain\n  end\nend\n",
-        )
-        .edit(
-            "app/models/article.rb",
-            "class Article < ApplicationRecord\n",
-            "class Article < ApplicationRecord\n  include Shareable\n",
-        )
+    article_with_shareable_tokens()
         .run_ruby(
             r#"
 Rails.secret_key_base = "test-secret"

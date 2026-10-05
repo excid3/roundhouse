@@ -29,15 +29,17 @@
 //!
 //! Ruby source, re-ingested — the same route `ingest::current_attributes`
 //! takes — because the block body is an instance-level expression the
-//! finder has to evaluate on the record it found. Each purpose gets a
-//! payload method (`__token_data_for_email_change`), which
-//! `generate_token_for` calls on `self` and the finder on `record`:
+//! finder has to evaluate on the record it found. Two dispatchers on
+//! the purpose carry everything per-declaration: `__token_data(purpose)`,
+//! the payload the record produces now, which `generate_token_for` signs
+//! and the finders compare against; and `__token_purpose(purpose)`, the
+//! purpose string the finders verify under:
 //!
 //! ```ruby
-//! def generate_token_for(purpose)
+//! def __token_data(purpose)
 //!   case purpose
 //!   when :email_change
-//!     ActiveRecord::TokenFor.generate(__token_data_for_email_change, "User\\nemail_change\\n3600", 3600)
+//!     ActiveRecord::TokenFor.value_data(id, (unconfirmed_email)&.to_s)
 //!   else
 //!     raise "unknown token purpose"
 //!   end
@@ -82,14 +84,6 @@ pub(crate) struct TokenForDecl {
     pub(crate) span: Span,
 }
 
-/// One `generates_token_for` call, in source order: one this pass can
-/// expand, or one it cannot (and the purpose it names, when that is a
-/// literal Symbol).
-enum Declared {
-    Expandable(TokenForDecl),
-    Unsupported { purpose: Option<Symbol> },
-}
-
 /// The declarations `model` gets token methods for, one per purpose:
 /// Rails keeps the LAST declaration of a purpose
 /// (`token_definitions.merge`). All or nothing. The methods dispatch on
@@ -111,9 +105,7 @@ pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
 /// `report_unclaimed_unknowns` asks.
 pub(crate) fn claims(model: &Model, span: Span) -> bool {
     model_decls(model).is_some()
-        && parse_decls(&model.body)
-            .iter()
-            .any(|d| matches!(d, Declared::Expandable(decl) if decl.span == span))
+        && parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))
 }
 
 /// The last declaration of each purpose, or `None` when the model is
@@ -122,24 +114,16 @@ fn model_decls(model: &Model) -> Option<Vec<TokenForDecl>> {
     if !integer_id(model) {
         return None;
     }
-    let mut last: Vec<TokenForDecl> = Vec::new();
-    let mut unsupported: Vec<Symbol> = Vec::new();
+    let mut last: Vec<(Symbol, Option<TokenForDecl>)> = Vec::new();
     for d in parse_decls(&model.body) {
-        match d {
-            Declared::Expandable(decl) => {
-                last.retain(|kept| kept.purpose != decl.purpose);
-                unsupported.retain(|p| *p != decl.purpose);
-                last.push(decl);
-            }
-            Declared::Unsupported { purpose: Some(purpose) } => {
-                last.retain(|kept| kept.purpose != purpose);
-                unsupported.retain(|p| *p != purpose);
-                unsupported.push(purpose);
-            }
-            Declared::Unsupported { purpose: None } => return None,
-        }
+        let (purpose, decl) = match d {
+            Ok(decl) => (decl.purpose.clone(), Some(decl)),
+            Err(purpose) => (purpose?, None),
+        };
+        last.retain(|(p, _)| *p != purpose);
+        last.push((purpose, decl));
     }
-    unsupported.is_empty().then_some(last)
+    last.into_iter().map(|(_, decl)| decl).collect()
 }
 
 fn integer_id(model: &Model) -> bool {
@@ -148,16 +132,18 @@ fn integer_id(model: &Model) -> bool {
 }
 
 /// A purpose the synthesized source can spell as a bare Symbol literal
-/// (`when :email_change`) and inside a method name. A quoted one
-/// (`:"share-link"`) would come out as other Ruby, so it stays unlowered.
+/// (`when :email_change`). A quoted one (`:"share-link"`) would come out
+/// as other Ruby, so it stays unlowered.
 fn plain_purpose(purpose: &Symbol) -> bool {
     let mut chars = purpose.as_str().chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Every `generates_token_for` call in `body`, in source order.
-fn parse_decls(body: &[ModelBodyItem]) -> Vec<Declared> {
+/// Every `generates_token_for` call in `body`, in source order: the
+/// declaration when this pass can expand it, otherwise the purpose it
+/// names (`None` for a computed one).
+fn parse_decls(body: &[ModelBodyItem]) -> Vec<Result<TokenForDecl, Option<Symbol>>> {
     let mut out = Vec::new();
     for item in body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
@@ -209,9 +195,9 @@ fn parse_decls(body: &[ModelBodyItem]) -> Vec<Declared> {
         };
         out.push(match purpose {
             Some(purpose) if ok && plain_purpose(&purpose) => {
-                Declared::Expandable(TokenForDecl { purpose, expires_in, value, span: expr.span })
+                Ok(TokenForDecl { purpose, expires_in, value, span: expr.span })
             }
-            purpose => Declared::Unsupported { purpose },
+            purpose => Err(purpose),
         });
     }
     out
@@ -259,20 +245,12 @@ pub(crate) fn push_token_for_methods(methods: &mut Vec<MethodDef>, model: &Model
                 vec![(Symbol::from("purpose"), Ty::Sym), (Symbol::from("token"), Ty::Str)],
                 record.clone(),
             )),
-            "__verified_token_data" => Some(fn_sig(
-                vec![(Symbol::from("purpose"), Ty::Sym), (Symbol::from("token"), Ty::Str)],
-                Ty::Str,
-            )),
-            "__token_data_matches?" => Some(fn_sig(
-                vec![(Symbol::from("purpose"), Ty::Sym), (Symbol::from("data"), Ty::Str)],
-                Ty::Bool,
-            )),
-            _ => Some(fn_sig(vec![], Ty::Str)),
+            "__token_purpose" => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
+            _ => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
         };
-        let own = model.body.iter().any(|item| {
-            matches!(item, ModelBodyItem::Method { method, .. }
-                if method.name == m.name && method.receiver == m.receiver)
-        }) || methods.iter().any(|x| x.name == m.name && x.receiver == m.receiver);
+        // `methods` already holds the model's own (push_user_methods
+        // runs first), and one it writes itself wins.
+        let own = methods.iter().any(|x| x.name == m.name && x.receiver == m.receiver);
         if !own {
             methods.push(m);
         }
@@ -327,72 +305,57 @@ fn full_purpose(model: &Model, d: &TokenForDecl) -> String {
     format!("{}\\\\n{}\\\\n{expires}", model.name.0.as_str(), d.purpose.as_str())
 }
 
-fn data_method(purpose: &Symbol) -> String {
-    format!("__token_data_for_{}", purpose.as_str())
-}
-
 fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
     use crate::emit::ruby::emit_expr;
     let class = model.name.0.as_str();
-    let mut body = String::new();
+    let case = |arms: String| format!("    case purpose\n{arms}    else\n      raise \"unknown token purpose\"\n    end\n");
+    let arms = |arm: &dyn Fn(&TokenForDecl) -> String| {
+        decls.iter().map(|d| format!("    when :{}\n      {}\n", d.purpose.as_str(), arm(d))).collect::<String>()
+    };
 
-    // One payload method per purpose: `[id]`, or `[id, value]` with the
-    // block's value in its String form.
-    for d in decls {
-        let data = match &d.value {
-            Some(e) => format!(
-                "value = ({})\n    ActiveRecord::TokenFor.value_data(id, value.nil? ? nil : value.to_s)",
-                emit_expr(e)
-            ),
-            None => "ActiveRecord::TokenFor.id_data(id)".to_string(),
-        };
-        body.push_str(&format!("  def {}\n    {data}\n  end\n\n", data_method(&d.purpose)));
-    }
+    // The payload for `purpose` on this record: `[id]`, or `[id, value]`
+    // with the block's value in its String form.
+    let data = case(arms(&|d| match &d.value {
+        Some(e) => format!("ActiveRecord::TokenFor.value_data(id, ({})&.to_s)", emit_expr(e)),
+        None => "ActiveRecord::TokenFor.id_data(id)".to_string(),
+    }));
+    let purposes = case(arms(&|d| format!("\"{}\"", full_purpose(model, d))));
+    let generate = case(arms(&|d| {
+        format!("ActiveRecord::TokenFor.generate(data, {class}.__token_purpose(purpose), {})", d.expires_in)
+    }));
 
-    body.push_str("  def generate_token_for(purpose)\n    case purpose\n");
-    for d in decls {
-        body.push_str(&format!(
-            "    when :{p}\n      ActiveRecord::TokenFor.generate({dm}, \"{purpose}\", {expires})\n",
-            p = d.purpose.as_str(),
-            dm = data_method(&d.purpose),
-            purpose = full_purpose(model, d),
-            expires = d.expires_in,
-        ));
-    }
-    body.push_str("    else\n      raise \"unknown token purpose\"\n    end\n  end\n\n");
+    // Rails: the finder answers nil for a token that does not verify,
+    // names no row, or whose payload the record no longer produces. The
+    // bang form raises InvalidSignature for the first and last, and
+    // `find`'s RecordNotFound for a row that is gone.
+    format!(
+        "class {class}
+  def __token_data(purpose)
+{data}  end
 
-    // The verified payload for `purpose`, "" for every rejection.
-    body.push_str("  def self.__verified_token_data(purpose, token)\n    data = \"\"\n    case purpose\n");
-    for d in decls {
-        body.push_str(&format!(
-            "    when :{p}\n      data = ActiveRecord::TokenFor.verified_data(token, \"{purpose}\")\n",
-            p = d.purpose.as_str(),
-            purpose = full_purpose(model, d),
-        ));
-    }
-    body.push_str("    else\n      raise \"unknown token purpose\"\n    end\n    data\n  end\n\n");
+  def self.__token_purpose(purpose)
+{purposes}  end
 
-    // Whether `record` still produces the payload the token carries.
-    body.push_str("  def __token_data_matches?(purpose, data)\n    current = \"\"\n    case purpose\n");
-    for d in decls {
-        body.push_str(&format!(
-            "    when :{p}\n      current = {dm}\n",
-            p = d.purpose.as_str(),
-            dm = data_method(&d.purpose),
-        ));
-    }
-    body.push_str("    end\n    current == data\n  end\n\n");
+  def generate_token_for(purpose)
+    data = __token_data(purpose)
+{generate}  end
 
-    body.push_str(&format!(
-        "  def self.find_by_token_for(purpose, token)\n    data = {class}.__verified_token_data(purpose, token)\n    return nil if data == \"\"\n    record = {class}.find_by(id: ActiveRecord::TokenFor.data_id(data))\n    return nil if record.nil?\n    record.__token_data_matches?(purpose, data) ? record : nil\n  end\n\n"
-    ));
+  def self.find_by_token_for(purpose, token)
+    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_purpose(purpose))
+    return nil if data == \"\"
+    record = {class}.find_by(id: ActiveRecord::TokenFor.data_id(data))
+    return nil if record.nil?
+    record.__token_data(purpose) == data ? record : nil
+  end
 
-    // Rails: a token that does not verify, or whose value no longer
-    // matches, is InvalidSignature; one naming a row that is gone is
-    // `find`'s RecordNotFound.
-    body.push_str(&format!(
-        "  def self.find_by_token_for!(purpose, token)\n    data = {class}.__verified_token_data(purpose, token)\n    raise ActiveSupport::MessageVerifier::InvalidSignature if data == \"\"\n    record = {class}.find(ActiveRecord::TokenFor.data_id(data))\n    raise ActiveSupport::MessageVerifier::InvalidSignature unless record.__token_data_matches?(purpose, data)\n    record\n  end\n"
-    ));
-
-    format!("class {class}\n{body}end\n")
+  def self.find_by_token_for!(purpose, token)
+    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_purpose(purpose))
+    raise ActiveSupport::MessageVerifier::InvalidSignature if data == \"\"
+    record = {class}.find(ActiveRecord::TokenFor.data_id(data))
+    raise ActiveSupport::MessageVerifier::InvalidSignature unless record.__token_data(purpose) == data
+    record
+  end
+end
+"
+    )
 }
