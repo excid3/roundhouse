@@ -995,7 +995,12 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // What it buys: an app's own `generates_token_for` declarations in
     // Rails' token format, unexpiring ones included (Jumpstart Pro's
     // email-change confirmation).
-    const CEILING: usize = 1409;
+    // 2026-10-05 1409 -> 1415, +6, MEASURED (token_for.rb 39 -> 45):
+    // TokenFor.int_value_data and .bool_value_data, the same parameter
+    // reads (`id`, `value`) as value_data. What they buy: a token whose
+    // block value is an Integer or a boolean carries the JSON Rails
+    // writes, so it verifies across to Rails.
+    const CEILING: usize = 1415;
 
     assert!(
         all_untyped.len() <= CEILING,

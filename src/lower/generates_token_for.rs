@@ -46,11 +46,11 @@
 //! end
 //! ```
 //!
-//! A block value goes into the payload as its String form (nil as
-//! `null`). For a String value — the corpus' case — that is Rails'
-//! JSON; a number or a Time would be quoted where Rails writes it
-//! bare, so such a token verifies in the emitted app but not across
-//! to Rails.
+//! A block value goes into the payload as the JSON Rails' `as_json`
+//! writes for a String, an Integer or a boolean (nil as `null`), chosen
+//! by the type the analyzer gave the block. Any other value goes in as
+//! its String form, so a Time or a Float token verifies in the emitted
+//! app but not across to Rails.
 //!
 //! ## Claimed and declined
 //!
@@ -305,6 +305,26 @@ fn full_purpose(model: &Model, d: &TokenForDecl) -> String {
     format!("{}\\\\n{}\\\\n{expires}", model.name.0.as_str(), d.purpose.as_str())
 }
 
+/// The `TokenFor` call that writes `[id, value]` for a block value
+/// `src`, chosen by the type the analyzer gave it, so the JSON is what
+/// Rails' `as_json` writes: a String or an Integer or a boolean, each
+/// possibly nil. Any other value goes over as its String form, which
+/// verifies in the emitted app but not across to Rails (a Time or a
+/// Float would need Rails' own `as_json` formatting).
+fn value_payload(e: &Expr, src: &str) -> String {
+    let non_nil: Vec<&Ty> = match &e.ty {
+        Some(Ty::Union { variants }) => variants.iter().filter(|t| **t != Ty::Nil).collect(),
+        Some(t) => vec![t],
+        None => Vec::new(),
+    };
+    match non_nil.as_slice() {
+        [Ty::Str] => format!("value_data(id, {src})"),
+        [Ty::Int] => format!("int_value_data(id, {src})"),
+        [Ty::Bool] => format!("bool_value_data(id, {src})"),
+        _ => format!("value_data(id, ({src})&.to_s)"),
+    }
+}
+
 fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
     use crate::emit::ruby::emit_expr;
     let class = model.name.0.as_str();
@@ -316,7 +336,7 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
     // The payload for `purpose` on this record: `[id]`, or `[id, value]`
     // with the block's value in its String form.
     let data = case(arms(&|d| match &d.value {
-        Some(e) => format!("ActiveRecord::TokenFor.value_data(id, ({})&.to_s)", emit_expr(e)),
+        Some(e) => format!("ActiveRecord::TokenFor.{}", value_payload(e, &emit_expr(e))),
         None => "ActiveRecord::TokenFor.id_data(id)".to_string(),
     }));
     let purposes = case(arms(&|d| format!("\"{}\"", full_purpose(model, d))));

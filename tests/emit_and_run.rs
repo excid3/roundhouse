@@ -1656,6 +1656,37 @@ fn a_generated_token_finds_its_record_until_its_value_changes() {
         .assert_passes();
 }
 
+/// A block value goes into the payload as the JSON Rails' `as_json`
+/// writes for its type: an Integer is a number (`[1,1]`) and a boolean
+/// is `true`/`false` (`[1,false]`), not a quoted string. Both tokens
+/// were minted by Rails 8.1.4 (`SECRET_KEY_BASE=test-secret`) and are
+/// unexpiring, so the emitted app must mint the same bytes and accept
+/// Rails' own.
+#[test]
+fn a_non_string_token_value_is_the_json_rails_writes() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  generates_token_for :counted do\n    id\n  end\n  generates_token_for :flagged do\n    title.nil?\n  end\n",
+        )
+        .run_ruby(
+            r#"
+Rails.secret_key_base = "test-secret"
+counted = "eyJfcmFpbHMiOnsiZGF0YSI6WzEsMV0sInB1ciI6IkFydGljbGVcbmNvdW50ZWRcbiJ9fQ==--d02f8c1104bf97b778253f734d7156c48eb98e88"
+flagged = "eyJfcmFpbHMiOnsiZGF0YSI6WzEsZmFsc2VdLCJwdXIiOiJBcnRpY2xlXG5mbGFnZ2VkXG4ifX0=--fb27c1ecd775cb15bc0966020341a5c07c7ab57e"
+a = Article.create!(title: "Hello", body: "Body text here")
+raise "expected the first row" unless a.id == 1
+raise "integer value differs from rails" unless a.generate_token_for(:counted) == counted
+raise "boolean value differs from rails" unless a.generate_token_for(:flagged) == flagged
+raise "rails integer token rejected" unless Article.find_by_token_for(:counted, counted)&.id == 1
+raise "rails boolean token rejected" unless Article.find_by_token_for(:flagged, flagged)&.id == 1
+puts "PASS typed values"
+"#,
+        )
+        .assert_passes();
+}
+
 /// Declaring a purpose twice keeps the last declaration, as Rails'
 /// `token_definitions.merge` does: the token carries the second block's
 /// value, so changing the first block's value leaves it valid.

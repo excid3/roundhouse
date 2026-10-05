@@ -68,11 +68,27 @@ module ActiveRecord
     end
 
     # A `generates_token_for` block's payload: `[id, value]` as JSON,
-    # nil being `null`. The lowering hands the value over as its
-    # String form (src/lower/generates_token_for.rs).
+    # nil being `null`, for a String value. The lowering picks this or
+    # one of the two below by the block's type, and hands any other
+    # value over as its String form (src/lower/generates_token_for.rs).
     def self.value_data(id, value)
       json = "null"
       json = ActionController::MessageVerifier.json_string(value) unless value.nil?
+      "[" + id.to_s + "," + json + "]"
+    end
+
+    # The same for a block whose value is an Integer: a JSON number,
+    # `[id, 5]`, which is what Rails' `as_json` writes.
+    def self.int_value_data(id, value)
+      json = "null"
+      json = value.to_s unless value.nil?
+      "[" + id.to_s + "," + json + "]"
+    end
+
+    # And for a true/false value: `[id, true]`.
+    def self.bool_value_data(id, value)
+      json = "null"
+      json = value ? "true" : "false" unless value.nil?
       "[" + id.to_s + "," + json + "]"
     end
 
