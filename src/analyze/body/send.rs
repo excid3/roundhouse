@@ -942,8 +942,35 @@ impl<'a> BodyTyper<'a> {
                 // The Date calendar intrinsics `time_calendar` lowers to.
                 if id.0.as_str() == "ActiveSupport" {
                     match method.as_str() {
-                        "current_date" | "date_beginning_of_month" | "date_end_of_month" => return Ty::Date,
-                        "date_beginning_of_day" | "date_end_of_day" => return Ty::Time,
+                        "current_date"
+                        | "date_current"
+                        | "date_from_civil"
+                        | "date_days_since"
+                        | "date_days_ago"
+                        | "date_yesterday"
+                        | "date_tomorrow"
+                        | "date_weeks_since"
+                        | "date_weeks_ago"
+                        | "date_months_since"
+                        | "date_months_ago"
+                        | "date_years_since"
+                        | "date_years_ago"
+                        | "date_beginning_of_week"
+                        | "date_end_of_week"
+                        | "date_next_week"
+                        | "date_prev_week"
+                        | "date_beginning_of_month"
+                        | "date_end_of_month"
+                        | "date_beginning_of_year"
+                        | "date_end_of_year" => return Ty::Date,
+                        "date_at_midnight"
+                        | "date_beginning_of_day"
+                        | "date_end_of_day" => return Ty::Time,
+                        "date_today?"
+                        | "date_yesterday?"
+                        | "date_tomorrow?"
+                        | "date_past?"
+                        | "date_future?" => return Ty::Bool,
                         _ => {}
                     }
                 }
@@ -1600,6 +1627,12 @@ impl<'a> BodyTyper<'a> {
             // has no user-defined ancestors in this corpus.
             Some(Ty::Time) => time_method(method).unwrap_or_else(unknown),
             Some(Ty::Date) => date_method(method, args).unwrap_or_else(unknown),
+            // `Integer#in_time_zone` lowers only for ≤1 arg (invariant 6).
+            Some(Ty::Int)
+                if method.as_str() == "in_time_zone" && args.len() > 1 =>
+            {
+                unknown()
+            }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method),
             Some(Ty::Bool) => bool_method(method),
@@ -1929,9 +1962,11 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
         "parse" => vec![Ty::Str, Ty::Bool, numeric],
         "strptime" => vec![Ty::Str, Ty::Str, numeric],
         "iso8601" => vec![Ty::Str, numeric],
+        // `Date.today` is Ruby stdlib (optional start-day). Rails'
+        // `Date.current` / `yesterday` / `tomorrow` take no arguments.
         "today" => vec![numeric],
-        // ActiveSupport's zone-aware today; lowered by `time_calendar`.
-        "current" => vec![],
+        // ActiveSupport's zone-aware today / neighbors; lowered by `time_calendar`.
+        "current" | "yesterday" | "tomorrow" => vec![],
         _ => return None,
     };
     let accepts = |actual: Option<&Ty>, expected: &Ty| match actual {
@@ -1947,20 +1982,100 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
 }
 
 fn date_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
+    let date = || Ty::Date;
+    let time = || Ty::Time;
+    // Known Integer (or not-yet-typed). Untyped is excluded for day-shift
+    // results: Spinel Date has no `+`/`-`, and lowering only grounds Int/Var.
+    let int_shift = |a: Option<&Ty>| {
+        a.is_none_or(|t| matches!(t, Ty::Int | Ty::Var { .. }))
+    };
+    // `ActiveSupport.in_time_zone` takes a String?/Symbol zone (runtime
+    // `to_s`); reject known non-zone types such as `TimeZoneData`.
+    let zone_arg = |a: Option<&crate::expr::Expr>| {
+        a.is_none_or(|e| {
+            matches!(
+                e.ty.as_ref(),
+                None | Some(Ty::Str | Ty::Sym | Ty::Nil | Ty::Var { .. } | Ty::Untyped)
+            )
+        })
+    };
+    // Arity must match `lower::time_calendar::rewrite_date_value` — typing
+    // a send the lowerer leaves alone is invariant 6 (silent NoMethodError).
+    let zero = args.is_empty();
+    let at_most_one_int = args.len() <= 1 && args.first().map(|a| int_shift(a.ty.as_ref())).unwrap_or(true);
     Some(match method.as_str() {
-        ">>" | "<<" if args.len() == 1
-            && args[0].ty.as_ref().is_none_or(|t| matches!(t, Ty::Int | Ty::Var { .. })) => Ty::Date,
-        "to_date" => Ty::Date,
-        "to_time" => Ty::Time,
-        // ActiveSupport's calendar extensions, lowered by `time_calendar`.
-        "beginning_of_month" | "at_beginning_of_month" | "end_of_month" | "at_end_of_month"
-            if args.is_empty() => Ty::Date,
-        "beginning_of_day" | "at_beginning_of_day" | "midnight" | "at_midnight" | "end_of_day"
-        | "at_end_of_day" if args.is_empty() => Ty::Time,
-        "year" | "month" | "mon" | "day" | "mday" | "wday" | "yday" => Ty::Int,
+        // Stdlib month shift stays on Date (Spinel implements >> / <<).
+        // `Date >> Untyped` stays gradual — same bar as `+` (operand may
+        // not be an Integer; claiming Date would green-light Date-only
+        // follow-ups after a send that can TypeError).
+        ">>" | "<<" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        // `Date + Integer` → Date. `Date + Untyped` stays gradual: the
+        // operand might not be an Integer day shift, and Spinel has no `+`.
+        "+" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        // `Date - Integer` → Date; `Date - Date` → a Rational day count
+        // we do not model structurally (gradual, like Time − Time).
+        // `Date - Untyped` stays gradual for the same reason as `+`.
+        "-" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Date) | Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        "to_date" if zero => date(),
+        // ActiveSupport calendar that preserves a date-only value.
+        "yesterday" | "tomorrow" | "next_week" | "prev_week" | "last_week"
+        | "last_month" | "last_year"
+        | "beginning_of_week" | "end_of_week" | "at_beginning_of_week" | "at_end_of_week"
+        | "beginning_of_month" | "end_of_month" | "at_beginning_of_month" | "at_end_of_month"
+        | "beginning_of_year" | "end_of_year" | "at_beginning_of_year" | "at_end_of_year"
+            if zero =>
+        {
+            date()
+        }
+        "prev_day" | "next_day" | "days_ago" | "days_since" | "weeks_ago" | "weeks_since"
+        | "next_month" | "prev_month" | "months_ago" | "months_since"
+        | "next_year" | "prev_year" | "years_ago" | "years_since"
+            if at_most_one_int =>
+        {
+            date()
+        }
+        // Date → time-of-day / zone conversions (Rails returns TimeWithZone).
+        // `to_fs` / `to_formatted_s` / `after?` / `before?` stay unmodeled
+        // until runtime + lowering exist (invariant 6).
+        "to_time" | "beginning_of_day" | "end_of_day" | "midnight" | "at_midnight"
+        | "at_beginning_of_day" | "at_end_of_day" | "noon" | "at_noon" | "middle_of_day"
+        | "at_middle_of_day" if zero => time(),
+        "in_time_zone" if args.len() <= 1 && zone_arg(args.first()) => time(),
+        // `all_day` is a Time range (day edges); month/week/year stay Date.
+        "all_day" if zero => Ty::Class {
+            id: ClassId(Symbol::from("Range")),
+            args: vec![time()],
+        },
+        "all_week" | "all_month" | "all_year" if zero => Ty::Class {
+            id: ClassId(Symbol::from("Range")),
+            args: vec![date()],
+        },
+        "year" | "month" | "mon" | "day" | "mday" | "wday" | "yday" if zero => Ty::Int,
+        "<=>" if args.len() == 1 => Ty::Int,
         "iso8601" | "xmlschema" | "to_s" | "strftime" | "inspect" => Ty::Str,
-        "<" | ">" | "<=" | ">=" | "leap?" | "monday?" | "tuesday?" | "wednesday?"
-        | "thursday?" | "friday?" | "saturday?" | "sunday?" => Ty::Bool,
+        // `change` / `advance` / `between?` / `after?` / `before?` stay
+        // unmodeled until runtime + lowering exist (invariant 6).
+        "<" | ">" | "<=" | ">=" if args.len() == 1 => Ty::Bool,
+        "leap?"
+        | "past?" | "future?" | "today?" | "yesterday?" | "tomorrow?"
+        | "monday?" | "tuesday?" | "wednesday?" | "thursday?" | "friday?"
+        | "saturday?" | "sunday?" | "on_weekend?" | "on_weekday?"
+            if zero =>
+        {
+            Ty::Bool
+        }
         _ => return None,
     })
 }
@@ -2781,6 +2896,8 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // `ago` / `from_now` / `since` / `until` produce a Time-ish
         // value; same propagation rationale.
         "ago" | "from_now" | "since" | "until" => Ty::Untyped,
+        // ActiveSupport `Numeric#in_time_zone` — epoch seconds → Time.
+        "in_time_zone" => Ty::Time,
         // Common Int formatters from ActiveSupport.
         "ordinalize" | "ordinal" => Ty::Str,
         _ => unknown(),

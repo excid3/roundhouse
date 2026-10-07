@@ -3,6 +3,65 @@
 use std::path::Path;
 use std::process::Command;
 
+const RAW_DICTIONARY_RESPONSE: &str = r#"
+require "zlib"
+if ENV["REJECT_RAW_DICTIONARY"] == "1"
+  # Reproduce JRuby's raw-stream restriction on the default MRI lane.
+  Zlib::Deflate.prepend(Module.new do
+    def set_dictionary(_dictionary)
+      raise Zlib::StreamError, "raw dictionaries unsupported"
+    end
+  end)
+end
+require File.expand_path("runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache", Dir.pwd)
+
+fragment = ("<p>cached fragment</p>" * 100).freeze
+env = {"REQUEST_METHOD" => "GET", "HTTP_ACCEPT_ENCODING" => "gzip"}
+[false, true].each do |with_fragment|
+  ["A" * 86, "B" * 86].each do |token|
+    raw = ("<p>layout</p>" * 100) + token + ("<p>footer</p>" * 100)
+    raw += fragment + ("<p>tail</p>" * 100) if with_fragment
+    app = lambda do |_env|
+      GzipCache.note_token(token)
+      GzipCache.note_fragment(fragment) if with_fragment
+      [200, {"content-type" => "text/html"}, [raw]]
+    end
+    wrapped = GzipCache.wrap(app)
+    2.times do
+      status, headers, body = wrapped.call(env)
+      raise "status" unless status == 200
+      raise "encoding" unless headers["content-encoding"] == "gzip"
+      raise "round trip" unless Zlib.gunzip(body.join) == raw
+    end
+  end
+end
+puts "ALL OK"
+"#;
+
+fn check_raw_dictionary_response(interpreter: &str, reject_dictionary: bool) {
+    let output = Command::new(interpreter)
+        .args(["-e", RAW_DICTIONARY_RESPONSE])
+        .env("REJECT_RAW_DICTIONARY", if reject_dictionary { "1" } else { "0" })
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Ruby interpreter available");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "gzip response failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("ALL OK"), "gzip response cases did not execute:\n{stdout}");
+}
+
+#[test]
+fn gzip_splicing_survives_missing_raw_dictionary_support() {
+    check_raw_dictionary_response("ruby", true);
+}
+
+#[test]
+#[ignore = "requires JRuby 10 and Java 21+"]
+fn gzip_splicing_executes_on_jruby() {
+    check_raw_dictionary_response("jruby", false);
+}
+
 #[test]
 fn identical_bodies_gzip_once() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

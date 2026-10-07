@@ -40,31 +40,42 @@ module ActionController
   REDIRECT_LINE_BREAK_PATTERN = /[\r\n\0\t]/.freeze
 
   # Puma's illegal-header rule: drop a key/value that cannot be one
-  # HTTP/1.1 line. A key may not hold a control character, `"`, `:` or a
-  # space; a value may not hold a control character other than tab.
-  #
-  # One regex test per key or value, as Puma itself checks. This used to
-  # walk characters (`[i, 1]`, since `getbyte`/`bytesize` do not exist on
-  # strict-target strings), allocating a one-character String and
-  # comparing it against ~30 literals per character of every header of
-  # every response: 17% of campfire's avatar route.
-  HEADER_KEY_ILLEGAL = /[\x00-\x1f\x7f": ]/.freeze
-  HEADER_VALUE_ILLEGAL = /[\x00-\x08\x0a-\x1f\x7f]/.freeze
-
+  # HTTP/1.1 line. Keys scan UTF-8 bytes; values walk characters and
+  # recognize the CRLF grapheme. CRuby/JRuby replace these portable
+  # predicates with regex checks in the target overlay.
   def self.header_key_ok?(k)
     return false if k.nil?
-    return false if k.length == 0
-    !k.match?(HEADER_KEY_ILLEGAL)
+    # Delimiters can share a Swift grapheme with a combining mark. Inspect
+    # their UTF-8 bytes so the policy does not depend on string indexing.
+    bytes = k.bytes
+    n = bytes.length
+    return false if n == 0
+    i = 0
+    while i < n
+      byte = bytes[i]
+      return false if byte <= 32 || byte == 34 || byte == 58 || byte == 127
+      i += 1
+    end
+    true
   end
 
   def self.header_value_ok?(v)
     # Nil is an unset (`headers["X-Rev"] = ENV["GIT_REVISION"]` when
     # the env is absent). Drop it; do not ask it for length.
     return false if v.nil?
-    !v.match?(HEADER_VALUE_ILLEGAL)
+    n = v.length
+    i = 0
+    while i < n
+      c = v[i, 1].to_s
+      return false if c != "\t" && header_control?(c)
+      i += 1
+    end
+    true
   end
 
   def self.header_control?(c)
+    # Swift strings index grapheme clusters: CRLF can be one element.
+    return true if c == "\r\n"
     c == "\0" || c == "\r" || c == "\n" || c == "\x01" || c == "\x02" ||
       c == "\x03" || c == "\x04" || c == "\x05" || c == "\x06" || c == "\x07" ||
       c == "\x08" || c == "\t" || c == "\x0b" || c == "\x0c" || c == "\x0e" ||

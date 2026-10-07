@@ -103,6 +103,8 @@ require_relative "runtime/active_record_relation_ext"
 require_relative "config/schema"
 require_relative "runtime/action_dispatch"
 require_relative "runtime/action_controller"
+# Replace the portable character walk only after loading the shared policy.
+require_relative "runtime/header_validation_cruby"
 # Signed cookies verified once per value per thread, not per request.
 require_relative "runtime/message_verifier_cruby"
 # Masked CSRF tokens XORed with pack/unpack, not 32 `chr`s.

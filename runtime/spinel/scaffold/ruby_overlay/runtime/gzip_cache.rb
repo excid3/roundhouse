@@ -160,6 +160,22 @@ module GzipCache
   FINAL_BLOCK = "\x03\x00".b.freeze
   SPLICE_OK = Zlib.respond_to?(:crc32_combine) && defined?(ObjectSpace::WeakKeyMap) ? true : false
 
+  # JRuby's zlib can splice raw deflate pieces but rejects a preset
+  # dictionary on a raw stream. A dictionary improves compression only;
+  # independent pieces still inflate correctly without it. Probe once,
+  # using a disposable stream rather than a failed request's compressor.
+  RAW_DICTIONARY_OK = SPLICE_OK && begin
+    probe = Zlib::Deflate.new(Zlib::BEST_SPEED, -Zlib::MAX_WBITS)
+    begin
+      probe.set_dictionary("roundhouse")
+      true
+    rescue Zlib::StreamError
+      false
+    ensure
+      probe.close
+    end
+  end
+
   @pieces = SPLICE_OK ? ObjectSpace::WeakKeyMap.new : nil
   @pieces_mutex = Mutex.new
   # The last fragment looked up and its entry. The cache hands a view the
@@ -425,7 +441,7 @@ module GzipCache
   # non-final block, so pieces concatenate into one stream.
   def self.raw_deflate(data, dict, level)
     z = Zlib::Deflate.new(level, -Zlib::MAX_WBITS)
-    z.set_dictionary(dict) unless dict.nil?
+    z.set_dictionary(dict) if RAW_DICTIONARY_OK && !dict.nil?
     s = z.deflate(data, Zlib::SYNC_FLUSH)
     z.close
     s

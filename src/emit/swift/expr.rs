@@ -2743,6 +2743,27 @@ fn emit_send(
         if method == "include?" {
             return format!("{}.contains({})", emit_expr(r), args_s[0]);
         }
+        // `String#match?(re)` / `Regexp#match?(str)` → RhString helper.
+        // NSRegularExpression has no compact String predicate; the
+        // primitive mirrors the TypeScript `re.test(s)` flip.
+        if method == "match?" {
+            // Require Regexp ty or a regex literal — not bare Const
+            // shape (a String-valued PATTERN must not flip).
+            let arg_is_regexp = matches!(
+                args[0].ty.as_ref(),
+                Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Regexp"
+            ) || matches!(&*args[0].node, ExprNode::Lit { value: Literal::Regex { .. } });
+            let recv_is_regexp = matches!(
+                r.ty.as_ref(),
+                Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "Regexp"
+            );
+            if arg_is_regexp && !recv_is_regexp {
+                return format!("RhString.matchPred({}, {})", emit_expr(r), args_s[0]);
+            }
+            if recv_is_regexp {
+                return format!("RhString.matchPred({}, {})", args_s[0], emit_expr(r));
+            }
+        }
         if method == "join" {
             return format!("{}.joined(separator: {})", emit_expr(r), args_s[0]);
         }

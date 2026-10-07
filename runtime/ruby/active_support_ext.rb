@@ -766,6 +766,11 @@ module ActiveSupport
     t.getlocal(find_zone!(zone).offset_at(t.to_i))
   end
 
+  # Numeric#in_time_zone: epoch seconds before the zone remapping above.
+  def self.time_at_epoch(n)
+    Time.at(n)
+  end
+
   # Not `Time.local`: under `use_zone` the civil value belongs to that zone, resolved twice to settle an offset change.
   def self.local_time(y, mo, d, h, mi, s, nsec)
     zone = current_zone

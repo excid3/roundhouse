@@ -1027,6 +1027,72 @@ fn app_uses_date(app: &App) -> bool {
     has_date
 }
 
+/// Insert Date-package requires after `active_record_serialization` in
+/// `boot.rb`. Spinel only — the program-defined `Date` class and the
+/// date-column JSON reopen belong on that target (matz/spinel#7334).
+fn inject_date_package_into_boot(boot: &mut String) -> Result<(), String> {
+    let anchor = "require_relative \"runtime/active_record_serialization\"\n";
+    // Prefer concat! over one escaped multiline string: the CI
+    // planner's project.rs body-scope regex backtracks for minutes
+    // on `\"` + `\` continuations in a single literal this large.
+    let inject = concat!(
+        "# Date package — only when the app uses date-only values (matz/spinel#7334).\n",
+        "require_relative \"runtime/date\"\n",
+        "require_relative \"runtime/active_support_date_parsing\"\n",
+        "require_relative \"runtime/active_record_date_serialization\"\n",
+    );
+    if boot.contains("require_relative \"runtime/date\"") {
+        return Ok(());
+    }
+    if let Some(at) = boot.find(anchor) {
+        boot.insert_str(at + anchor.len(), inject);
+        Ok(())
+    } else {
+        Err(
+            "boot.rb missing active_record_serialization require \
+             (Date package inject anchor)"
+                .into(),
+        )
+    }
+}
+
+/// CRuby/JRuby overlay boot replaces Spinel's boot wholesale, wiping
+/// the Date-package inject. Re-inject **only** the shared `date_*`
+/// calendar helpers (invariant 2). Do not load Spinel's `date.rb`
+/// polyfill (clobbers stdlib Date → `@year` nil on `>>`) or
+/// `active_record_date_serialization` (overlay already wraps
+/// `_as_json_only`; a second alias infinite-recurses).
+fn inject_cruby_date_calendar_helpers(boot: &mut String) -> Result<(), String> {
+    let anchor = "require_relative \"runtime/active_record_serialization\"\n";
+    let inject = concat!(
+        "# Date calendar helpers — shared with Spinel (invariant 2).\n",
+        "require_relative \"runtime/active_support_date_parsing\"\n",
+    );
+    if boot.contains("require_relative \"runtime/active_support_date_parsing\"") {
+        return Ok(());
+    }
+    if let Some(at) = boot.find(anchor) {
+        boot.insert_str(at + anchor.len(), inject);
+        Ok(())
+    } else {
+        Err(
+            "boot.rb missing active_record_serialization require \
+             (CRuby date calendar inject anchor)"
+                .into(),
+        )
+    }
+}
+
+fn inject_cruby_date_calendar_boot_requires(
+    files: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let boot = files
+        .iter_mut()
+        .find(|(p, _)| p == "boot.rb")
+        .ok_or("ruby family: boot.rb missing for date calendar re-inject")?;
+    inject_cruby_date_calendar_helpers(&mut boot.1)
+}
+
 /// The executed Date-only runtime is native Ruby (and now Spinel), not
 /// the timestamp seam shared by the other targets (including the
 /// unverified JRuby adapter). Reject before entering their emitters:
@@ -2657,6 +2723,14 @@ fn ruby_family_runtime_files(
     // gets the block exactly once; this is the ruby family's turn, and
     // the ruby family is the one that can run the lines.
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
+    // Overlay boot replaces the spinel boot wholesale (see comment above
+    // on apply_module_mixins), wiping the Date-package inject from
+    // `spinel_files`. Re-inject only the shared `date_*` helpers — not
+    // Spinel's Date polyfill or date-JSON reopen (see
+    // `inject_cruby_date_calendar_helpers`).
+    if app_uses_date(app) {
+        inject_cruby_date_calendar_boot_requires(&mut files)?;
+    }
     Ok(files)
 }
 
@@ -4103,27 +4177,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
             files.push((dest.to_string(), rbs));
         }
         if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
-            let anchor = "require_relative \"runtime/active_record_serialization\"\n";
-            // Prefer concat! over one escaped multiline string: the CI
-            // planner's project.rs body-scope regex backtracks for minutes
-            // on `\"` + `\` continuations in a single literal this large.
-            let inject = concat!(
-                "# Date package — only when the app uses date-only values (matz/spinel#7334).\n",
-                "require_relative \"runtime/date\"\n",
-                "require_relative \"runtime/active_support_date_parsing\"\n",
-                "require_relative \"runtime/active_record_date_serialization\"\n",
-            );
-            if !boot.contains("require_relative \"runtime/date\"") {
-                if let Some(at) = boot.find(anchor) {
-                    boot.insert_str(at + anchor.len(), inject);
-                } else {
-                    return Err(
-                        "spinel boot.rb missing active_record_serialization require \
-                         (Date package inject anchor)"
-                            .into(),
-                    );
-                }
-            }
+            inject_date_package_into_boot(boot)?;
         }
     } else {
         files.retain(|(p, _)| !DATE_PACKAGE_FILES.contains(&p.as_str()));

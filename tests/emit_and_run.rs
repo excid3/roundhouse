@@ -1301,6 +1301,135 @@ fn date_blog() -> emit_and_run::Overlay {
         .write("app/models/calendar_entry.rb", include_str!("date_columns_model.rb"))
 }
 
+/// ActiveSupport Date calendar: constructors, date-preserving edges, and
+/// Date→Time / Integer→Time zone conversions must both type-clean and run.
+#[test]
+fn activesupport_date_calendar_runs() {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+        )
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        )
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "events", force: :cascade do |t|
+    t.date "due_on"
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/event.rb",
+            r#"class Event < ApplicationRecord
+  def month_span
+    due_on.beginning_of_month..due_on.end_of_month
+  end
+
+  def prior_day
+    due_on.yesterday
+  end
+
+  def zoned
+    due_on.in_time_zone("UTC")
+  end
+end
+"#,
+        )
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  get \"/probe\", to: \"probe#show\"\nend\n",
+        )
+        .write(
+            "app/controllers/probe_controller.rb",
+            r#"class ProbeController < ApplicationController
+  def show
+    event = Event.create!(due_on: Date.new(2024, 1, 31))
+    cur = Date.current
+    yday = Date.yesterday
+    span = event.month_span
+    prior = event.prior_day
+    # Non-nilable Date literal: column readers are Date? and binop gate
+    # refuses Date? + Integer (see #394); day arithmetic on a known Date
+    # still grounds through date_days_since.
+    shifted = Date.new(2024, 1, 31) + 2
+    zoned = event.zoned
+    # Today must not be past? (Rails Date#past? is self < Date.current).
+    today_past = Date.current.past?
+    old_past = Date.new(2020, 1, 1).past?
+    epoch = 1_704_067_200.in_time_zone("UTC")
+    render plain: [
+      cur.class.name,
+      yday.class.name,
+      span.begin.iso8601,
+      span.end.iso8601,
+      prior.iso8601,
+      shifted.iso8601,
+      zoned.year,
+      today_past,
+      old_past,
+      epoch.year
+    ].join(",")
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+require_relative "app/controllers/probe_controller"
+controller = ProbeController.new
+controller.process_action(:show)
+parts = controller.body.split(",")
+raise "Date.current class: #{parts[0]}" unless parts[0] == "Date"
+raise "Date.yesterday class: #{parts[1]}" unless parts[1] == "Date"
+raise "beginning_of_month: #{parts[2]}" unless parts[2] == "2024-01-01"
+raise "end_of_month: #{parts[3]}" unless parts[3] == "2024-01-31"
+raise "yesterday: #{parts[4]}" unless parts[4] == "2024-01-30"
+raise "Date+2: #{parts[5]}" unless parts[5] == "2024-02-02"
+raise "in_time_zone year: #{parts[6]}" unless parts[6] == "2024"
+raise "today.past?: #{parts[7]}" unless parts[7] == "false"
+raise "old.past?: #{parts[8]}" unless parts[8] == "true"
+raise "Integer#in_time_zone year: #{parts[9]}" unless parts[9] == "2024"
+puts "ActiveSupport Date calendar OK"
+"#,
+        )
+        .assert_passes();
+}
+
+/// Spinel has no native `Date#+`; grounding must carry constructors,
+/// day arithmetic, and calendar-day `past?` — CRuby stdlib can mask that.
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn activesupport_date_calendar_runs_on_spinel() {
+    date_blog()
+        .edit(
+            "app/models/calendar_entry.rb",
+            "\nend\n",
+            "\n  def prior_day\n    due_on.yesterday\n  end\n\n  def self.probe\n    entry = create!(due_on: Date.new(2024, 1, 31))\n    [\n      Date.current.class.name,\n      entry.due_on.beginning_of_month.iso8601,\n      entry.due_on.end_of_month.iso8601,\n      entry.prior_day.iso8601,\n      (Date.new(2024, 1, 31) + 2).iso8601,\n      Date.current.past?,\n      Date.new(2020, 1, 1).past?,\n    ]\n  end\nend\n",
+        )
+        .run_spinel(
+            r#"
+Db.configure(":memory:")
+Schema.statements.each { |sql| Db.exec(sql) }
+ActiveRecord.adapter = SqliteAdapter
+parts = CalendarEntry.probe
+raise "Date.current class: #{parts[0]}" unless parts[0] == "Date"
+raise "beginning_of_month: #{parts[1]}" unless parts[1] == "2024-01-01"
+raise "end_of_month: #{parts[2]}" unless parts[2] == "2024-01-31"
+raise "yesterday: #{parts[3]}" unless parts[3] == "2024-01-30"
+raise "Date+2: #{parts[4]}" unless parts[4] == "2024-02-02"
+raise "today.past?: #{parts[5]}" unless parts[5] == false
+raise "old.past?: #{parts[6]}" unless parts[6] == true
+puts "ActiveSupport Date calendar OK on Spinel"
+"#,
+        )
+        .assert_passes();
+}
+
 /// ActiveSupport's Date calendar extensions and `Date.current`, which
 /// reads today in the app's zone rather than the host's.
 #[test]
