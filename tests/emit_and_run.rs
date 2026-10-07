@@ -2101,6 +2101,25 @@ puts "PASS typed values"
         .assert_passes();
 }
 
+/// A multi-statement block body must still synthesize: the typed
+/// payload writers parenthesize the emitted expression so a Seq (or a
+/// modifier-`if`) is legal as a call argument. Without that, prism
+/// rejects the synthesized source, methods stay typed but undefined
+/// (invariant 6), and `generate_token_for` raises NoMethodError.
+#[test]
+fn a_multi_statement_token_block_still_synthesizes() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  generates_token_for :share do\n    t = title\n    t\n  end\n",
+        )
+        .run_ruby(
+            "a = Article.create!(title: \"Hello\", body: \"Body text here\")\ntoken = a.generate_token_for(:share)\nraise \"find\" unless Article.find_by_token_for(:share, token)&.id == a.id\na.update!(title: \"Changed\")\nraise \"stale\" unless Article.find_by_token_for(:share, token).nil?\nputs \"PASS multi-statement token block\"",
+        )
+        .assert_passes();
+}
+
 /// Declaring a purpose twice keeps the last declaration, as Rails'
 /// `token_definitions.merge` does: the token carries the second block's
 /// value, so changing the first block's value leaves it valid.

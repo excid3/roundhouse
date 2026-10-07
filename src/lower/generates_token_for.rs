@@ -306,10 +306,14 @@ fn value_payload(e: &Expr, src: &str) -> String {
         Some(t) => vec![t],
         None => Vec::new(),
     };
+    // Always parenthesize `src`: a modifier-`if` or multi-statement
+    // block body is illegal as a bare call argument, and without
+    // parentheses synthesis fails while the analyzer still types the
+    // methods (invariant 6).
     match non_nil.as_slice() {
-        [Ty::Str] => format!("value_data(id, {src})"),
-        [Ty::Int] => format!("int_value_data(id, {src})"),
-        [Ty::Bool] => format!("bool_value_data(id, {src})"),
+        [Ty::Str] => format!("value_data(id, ({src}))"),
+        [Ty::Int] => format!("int_value_data(id, ({src}))"),
+        [Ty::Bool] => format!("bool_value_data(id, ({src}))"),
         _ => format!("value_data(id, ({src})&.to_s)"),
     }
 }
