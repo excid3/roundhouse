@@ -23,26 +23,38 @@
 //! format is Rails' own: the `[id]` or `[id, value]` payload under the
 //! purpose `"<Model>\n<purpose>\n<expires_in seconds>"`. The purpose is
 //! a compile-time fact, so `expires_in:` must fold to seconds here — an
-//! Integer or `N.<unit>` literal.
+//! Integer or `N.<unit>` literal (`lower::duration::literal_seconds`).
 //!
 //! ## Synthesis
 //!
 //! Ruby source, re-ingested — the same route `ingest::current_attributes`
 //! takes — because the block body is an instance-level expression the
-//! finder has to evaluate on the record it found. Two dispatchers on
-//! the purpose carry everything per-declaration: `__token_data(purpose)`,
-//! the payload the record produces now, which `generate_token_for` signs
-//! and the finders compare against; and `__token_purpose(purpose)`, the
-//! purpose string the finders verify under:
+//! finder has to evaluate on the record it found. Two purpose
+//! dispatchers carry everything per-declaration: `__token_data(purpose)`,
+//! the payload the record produces now; and `__token_meta(purpose)`, the
+//! `[full_purpose, expires_in]` pair minting and the finders share:
 //!
 //! ```ruby
 //! def __token_data(purpose)
 //!   case purpose
 //!   when :email_change
-//!     ActiveRecord::TokenFor.value_data(id, (unconfirmed_email)&.to_s)
+//!     ActiveRecord::TokenFor.value_data(id, unconfirmed_email)
 //!   else
 //!     raise "unknown token purpose"
 //!   end
+//! end
+//!
+//! def self.__token_meta(purpose)
+//!   case purpose
+//!   when :email_change then ["User\\nemail_change\\n3600", 3600]
+//!   else raise "unknown token purpose"
+//!   end
+//! end
+//!
+//! def generate_token_for(purpose)
+//!   data = __token_data(purpose)
+//!   meta = self.class.__token_meta(purpose)
+//!   ActiveRecord::TokenFor.generate(data, meta[0], meta[1])
 //! end
 //! ```
 //!
@@ -67,6 +79,7 @@
 //! `token_for_decls` is the one place that decides, and
 //! `report_unclaimed_unknowns` asks `claims` by span.
 
+use super::duration::literal_seconds;
 use super::model_to_library::fn_sig;
 use crate::dialect::{MethodDef, Model, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -123,7 +136,12 @@ fn model_decls(model: &Model) -> Option<Vec<TokenForDecl>> {
         last.retain(|(p, _)| *p != purpose);
         last.push((purpose, decl));
     }
-    last.into_iter().map(|(_, decl)| decl).collect()
+    // Explicit all-or-nothing: any purpose whose last declaration cannot
+    // expand declines the whole model (do not rely on Option collect).
+    if last.iter().any(|(_, decl)| decl.is_none()) {
+        return None;
+    }
+    Some(last.into_iter().filter_map(|(_, decl)| decl).collect())
 }
 
 fn integer_id(model: &Model) -> bool {
@@ -167,7 +185,7 @@ fn parse_decls(body: &[ModelBodyItem]) -> Vec<Result<TokenForDecl, Option<Symbol
                             ExprNode::Lit { value: Literal::Sym { value: key } }
                                 if key.as_str() == "expires_in" =>
                             {
-                                match duration_seconds(v) {
+                                match literal_seconds(v) {
                                     Some(secs) if secs > 0 => expires_in = secs,
                                     _ => ok = false,
                                 }
@@ -231,10 +249,12 @@ pub(crate) fn push_token_for_methods(methods: &mut Vec<MethodDef>, model: &Model
     };
     let record = Ty::Class { id: model.name.clone(), args: vec![] };
     let nilable_record = Ty::Union { variants: vec![record.clone(), Ty::Nil] };
+    let meta_ty = Ty::Array { elem: Box::new(Ty::Untyped) };
     for mut m in synthesized {
         // Declared signatures, so the sidecar the strict targets compile
         // from says what the registry already says (`register_generates_
-        // token_for`) instead of `untyped`.
+        // token_for`) instead of `untyped`. Name every helper explicitly
+        // — a catch-all would stamp the wrong shape after `__token_meta`.
         m.signature = match m.name.as_str() {
             "generate_token_for" => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
             "find_by_token_for" => Some(fn_sig(
@@ -245,8 +265,16 @@ pub(crate) fn push_token_for_methods(methods: &mut Vec<MethodDef>, model: &Model
                 vec![(Symbol::from("purpose"), Ty::Sym), (Symbol::from("token"), Ty::Str)],
                 record.clone(),
             )),
-            "__token_purpose" => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
-            _ => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
+            "__token_data" => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], Ty::Str)),
+            "__token_meta" => Some(fn_sig(vec![(Symbol::from("purpose"), Ty::Sym)], meta_ty.clone())),
+            other => {
+                crate::ingest::survey::record_synthesis_failure(
+                    "<generates_token_for>",
+                    &format!("unexpected synthesized method `{other}` on `{}`", model.name.0.as_str()),
+                    &[],
+                );
+                continue;
+            }
         };
         // `methods` already holds the model's own (push_user_methods
         // runs first), and one it writes itself wins.
@@ -254,45 +282,6 @@ pub(crate) fn push_token_for_methods(methods: &mut Vec<MethodDef>, model: &Model
         if !own {
             methods.push(m);
         }
-    }
-}
-
-/// `expires_in:` as seconds, when it is a compile-time fact: an
-/// Integer literal or `N.<unit>` for the fixed-length units. A month
-/// or a year has no fixed length, and anything computed is unknown.
-/// The analyzer asks before `lower::duration` runs and the model
-/// lowering after it, so the grounded `ActiveSupport::Duration.<units>(N)`
-/// reads the same as the `N.<unit>` it came from.
-fn duration_seconds(e: &Expr) -> Option<i64> {
-    let int = |e: &Expr| match &*e.node {
-        ExprNode::Lit { value: Literal::Int { value } } => Some(*value),
-        _ => None,
-    };
-    let unit_seconds = |unit: &str| match unit {
-        "second" | "seconds" => Some(1),
-        "minute" | "minutes" => Some(60),
-        "hour" | "hours" => Some(3_600),
-        "day" | "days" => Some(86_400),
-        "week" | "weeks" => Some(604_800),
-        _ => None,
-    };
-    match &*e.node {
-        ExprNode::Lit { .. } => int(e),
-        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
-            let (n, unit) = match (&*recv.node, args.as_slice()) {
-                (ExprNode::Const { path }, [n])
-                    if path.len() == 2
-                        && path[0].as_str() == "ActiveSupport"
-                        && path[1].as_str() == "Duration" =>
-                {
-                    (int(n)?, method.as_str())
-                }
-                (_, []) => (int(recv)?, method.as_str()),
-                _ => return None,
-            };
-            n.checked_mul(unit_seconds(unit)?)
-        }
-        _ => None,
     }
 }
 
@@ -328,20 +317,22 @@ fn value_payload(e: &Expr, src: &str) -> String {
 fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
     use crate::emit::ruby::emit_expr;
     let class = model.name.0.as_str();
-    let case = |arms: String| format!("    case purpose\n{arms}    else\n      raise \"unknown token purpose\"\n    end\n");
+    let case = |arms: String| {
+        format!("    case purpose\n{arms}    else\n      raise \"unknown token purpose\"\n    end\n")
+    };
     let arms = |arm: &dyn Fn(&TokenForDecl) -> String| {
-        decls.iter().map(|d| format!("    when :{}\n      {}\n", d.purpose.as_str(), arm(d))).collect::<String>()
+        decls
+            .iter()
+            .map(|d| format!("    when :{}\n      {}\n", d.purpose.as_str(), arm(d)))
+            .collect::<String>()
     };
 
-    // The payload for `purpose` on this record: `[id]`, or `[id, value]`
-    // with the block's value in its String form.
     let data = case(arms(&|d| match &d.value {
         Some(e) => format!("ActiveRecord::TokenFor.{}", value_payload(e, &emit_expr(e))),
         None => "ActiveRecord::TokenFor.id_data(id)".to_string(),
     }));
-    let purposes = case(arms(&|d| format!("\"{}\"", full_purpose(model, d))));
-    let generate = case(arms(&|d| {
-        format!("ActiveRecord::TokenFor.generate(data, {class}.__token_purpose(purpose), {})", d.expires_in)
+    let meta = case(arms(&|d| {
+        format!("[\"{}\", {}]", full_purpose(model, d), d.expires_in)
     }));
 
     // Rails: the finder answers nil for a token that does not verify,
@@ -353,15 +344,17 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
   def __token_data(purpose)
 {data}  end
 
-  def self.__token_purpose(purpose)
-{purposes}  end
+  def self.__token_meta(purpose)
+{meta}  end
 
   def generate_token_for(purpose)
     data = __token_data(purpose)
-{generate}  end
+    meta = self.class.__token_meta(purpose)
+    ActiveRecord::TokenFor.generate(data, meta[0], meta[1])
+  end
 
   def self.find_by_token_for(purpose, token)
-    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_purpose(purpose))
+    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_meta(purpose)[0])
     return nil if data == \"\"
     record = {class}.find_by(id: ActiveRecord::TokenFor.data_id(data))
     return nil if record.nil?
@@ -369,7 +362,7 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
   end
 
   def self.find_by_token_for!(purpose, token)
-    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_purpose(purpose))
+    data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_meta(purpose)[0])
     raise ActiveSupport::MessageVerifier::InvalidSignature if data == \"\"
     record = {class}.find(ActiveRecord::TokenFor.data_id(data))
     raise ActiveSupport::MessageVerifier::InvalidSignature unless record.__token_data(purpose) == data

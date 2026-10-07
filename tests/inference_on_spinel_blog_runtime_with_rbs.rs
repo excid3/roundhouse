@@ -601,8 +601,6 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // Soft ratchet under canonical class-ID lookup (Fixes #435), then
     // dependency RBS + cross-stem ivar merge + Relation/Base overlays.
     // Fails only when the residual rises. Not a substitute for Bar B.
-    // TokenFor helpers from generates_token_for may add parameter-read
-    // sites; remeasure and ledger any delta here before pushing.
     const CEILING: usize = 0;
 
     assert!(

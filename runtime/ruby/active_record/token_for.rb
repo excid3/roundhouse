@@ -37,10 +37,12 @@ module ActiveRecord
     # The signed token for `data_json` under `purpose`, expiring
     # `expires_in` seconds from now, or never for 0. An unexpiring token
     # has no `exp` key at all — Rails' metadata envelope omits a nil
-    # expiry, as it does for a signed id.
+    # expiry, as it does for a signed id. A negative lifetime still
+    # encodes an already-past `exp`, so a direct caller cannot mint a
+    # reusable token by accident.
     def self.generate(data_json, purpose, expires_in)
       exp = ""
-      if expires_in > 0
+      if expires_in != 0
         exp = "\"" +
               ActionController::MessageVerifier.iso8601_ms(Time.now + expires_in) +
               "\""
