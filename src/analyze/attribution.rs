@@ -331,12 +331,28 @@ impl<'a> AttributionCtx<'a> {
         let mut gap_receivers: HashMap<String, &str> = HashMap::new();
         let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
         if let Some(resolver) = &resolver {
-            for (file, path) in &tainted_files {
+            // A namespace several gap files reopen (`module Discourse` in
+            // `config/application.rb` and `lib/discourse.rb`) names one
+            // cause, the same on every run: the file Rails would autoload
+            // it from, else the first path.
+            let rank = |name: &str, path: &str| {
+                let conventional = format!("/{}.rb", crate::naming::underscore(name.trim_start_matches("::")));
+                (!path.ends_with(&conventional), path.to_string())
+            };
+            let mut files: Vec<(&FileId, &&str)> = tainted_files.iter().collect();
+            files.sort_by_key(|(_, path)| **path);
+            for (file, path) in files {
                 for name in resolver.namespaces_declared_in(*file) {
-                    gap_namespaces.entry(name.to_string()).or_insert(path);
+                    let slot = gap_namespaces.entry(name.to_string()).or_insert(path);
+                    if rank(name, path) < rank(name, slot) {
+                        *slot = path;
+                    }
                 }
                 for name in resolver.receivers_declared_in(*file) {
-                    gap_receivers.entry(name.to_string()).or_insert(path);
+                    let slot = gap_receivers.entry(name.to_string()).or_insert(path);
+                    if rank(name, path) < rank(name, slot) {
+                        *slot = path;
+                    }
                 }
             }
         }

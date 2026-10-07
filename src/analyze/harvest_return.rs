@@ -52,6 +52,58 @@ fn stabilize_untyped_return_oscillation(existing: &Ty, new: &Ty) -> Option<Ty> {
     Some(core_e)
 }
 
+/// `ty` with every strict subterm that is `prior` replaced by `untyped`. A
+/// union holding all of `prior`'s variants counts: `prior` flattens into a
+/// union it joins, so it is never there as one term.
+fn untie(ty: &Ty, prior: &Ty) -> Ty {
+    let go = |t: &Ty| {
+        if t == prior {
+            return Ty::Untyped;
+        }
+        if let (Ty::Union { variants: pv }, Ty::Union { variants: tv }) = (prior, t)
+            && pv.iter().all(|v| tv.contains(v))
+        {
+            let mut rest: Vec<Ty> = tv.iter().filter(|v| !pv.contains(v)).map(|v| untie(v, prior)).collect();
+            if !rest.contains(&Ty::Untyped) {
+                rest.push(Ty::Untyped);
+            }
+            return Ty::Union { variants: rest };
+        }
+        untie(t, prior)
+    };
+    match ty {
+        Ty::Array { elem } => Ty::Array { elem: Box::new(go(elem)) },
+        Ty::Hash { key, value } => Ty::Hash { key: Box::new(go(key)), value: Box::new(go(value)) },
+        Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(go).collect() },
+        Ty::Union { variants } => Ty::Union { variants: variants.iter().map(go).collect() },
+        Ty::Record { row } => Ty::Record {
+            row: crate::ty::Row {
+                fields: row.fields.iter().map(|(name, field)| (name.clone(), go(field))).collect(),
+                rest: row.rest.clone(),
+            },
+        },
+        Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(go).collect() },
+        other => other.clone(),
+    }
+}
+
+/// A return that nests the previous round's return is a recursive method
+/// (`value.map { |v| sanitize(v) }`) unrolled one level more: left alone it
+/// doubles every round and never converges. The nested copy is cut to
+/// `untyped`. A scalar previous return is too weak a witness to cut on.
+fn untie_recursive_return(existing: &Ty, new: &Ty) -> Option<Ty> {
+    if !matches!(
+        existing,
+        Ty::Union { .. } | Ty::Array { .. } | Ty::Hash { .. } | Ty::Tuple { .. } | Ty::Record { .. }
+    )
+        && !matches!(existing, Ty::Class { args, .. } if !args.is_empty())
+    {
+        return None;
+    }
+    let untied = untie(new, existing);
+    (untied != *new).then_some(untied)
+}
+
 enum HarvestWrite {
     Keep,
     Set(Ty),
@@ -64,6 +116,12 @@ fn decide_harvested_return(existing: &Ty, new: Ty) -> HarvestWrite {
     }
     if existing == &new {
         return HarvestWrite::Keep;
+    }
+    if let Some(untied) = untie_recursive_return(existing, &new) {
+        if existing == &untied {
+            return HarvestWrite::Keep;
+        }
+        return HarvestWrite::Set(untied);
     }
     if let Some(stable) = stabilize_untyped_return_oscillation(existing, &new) {
         if existing == &stable {
@@ -217,5 +275,66 @@ mod tests {
         insert_inferred_return(&mut table, &method, gradual_nil());
         insert_inferred_return(&mut table, &method, Ty::Nil);
         assert_eq!(table.get(&method), Some(&gradual_nil()));
+    }
+
+    fn arr(elem: Ty) -> Ty {
+        Ty::Array { elem: Box::new(elem) }
+    }
+
+    fn sym_hash(value: Ty) -> Ty {
+        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(value) }
+    }
+
+    fn union(variants: Vec<Ty>) -> Ty {
+        Ty::Union { variants }
+    }
+
+    // `def sanitize(v) = v.is_a?(Array) ? v.map { sanitize(_1) } : v.to_s`
+    #[test]
+    fn insert_recursive_return_that_nests_its_previous_round_keeps_the_previous() {
+        let method = Symbol::from("sanitize");
+        let mut table = HashMap::new();
+        let first = union(vec![Ty::Str, arr(Ty::Untyped)]);
+        insert_inferred_return(&mut table, &method, first.clone());
+        insert_inferred_return(&mut table, &method, union(vec![Ty::Str, arr(first.clone())]));
+        assert_eq!(table.get(&method), Some(&first));
+    }
+
+    #[test]
+    fn insert_recursive_return_flattened_into_a_union_is_cut() {
+        let method = Symbol::from("sanitize");
+        let mut table = HashMap::new();
+        let first = union(vec![Ty::Str, sym_hash(Ty::Untyped)]);
+        insert_inferred_return(&mut table, &method, first.clone());
+        let nested = union(vec![Ty::Str, sym_hash(union(vec![Ty::Str, sym_hash(Ty::Untyped), Ty::Int]))]);
+        insert_inferred_return(&mut table, &method, nested);
+        let cut = union(vec![Ty::Str, sym_hash(union(vec![Ty::Int, Ty::Untyped]))]);
+        assert_eq!(table.get(&method), Some(&cut));
+        insert_inferred_return(&mut table, &method, union(vec![Ty::Str, sym_hash(union(vec![Ty::Str, sym_hash(union(vec![Ty::Int, Ty::Untyped])), Ty::Int]))]));
+        assert_eq!(table.get(&method), Some(&cut));
+    }
+
+    // `def wrap(v) = { nested: wrap(v.inner) }`
+    #[test]
+    fn insert_recursive_return_nested_in_a_record_keeps_the_previous() {
+        let method = Symbol::from("wrap");
+        let record = |field: Ty| Ty::Record {
+            row: crate::ty::Row { fields: [(Symbol::from("nested"), field)].into_iter().collect(), rest: None },
+        };
+        let mut table = HashMap::new();
+        let first = record(Ty::Untyped);
+        insert_inferred_return(&mut table, &method, first.clone());
+        insert_inferred_return(&mut table, &method, record(first.clone()));
+        assert_eq!(table.get(&method), Some(&first));
+    }
+
+    #[test]
+    fn insert_scalar_previous_return_is_not_a_recursion_witness() {
+        let method = Symbol::from("names");
+        let mut table = HashMap::new();
+        insert_inferred_return(&mut table, &method, Ty::Str);
+        let widened = union(vec![Ty::Str, arr(Ty::Str)]);
+        insert_inferred_return(&mut table, &method, widened.clone());
+        assert_eq!(table.get(&method), Some(&widened));
     }
 }

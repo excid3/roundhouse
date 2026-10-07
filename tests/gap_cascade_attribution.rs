@@ -20,6 +20,8 @@ fn references_to_a_class_dropped_by_an_ingest_gap_are_coverage_notes() {
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         // `has_role?` is a gem's method: the visibility change refuses the whole model.
         ("app/models/article.rb", "class Article < ApplicationRecord\n  LIMIT = 5\n  private :has_role?\nend\n"),
+        // Sorts first, but Rails autoloads `Article` from `app/models/article.rb`: that is the cause named.
+        ("app/lib/early_patch.rb", "class Article < ApplicationRecord\n  private :has_role?\nend\n"),
         ("app/models/admin/summary.rb", "class Admin::Summary < ApplicationRecord\n  private :has_role?\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         (
@@ -38,6 +40,10 @@ fn references_to_a_class_dropped_by_an_ingest_gap_are_coverage_notes() {
     }
 
     let out = check_continue(&root);
+    // One run passes by luck when the cause is picked in HashMap order; that order changes per process.
+    for _ in 0..4 {
+        assert_eq!(check_continue(&root), out, "the output differs between runs");
+    }
     let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no `{needle}` line:\n{out}"));
 
     let article = line("constant not supported (all targets): Article");
