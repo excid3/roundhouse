@@ -44,7 +44,7 @@ pub fn apply_exclude_predicate_lowering(app: &mut App) {
 
 /// Does any app class define its own `exclude?`? Then the name doesn't
 /// mean ActiveSupport's and the pass stands down.
-fn app_defines_exclude(app: &App) -> bool {
+pub(crate) fn app_defines_exclude(app: &App) -> bool {
     let is_exclude = |n: &Symbol| n.as_str() == "exclude?";
     app.models.iter().any(|m| {
         m.body.iter().any(|item| {
@@ -59,6 +59,10 @@ fn app_defines_exclude(app: &App) -> bool {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node else {
         return;
     };

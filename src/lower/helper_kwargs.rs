@@ -61,8 +61,16 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) {
     // producers rejoin this pass's established positional normalization.
     let _ = super::forwarding::apply(app);
     apply_to_test_modules(app);
-    apply_to_library_class_calls(app);
-    apply_to_instance_calls(app);
+    let class_params = library_class_call_params(app);
+    let instance_params = instance_call_params(app);
+    if !class_params.is_empty() || !instance_params.is_empty() {
+        super::for_each_hook_body(app, &mut |e| {
+            rewrite_class_and_instance(e, &class_params, &instance_params);
+        });
+        for view in &mut app.views {
+            rewrite_class_and_instance(&mut view.body, &class_params, &instance_params);
+        }
+    }
     super::kwsplat::restore_kwrest_in_test_helpers(app);
     let params = helper_param_names(app);
     if params.is_empty() {
@@ -86,7 +94,7 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) {
 /// `from_keyword` may be named. A class method's genuine optional
 /// positional (`def f(x, opts = {})`) called with `f(x, opts: 1)` is
 /// handed the Hash `{opts: 1}` by Ruby, and must keep it.
-fn apply_to_library_class_calls(app: &mut App) {
+fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
     let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
     for lc in &app.library_classes {
         for m in &lc.methods {
@@ -108,18 +116,25 @@ fn apply_to_library_class_calls(app: &mut App) {
             );
         }
     }
+    params
+}
+
+fn rewrite_class_and_instance(
+    e: &mut Expr,
+    class_params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_params: &HashMap<(String, Symbol), Vec<Slot>>,
+) {
+    e.node.for_each_child_mut(&mut |c| {
+        rewrite_class_and_instance(c, class_params, instance_params)
+    });
+    rewrite_class_calls_node(e, class_params);
+    rewrite_instance_calls_node(e, instance_params);
+}
+
+fn rewrite_class_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
     if params.is_empty() {
         return;
     }
-    let mut rewrite = |e: &mut Expr| rewrite_class_calls(e, &params);
-    super::for_each_hook_body(app, &mut rewrite);
-    for view in &mut app.views {
-        rewrite_class_calls(&mut view.body, &params);
-    }
-}
-
-fn rewrite_class_calls(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
-    e.node.for_each_child_mut(&mut |c| rewrite_class_calls(c, params));
     let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *e.node else { return };
     let ExprNode::Const { path } = &*recv.node else { return };
     let class = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
@@ -139,7 +154,7 @@ fn rewrite_class_calls(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot
 /// Keyed by the receiver's TYPE, not the method name: `Location` has a
 /// `fetch_content_type` of its own, with no parameters. Same narrowing
 /// as the class-method rule — only `from_keyword` slots may be named.
-fn apply_to_instance_calls(app: &mut App) {
+fn instance_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
     let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
     for lc in &app.library_classes {
         for m in &lc.methods {
@@ -161,18 +176,13 @@ fn apply_to_instance_calls(app: &mut App) {
             );
         }
     }
+    params
+}
+
+fn rewrite_instance_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
     if params.is_empty() {
         return;
     }
-    let mut rewrite = |e: &mut Expr| rewrite_instance_calls(e, &params);
-    super::for_each_hook_body(app, &mut rewrite);
-    for view in &mut app.views {
-        rewrite_instance_calls(&mut view.body, &params);
-    }
-}
-
-fn rewrite_instance_calls(e: &mut Expr, params: &HashMap<(String, Symbol), Vec<Slot>>) {
-    e.node.for_each_child_mut(&mut |c| rewrite_instance_calls(c, params));
     let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *e.node else { return };
     let Some(crate::ty::Ty::Class { id, .. }) = &recv.ty else { return };
     let Some(slots) = params.get(&(id.0.as_str().to_string(), method.clone())) else { return };

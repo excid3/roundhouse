@@ -100,8 +100,23 @@ module Tep
     # query cache wired to the lease could never turn on. The `/cable`
     # upgrade is dispatched under this lease too; the socket's recv loop
     # runs after the response and outside it, as before.
+    #
+    # A GET/HEAD reads through one SQLite snapshot (Db.read_snapshot_begin);
+    # any write still works, the shim ends the snapshot before it.
     def dispatch(req, res)
-      Db.with_connection { Main.dispatch(req, res) }
+      Db.with_connection do
+        snapshot = req.verb == "GET" || req.verb == "HEAD"
+        Db.read_snapshot_begin if snapshot
+        begin
+          Main.dispatch(req, res)
+        ensure
+          Db.read_snapshot_end if snapshot
+        end
+        # A value, not whatever Main.dispatch answers: with_connection
+        # assigns the block's value (`result = yield`), and spinel cannot
+        # hold a void there.
+        true
+      end
     end
   end
 

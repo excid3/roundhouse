@@ -599,6 +599,7 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
         "find", "find_by", "first", "last", "all", "each", "map", "to_a", "count",
         "exists?", "empty?", "any?", "none?", "sum", "maximum", "minimum", "pluck",
         "pick", "destroy_all", "delete_all", "update_all", "klass", "where_clauses",
+        "spawn", "find_each", "find_in_batches",
     ];
     let scopes = crate::lower::scope_chain::build_scope_registry(&app.models);
     // name -> [(model, params)] in app-model order, names sorted — the
@@ -6503,6 +6504,30 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
+    /// Does this Const name a constant already marked deferred — bare
+    /// `BUILTIN`, or `OwnClass::BUILTIN` (qualified by a later rewrite)?
+    fn const_names_deferred(
+        path: &[crate::ident::Symbol],
+        deferred_names: &std::collections::HashSet<String>,
+        class_name: &str,
+    ) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        if path.len() == 1 {
+            return deferred_names.contains(path[0].as_str());
+        }
+        let leaf = path[path.len() - 1].as_str();
+        if !deferred_names.contains(leaf) {
+            return false;
+        }
+        let prefix = path[..path.len() - 1]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        prefix == class_name
+    }
     fn calls_self(expr: &Expr, own: &std::collections::HashSet<&str>, deferred_names: &std::collections::HashSet<String>, class_name: &str) -> bool {
         match &*expr.node {
             // A closure that is STORED rather than run — `proc { … }`,
@@ -6544,9 +6569,12 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
                             _ => calls_self(b, own, deferred_names, class_name),
                         }))
             }
-            ExprNode::Const { path }
-                if path.len() == 1 && deferred_names.contains(path[0].as_str()) =>
-            {
+            // Bare `BUILTIN` *and* `Sound::BUILTIN` — index_by grounding
+            // (and similar) rewrites the receiver to the qualified form,
+            // and a rule that only matched path.len() == 1 left INDEX
+            // eager while BUILTIN deferred: `uninitialized constant
+            // Sound::BUILTIN` at load (campfire models.rb → sound.rb).
+            ExprNode::Const { path } if const_names_deferred(path, deferred_names, class_name) => {
                 true
             }
             _ => {
@@ -6945,6 +6973,9 @@ fn require_path_for_body_const(
     // body to need this: `created_at: <%= 1.hour.ago %>` grounds to
     // `ActiveSupport::Duration.hour(1)` and `test/fixtures/<x>.rb` is
     // reached from the test harness, not from main.rb's require chain.
+    if joined == "ActiveSupport::SecurityUtils" {
+        return Some("runtime/security_utils".to_string());
+    }
     if joined == "ActiveSupport::Duration" {
         return Some("runtime/active_support_duration".to_string());
     }
@@ -7384,11 +7415,12 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
-// Known gaps, deliberate: has_one, direct has_many with a scope or
-// polymorphic owner, and scope-carrying through-assocs (other than a
-// plain `order("...")`) get no batch arm — the dispatch
+// Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
+// with a scope or polymorphic owner, and scope-carrying through-assocs
+// (other than a plain `order("...")`) get no batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
-// Rails, which also lazy-loads what `includes` doesn't name). Assigning
+// Rails, which also lazy-loads what `includes` doesn't name). Unscoped
+// non-polymorphic has_one uses PreloadKind::HasOne (first-wins). Assigning
 // a belongs_to (`c.story = s`) on a PRELOADED record does not refresh
 // the cache (fresh records never have the loaded flag set, so the
 // benchmark's build-then-render flows are unaffected).
@@ -7517,6 +7549,9 @@ enum PreloadKind {
     BelongsTo { fk: String, target: String, table: String },
     /// (fk column on the target, target class)
     HasMany { fk: String, target: String },
+    /// `has_one` — same FK-on-target batch as has_many, installing one
+    /// record (or nil) per owner through the single-record preload setter.
+    HasOne { fk: String, target: String },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -7569,6 +7604,24 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::HasMany {
+                        fk: foreign_key.as_str().to_string(),
+                        target: target.0.as_str().to_string(),
+                    },
+                ));
+            }
+            // Same restriction as has_many: FK-only batch. Scoped or
+            // polymorphic has_one stays on the lazy reader until the
+            // batch can preserve those predicates.
+            Association::HasOne {
+                name, target, foreign_key,
+                scope: None, as_interface: None, ..
+            } => {
+                if !model_exists(target) {
+                    continue;
+                }
+                out.push((
+                    name.as_str().to_string(),
+                    PreloadKind::HasOne {
                         fk: foreign_key.as_str().to_string(),
                         target: target.0.as_str().to_string(),
                     },
@@ -7738,6 +7791,32 @@ end
 "#
                 );
             }
+            PreloadKind::HasOne { fk, target } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  ids = []
+  records.each do |r|
+    ids << r.id
+  end
+  by_id = {{}}
+  loaded = []
+  if ids.length > 0
+    loaded = ActiveRecord::Relation.new({target}).where({fk}: ids).to_a
+  end
+  loaded.each do |rec|
+    k = rec.{fk}
+    by_id[k] = rec if by_id[k].nil?
+  end
+  records.each do |r|
+    r._preload_{name}(by_id[r.id])
+  end
+  loaded
+end
+"#
+                );
+            }
             PreloadKind::Through { target, join, group_col, order } => {
                 let table = crate::naming::pluralize_snake(target.as_str());
                 let order_sql = match order {
@@ -7855,6 +7934,7 @@ end
             let target = match kind {
                 PreloadKind::BelongsTo { target, .. } => Some(target.as_str()),
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
+                PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
                 // `includes(logo_attachment: :blob)`: the blob is already

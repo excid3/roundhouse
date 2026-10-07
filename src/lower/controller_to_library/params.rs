@@ -839,10 +839,13 @@ fn build_params_object(
     with_ty(Expr::new(span, ExprNode::Seq { exprs: stmts }), owner_ty)
 }
 
-pub fn helper_spec_map<'a>(
-    actions: &[crate::dialect::Action],
+pub fn helper_spec_map<'a, 'b, I>(
+    actions: I,
     specs: &'a ParamsSpecs,
-) -> BTreeMap<Symbol, &'a ParamsSpec> {
+) -> BTreeMap<Symbol, &'a ParamsSpec>
+where
+    I: IntoIterator<Item = &'b crate::dialect::Action>,
+{
     let mut out = BTreeMap::new();
     for a in actions {
         if !a.name.as_str().ends_with("_params") {
@@ -2049,10 +2052,16 @@ fn build_from_raw_call(class_id: &ClassId, span: Span) -> Expr {
 /// `permitted[:title]`-shape call sites in test bodies / view
 /// bodies dispatch through the typed accessor.
 pub fn rewrite_typed_bracket_to_field(expr: &Expr, specs: &ParamsSpecs) -> Expr {
+    let permitted_fields = permitted_field_tys(specs);
+    crate::lower::controller_to_library::util::map_expr(expr, &|e| {
+        try_rewrite_typed_bracket(e, &permitted_fields)
+    })
+}
+
+pub(crate) fn permitted_field_tys(
+    specs: &ParamsSpecs,
+) -> std::collections::HashMap<ClassId, std::collections::HashMap<String, Ty>> {
     use crate::ty::Ty;
-    // Build a quick `class_id -> permitted-fields-set` lookup so the
-    // walker can validate the literal key is one of the permitted
-    // fields before rewriting.
     let mut permitted_fields: std::collections::HashMap<
         ClassId,
         std::collections::HashMap<String, Ty>,
@@ -2064,43 +2073,54 @@ pub fn rewrite_typed_bracket_to_field(expr: &Expr, specs: &ParamsSpecs) -> Expr 
         }
         permitted_fields.insert(spec.class_id.clone(), set);
     }
+    permitted_fields
+}
 
-    map_expr(expr, &|e| {
-        let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else {
-            return None;
-        };
-        if method.as_str() != "[]" || args.len() != 1 {
-            return None;
-        }
-        let recv_class_id = match recv.ty.as_ref() {
-            Some(Ty::Class { id, .. }) => id,
-            _ => return None,
-        };
-        let fields = permitted_fields.get(recv_class_id)?;
-        let key = match &*args[0].node {
-            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
-            ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
-            _ => return None,
-        };
-        let slot_ty = fields.get(&key)?;
-        // Synthesize `recv.<field>` — a zero-arg Send to the typed
-        // attr_reader. Carries the receiver's type forward and drops
-        // the bracket-key arg.
-        Some(Expr {
-            span: e.span,
-            node: Box::new(ExprNode::Send {
-                recv: Some(recv.clone()),
-                method: Symbol::from(key),
-                args: Vec::new(),
-                block: None,
-                parenthesized: false,
-            }),
-            ty: Some(slot_ty.clone()),
-            effects: e.effects.clone(),
-            leading_blank_line: e.leading_blank_line,
-            diagnostic: None,
-            hint: None,
-            decisions: 0,
-        })
+pub(crate) fn rewrite_typed_bracket_to_field_in_place(
+    expr: &mut Expr,
+    permitted_fields: &std::collections::HashMap<ClassId, std::collections::HashMap<String, crate::ty::Ty>>,
+) -> bool {
+    crate::lower::controller_to_library::util::map_expr_mut(expr, &|e| {
+        try_rewrite_typed_bracket(e, permitted_fields)
+    })
+}
+
+fn try_rewrite_typed_bracket(
+    e: &Expr,
+    permitted_fields: &std::collections::HashMap<ClassId, std::collections::HashMap<String, crate::ty::Ty>>,
+) -> Option<Expr> {
+    use crate::ty::Ty;
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else {
+        return None;
+    };
+    if method.as_str() != "[]" || args.len() != 1 {
+        return None;
+    }
+    let recv_class_id = match recv.ty.as_ref() {
+        Some(Ty::Class { id, .. }) => id,
+        _ => return None,
+    };
+    let fields = permitted_fields.get(recv_class_id)?;
+    let key = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return None,
+    };
+    let slot_ty = fields.get(&key)?;
+    Some(Expr {
+        span: e.span,
+        node: Box::new(ExprNode::Send {
+            recv: Some(recv.clone()),
+            method: Symbol::from(key),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        }),
+        ty: Some(slot_ty.clone()),
+        effects: e.effects.clone(),
+        leading_blank_line: e.leading_blank_line,
+        diagnostic: None,
+        hint: None,
+        decisions: 0,
     })
 }

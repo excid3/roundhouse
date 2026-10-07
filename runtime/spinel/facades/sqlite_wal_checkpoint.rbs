@@ -1,0 +1,5 @@
+module SqliteWalCheckpoint
+  INTERVAL: Float
+  def self.start: (?Float interval) -> nil
+  def self.checkpoint: () -> nil
+end

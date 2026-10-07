@@ -103,6 +103,14 @@ translated — to its own binary and diffs its output against a
 `.expected` snapshot. The `e2e/` Playwright suite is the same one the
 other server targets ship.
 
+The emitted Ruby carries `#<SPINEL_SOURCE>` comments naming the app
+file and line each statement came from (`<app>/app/views/rooms/show.html.erb:12`),
+so C compiler errors, `-g`/`--debug` stepping, `perf` and Spinel's
+`--warn-widen` report positions in your `.rb` and `.erb` sources rather
+than in the lowered tree. The paths start with the app directory's
+name; point a debugger at its parent (gdb `directory`). Code with no
+source line of its own reports the nearest marked line above it.
+
 ## One command: OCRAN
 
 [OCRAN](https://github.com/Largo/ocran) packages Ruby programs for

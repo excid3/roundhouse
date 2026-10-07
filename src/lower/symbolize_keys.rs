@@ -30,6 +30,7 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ty::Ty;
 
+#[allow(dead_code)]
 pub fn apply_symbolize_keys_grounding(app: &mut App) {
     super::for_each_hook_body(app, &mut rewrite);
     for view in &mut app.views {
@@ -39,6 +40,10 @@ pub fn apply_symbolize_keys_grounding(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let replacement = match &mut *expr.node {
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }
             if method.as_str() == "stringify_keys" && args.is_empty() =>

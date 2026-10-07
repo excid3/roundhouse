@@ -1,7 +1,7 @@
 //! `protect_from_forgery` / `skip_forgery_protection` become the
-//! `verify_authenticity_token` filter Rails registers. (Rails' implicit
-//! default on every ActionController::Base chain is gated off; see
-//! `rails_implicit_default_is_not_applied_yet`.)
+//! `verify_authenticity_token` filter Rails registers. Rails' implicit
+//! default on every ActionController::Base chain is on; see
+//! `rails_implicit_default_is_applied`.
 //!
 //! Campfire's shape is the one that matters: the macro sits in the
 //! `Authentication` concern's `included do`, AFTER `require_authentication`,
@@ -108,13 +108,26 @@ fn skip_forgery_protection_removes_the_check() {
 }
 
 #[test]
-fn rails_implicit_default_is_not_applied_yet() {
+fn skip_before_action_verify_authenticity_token_removes_the_check() {
+    let files = emit(vec![
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\nend\n",
+        ),
+        (
+            "app/controllers/rooms_controller.rb",
+            "class RoomsController < ApplicationController\n  skip_before_action :verify_authenticity_token\n\n  def create\n  end\nend\n",
+        ),
+        ("config/routes.rb", "Rails.application.routes.draw do\n  resources :rooms, only: [:create]\nend\n"),
+    ]);
+    let rooms = get(&files, "rooms_controller.rb");
+    assert!(!rooms.contains("verify_authenticity_token"), "{rooms}");
+}
+
+#[test]
+fn rails_implicit_default_is_applied() {
     // Rails puts `verify_authenticity_token` at the head of every chain
     // rooted at ActionController::Base (`default_protect_from_forgery`).
-    // Gated off in `build_filter_preamble`: an app relying on it —
-    // real-blog — is emitted for the strict targets too, which have no
-    // such method. Pinned so turning it on is a decision with a test
-    // to update, not a side effect.
     let files = emit(vec![
         (
             "app/controllers/application_controller.rb",
@@ -127,7 +140,9 @@ fn rails_implicit_default_is_not_applied_yet() {
         ("config/routes.rb", "Rails.application.routes.draw do\n  resources :rooms, only: [:create]\nend\n"),
     ]);
     let rooms = get(&files, "rooms_controller.rb");
-    assert!(!rooms.contains("verify_authenticity_token"), "{rooms}");
+    let verify = rooms.find("verify_authenticity_token").expect("implicit verify_authenticity_token");
+    let load = rooms.find("load_room").expect("load_room");
+    assert!(verify < load, "the implicit check runs first:\n{rooms}");
 }
 
 #[test]
@@ -144,12 +159,10 @@ fn an_api_controller_is_not_protected() {
 }
 
 #[test]
-fn null_session_is_not_lowered_as_the_exception_filter() {
-    // Rails' bare `protect_from_forgery` is `with: :null_session`: an
-    // unverified request runs with an empty session instead of failing.
-    // That strategy is not modeled, so the macro must not become the
-    // `:exception` filter — it stays an unrecognized class-body macro,
-    // which the survey reports (lobsters writes exactly this).
+fn bare_protect_from_forgery_still_registers_the_check() {
+    // Rails' bare `protect_from_forgery` is `with: :null_session`. This
+    // runtime has one handler (422), so the callback still lands. Residual:
+    // the request is not run with an empty session.
     let files = emit(vec![
         (
             "app/controllers/application_controller.rb",
@@ -162,5 +175,5 @@ fn null_session_is_not_lowered_as_the_exception_filter() {
         ("config/routes.rb", "Rails.application.routes.draw do\n  resources :rooms, only: [:create]\nend\n"),
     ]);
     let rooms = get(&files, "rooms_controller.rb");
-    assert!(!rooms.contains("verify_authenticity_token"), "{rooms}");
+    assert!(rooms.contains("verify_authenticity_token"), "{rooms}");
 }

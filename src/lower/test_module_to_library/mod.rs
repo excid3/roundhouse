@@ -90,6 +90,11 @@ pub fn lower_test_modules_with_inner(
     // RouteHelpers entries into each test class's instance_methods so
     // bare-name dispatch resolves.
     crate::lower::view_to_library::insert_framework_stubs(&mut classes);
+    // Stdlib exceptions (`StandardError`, `ActiveRecord::RecordNotFound`, …)
+    // so retyping test bodies keeps `CLASS_OBJECT_VALUE` on those Const
+    // refs — otherwise `Child < Parent` collapses to Incompatible and
+    // TS/Kotlin/Swift framework `errors_test` throw at emit.
+    crate::analyze::register_stdlib_classes(&mut classes);
     insert_minitest_test_baseline(&mut classes);
     insert_cookie_jar_baseline(&mut classes);
 
@@ -166,13 +171,19 @@ pub fn lower_test_modules_with_inner(
     // setup. Lets dispatch on `self` resolve when one test method
     // calls a setup helper (or when frameworks evolve to support
     // shared utility methods).
-    for lc in &all_lcs {
+    for (idx, lc) in all_lcs.iter().enumerate() {
         let mut info = ClassInfo::default();
         for m in &lc.methods {
             if let Some(sig) = &m.signature {
                 info.instance_methods.insert(m.name.clone(), sig.clone());
                 info.instance_method_kinds.insert(m.name.clone(), m.kind);
             }
+        }
+        // Spliced test-helper constants (DnsTestHelper → WEB_PUSH_…) so
+        // `type_method_body` can seed ConstScope and Value qualify keeps
+        // the bare name rather than re-expanding to the helper module.
+        for (name, _) in &test_modules[idx].constants {
+            info.constants.entry(name.clone()).or_insert(Ty::Untyped);
         }
         // Inherit Minitest::Test assertion methods so `self.assert(...)`
         // dispatch resolves through the registry.
@@ -241,13 +252,19 @@ pub fn lower_test_modules_with_inner(
     // return, and BEFORE the test bodies are typed against the
     // registry. A body the typer cannot name keeps the nil default
     // rather than gaining `untyped`; a test method is never a helper.
+    let synthesized_per_module: Vec<std::collections::HashSet<Symbol>> = test_modules
+        .iter()
+        .map(|tm| {
+            tm.helpers
+                .iter()
+                .filter(|h| h.signature.is_none())
+                .map(|h| h.name.clone())
+                .collect()
+        })
+        .collect();
+    let mut lifted_sigs_per_module = vec![false; all_lcs.len()];
     for (idx, lc) in all_lcs.iter_mut().enumerate() {
-        let synthesized: std::collections::HashSet<Symbol> = test_modules[idx]
-            .helpers
-            .iter()
-            .filter(|h| h.signature.is_none())
-            .map(|h| h.name.clone())
-            .collect();
+        let synthesized = &synthesized_per_module[idx];
         if synthesized.is_empty() {
             continue;
         }
@@ -268,6 +285,7 @@ pub fn lower_test_modules_with_inner(
                 lifted.push((method.name.clone(), sig.clone()));
             }
         }
+        lifted_sigs_per_module[idx] = !lifted.is_empty();
         if let Some(info) = classes.get_mut(&lc.name) {
             for (name, sig) in lifted {
                 info.instance_methods.insert(name, sig);
@@ -280,9 +298,27 @@ pub fn lower_test_modules_with_inner(
     // per-method loop.
     let blank_defs = crate::lower::blank::AppDefinitions::from_class_registry(&classes);
 
-    for (idx, lc) in all_lcs.iter_mut().enumerate() {
+    for (idx, mut lc) in all_lcs.into_iter().enumerate() {
+        let synthesized = &synthesized_per_module[idx];
+        let lifted_sigs = lifted_sigs_per_module[idx];
         for method in &mut lc.methods {
-            crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            // Helpers with no declared signature were typed in the lift
+            // pass above, before sibling returns were in the registry.
+            // Retype them once those signatures exist. Skip the extra
+            // type only when this module lifted nothing.
+            if !synthesized.contains(&method.name) || lifted_sigs {
+                crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            }
+            // Harvest from this first typed pass, before the rewrites.
+            // Assoc-create / route-id / assert / blank / header rewrites
+            // do not introduce ivar assignments, so the map is the same
+            // as harvesting after them — and one follow-up type then
+            // covers both rewritten nodes and ivar reads. Without the
+            // ivar seed, `@messages = ….to_a` binds nothing and
+            // `@messages.third` is a read off an untyped ivar.
+            let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+            crate::analyze::extract_ivar_assignments(&method.body, &mut ivars);
+            ivars.retain(|_, ty| !ty.is_unknown());
             // Has-many `.create` / `.build` rewrite needs the parent
             // expression's class type — must run AFTER the typer.
             // Statement-shape pass (no outer Assign) so it pairs with
@@ -291,7 +327,8 @@ pub fn lower_test_modules_with_inner(
             // freshly-synthesized Sends/Hash entries get a `ty` —
             // `lowered_real_blog_typing_residual` enforces a
             // 0-untyped ceiling.
-            method.body = crate::lower::seeds_to_library::rewrite_assoc_create_with_models(&method.body, models);
+            let mut rewritten = crate::lower::seeds_to_library::
+                rewrite_assoc_create_with_models_in_place(&mut method.body, models);
             // A record standing where a route helper wants an id.
             // Type-directed, so it must be here and not back where the
             // `RouteHelpers.` receiver was added: at THAT point a test
@@ -300,8 +337,8 @@ pub fn lower_test_modules_with_inner(
             // a chain — neither is a shape the receiver-adding pass can
             // recognize, and both asserted a redirect to
             // `/rooms/#<Room:0x000000012339eda0>`.
-            method.body = crate::lower::controller_to_library::rewrites::
-                project_route_helper_ids(&method.body);
+            rewritten |= crate::lower::controller_to_library::rewrites::
+                project_route_helper_ids_in_place(&mut method.body);
             // Inline assert_*/refute_* sends — replaces vacuous
             // Minitest dispatch with real `raise` so spinel's
             // assertion-correctness signal is non-fake. See
@@ -310,7 +347,7 @@ pub fn lower_test_modules_with_inner(
             // ExprNode::Raise as its native halt-with-message (Ruby
             // `raise`, Crystal `raise`, TS `throw`, …) — see the
             // issue's "Cross-target benefits" table.
-            method.body = inline_assertions::inline_assertions(&method.body);
+            rewritten |= inline_assertions::inline_assertions_in_place(&mut method.body);
             // Ground `blank?`/`present?`/`presence` by receiver type,
             // AFTER the assertion inlining that wraps them in a `raise
             // … if !(…)` and BEFORE the re-type that stamps the result.
@@ -319,32 +356,24 @@ pub fn lower_test_modules_with_inner(
             // controller test files; on a strict target the dynamic
             // send is `undefined method 'present?' for an instance of
             // String` and takes every test behind it.
-            crate::lower::blank::ground_body(&mut method.body, &blank_defs);
-            lowercase_header_reads(&mut method.body);
-            crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
-            // A test's ivars are bound in its own body — the setup is
-            // inlined ahead of every test — so they can be harvested
-            // from this one typed pass and the body re-typed with
-            // them, the way `type_inner_class` does for a stand-in
-            // class. Without it `@messages = ….to_a` binds nothing and
-            // `@messages.third` below is a read off an untyped ivar.
-            let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
-            crate::analyze::extract_ivar_assignments(&method.body, &mut ivars);
-            ivars.retain(|_, ty| !ty.is_unknown());
-            if !ivars.is_empty() {
+            rewritten |= crate::lower::blank::ground_body(&mut method.body, &blank_defs);
+            rewritten |= lowercase_header_reads(&mut method.body);
+            if rewritten || !ivars.is_empty() {
                 crate::lower::typing::type_method_body(method, &classes, &ivars);
             }
             // `second`…`fifth` on a typed Array — type-directed, so
             // here and not in the pre-typing pass over `app.test_modules`.
-            crate::lower::array_ordinal::rewrite_body(&mut method.body);
+            let mut ordinal = crate::lower::array_ordinal::rewrite_body(&mut method.body);
             // `squish` on a typed String receiver — type-directed for
             // the same reason, and after the ordinal rewrite for no
             // reason but that the two are one re-type apart.
-            crate::lower::enumerable_ext::rewrite_body(&mut method.body);
-            crate::lower::typing::type_method_body(method, &classes, &ivars);
+            ordinal |= crate::lower::enumerable_ext::rewrite_body(&mut method.body);
+            if ordinal {
+                crate::lower::typing::type_method_body(method, &classes, &ivars);
+            }
         }
         out.push(LoweredTestModule {
-            test_class: lc.clone(),
+            test_class: lc,
             inner_classes: std::mem::take(&mut typed_inner_per_module[idx]),
             constants: test_modules[idx].constants.clone(),
         });
@@ -370,11 +399,13 @@ pub fn lower_test_modules_with_inner(
 ///   2. Harvest ivar types from the typed bodies — direct `@x = v`
 ///      assignments plus `self.x = v` setter calls (the latter carries
 ///      the inherited AR primary-key `id`, set via `self.id = id`).
-///   3. Re-type every body with the harvested ivar bindings (so `@id`/
-///      `@title` reads resolve to Integer/String), then lift the
-///      inferred body type into each synthesized signature's return
-///      slot. `initialize` is pinned to a nil (void) return rather than
-///      the type of its last assignment.
+///   3. If any ivar was harvested, re-type every body with those
+///      bindings (so `@id`/`@title` reads resolve to Integer/String).
+///      Then lift the inferred body type into each synthesized
+///      signature's return slot. `initialize` is pinned to a nil (void)
+///      return rather than the type of its last assignment. Skip the
+///      retype when harvest found nothing — pass 1 already typed
+///      against empty ivars.
 /// Copy a parent class's instance surface onto `info` for every name
 /// the subclass doesn't declare itself. Only the names are inherited —
 /// an override keeps its own entry, which `type_inner_class` then pins
@@ -489,9 +520,12 @@ fn type_inner_class(inner: &mut LibraryClass, classes: &HashMap<ClassId, ClassIn
     }
 
     // Pass 3 — re-type with ivars, then lift return types into the
-    // signatures we synthesized in pass 1.
+    // signatures we synthesized in pass 1. Skip the retype when harvest
+    // found nothing: pass 1 already typed against empty ivars.
     for (method, was_synthesized) in inner.methods.iter_mut().zip(synthesized) {
-        crate::lower::typing::type_method_body(method, classes, &ivars);
+        if !ivars.is_empty() {
+            crate::lower::typing::type_method_body(method, classes, &ivars);
+        }
         if !was_synthesized {
             continue;
         }
@@ -898,6 +932,10 @@ fn cookie_jar_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("ActionController::CookieJar")), args: vec![] }
 }
 
+fn permanent_cookie_jar_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActionController::PermanentCookieJar")), args: vec![] }
+}
+
 fn signed_cookie_jar_ty() -> Ty {
     Ty::Class { id: ClassId(Symbol::from("ActionController::SignedCookieJar")), args: vec![] }
 }
@@ -916,7 +954,7 @@ fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("raw", fn_sig(vec![key()], Ty::Str)),
         ("raw_set", fn_sig(vec![key(), value()], Ty::Str)),
         ("delete", fn_sig(vec![key()], Ty::Str)),
-        ("permanent", fn_sig(vec![], cookie_jar_ty())),
+        ("permanent", fn_sig(vec![], permanent_cookie_jar_ty())),
         ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
         ("pending", fn_sig(vec![], str_hash.clone())),
         ("to_h", fn_sig(vec![], str_hash.clone())),
@@ -971,6 +1009,24 @@ fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
         signed.clone(),
     );
     classes.insert(ClassId(Symbol::from("SignedCookieJar")), signed);
+
+    // `cookies.permanent`: the unsigned jar's surface, writes expiring.
+    let mut permanent = ClassInfo::default();
+    for (name, sig) in [
+        ("[]", fn_sig(vec![key()], Ty::Str)),
+        ("[]=", fn_sig(vec![key(), value()], Ty::Str)),
+        ("delete", fn_sig(vec![key()], Ty::Str)),
+        ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
+    ] {
+        let sym = Symbol::from(name);
+        permanent.instance_methods.insert(sym.clone(), sig);
+        permanent.instance_method_kinds.insert(sym, AccessorKind::Method);
+    }
+    classes.insert(
+        ClassId(Symbol::from("ActionController::PermanentCookieJar")),
+        permanent.clone(),
+    );
+    classes.insert(ClassId(Symbol::from("PermanentCookieJar")), permanent);
 }
 
 /// Insert a `Minitest::Test` ClassInfo entry — the parent of every
@@ -1006,19 +1062,29 @@ fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
 /// the lookup Rails performs is the same for every spelling. Reads
 /// only, and only in test bodies; the controller's own
 /// `headers["X-Thing"] = …` writes are the app's.
-fn lowercase_header_reads(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut lowercase_header_reads);
+fn lowercase_header_reads(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if lowercase_header_reads(c) {
+            changed = true;
+        }
+    });
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else {
-        return;
+        return changed;
     };
     if method.as_str() != "[]" || args.len() != 1 {
-        return;
+        return changed;
     }
-    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return };
+    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
     if inner.as_str() != "headers" || !inner_args.is_empty() {
-        return;
+        return changed;
     }
     if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {
-        *value = value.to_ascii_lowercase();
+        let lower = value.to_ascii_lowercase();
+        if lower != *value {
+            *value = lower;
+            return true;
+        }
     }
+    changed
 }

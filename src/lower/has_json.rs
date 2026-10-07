@@ -315,6 +315,10 @@ pub fn apply_has_json_lowering(
 
 fn rewrite(expr: &mut Expr, map: &HasJsonColumns) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, map));
+    rewrite_node(expr, map);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, map: &HasJsonColumns) {
     match &mut *expr.node {
         // `x.settings.foo`, `x.settings.foo?`, `x.settings.foo = v` —
         // a plain attribute write ingests as a `foo=` send, so all
@@ -335,7 +339,7 @@ fn rewrite(expr: &mut Expr, map: &HasJsonColumns) {
     }
 }
 
-type HasJsonColumns = HashMap<String, HashMap<String, JsonScalar>>;
+pub(crate) type HasJsonColumns = HashMap<String, HashMap<String, JsonScalar>>;
 
 /// When `recv` is the `<base>.<col>` hop of a schema key named by
 /// `method`, collapse `recv` to `<base>` and answer with the flat

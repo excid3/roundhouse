@@ -61,8 +61,6 @@ use crate::expr::{Expr, ExprNode, Literal};
 const CABLE_MOUNT_PATH: &str = "/cable";
 
 pub fn apply_config_reader_lowering(app: &mut App) {
-    ground_cable_mount_path(app);
-    ground_credentials_readers(app);
     // Reader name -> the type of the value it answers, from the lifted
     // method's own body. Stamped onto each rewritten read for the same
     // reason the synthesized `application` hop below is stamped: this
@@ -91,17 +89,62 @@ pub fn apply_config_reader_lowering(app: &mut App) {
                 (m.name.clone(), ty)
             })
             .collect(),
-        None => return,
+        None => Vec::new(),
     };
-    if lifted.is_empty() {
-        return;
+    let lifted = (!lifted.is_empty()).then_some(lifted);
+    // Cable, credentials, and lifted config reads used to be three
+    // hook+view walks. They match disjoint chains, so one walk is
+    // equivalent: config peels outermost-first (longest chain wins),
+    // then cable/credentials apply post-order on the way back. Tests
+    // only ever saw the config rewrite.
+    super::for_each_hook_body(app, &mut |e| rewrite_fused(e, lifted.as_deref(), true));
+    if let Some(lifted) = lifted.as_deref() {
+        super::for_each_test_body(app, &mut |e| rewrite(e, lifted));
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &lifted));
-    super::for_each_test_body(app, &mut |e| rewrite(e, &lifted));
-    let lifted_for_views = lifted.clone();
     for view in &mut app.views {
-        rewrite(&mut view.body, &lifted_for_views);
+        rewrite_fused(&mut view.body, lifted.as_deref(), true);
     }
+}
+
+/// Combined cable + credentials + (optional) config rewrite. `config`
+/// is outermost-first; cable/credentials are post-order. Surfaces that
+/// never ran config pass `lifted = None`.
+fn rewrite_fused(
+    expr: &mut Expr,
+    lifted: Option<&[(crate::ident::Symbol, Option<crate::ty::Ty>)]>,
+    cable_and_credentials: bool,
+) {
+    if let Some(lifted) = lifted {
+        unwrap_config_tap(expr);
+        if rewrite_write_here(expr, lifted) {
+            super::symbolize_keys::rewrite_node(expr);
+            // rewrite_write_here only config-rewrites the value. Cable,
+            // credentials, and nested symbolize_keys used to reach it
+            // on their own walks; apply them to the new arguments.
+            if let ExprNode::Send { args, .. } = &mut *expr.node {
+                for arg in args {
+                    rewrite_fused(arg, Some(lifted), cable_and_credentials);
+                }
+            }
+            return;
+        }
+        if rewrite_here(expr, lifted) {
+            super::symbolize_keys::rewrite_node(expr);
+            return;
+        }
+    }
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_fused(c, lifted, cable_and_credentials));
+    if cable_and_credentials {
+        rewrite_cable_node(expr);
+        rewrite_credentials_node(expr);
+    }
+    // After `config_reader`: a lifted group reader is the receiver
+    // `symbolize_keys` keys on, and that receiver does not exist until
+    // this walk peels the `config` chain. Post-order on the parent
+    // (`hash.symbolize_keys`) sees the rewritten, typed child. Tests
+    // never ran `symbolize_keys`, so they stay on `rewrite` above.
+    super::symbolize_keys::rewrite_node(expr);
 }
 
 /// The type a reader answers: its body's, or its last statement's when
@@ -127,15 +170,7 @@ fn body_ty(body: &Expr) -> Option<crate::ty::Ty> {
 /// index is the same question, asked of the store we have. A `!` key
 /// (`credentials.x!`, "raise when absent") and the Hash's own methods
 /// are left alone.
-fn ground_credentials_readers(app: &mut App) {
-    super::for_each_hook_body(app, &mut rewrite_credentials_read);
-    for view in &mut app.views {
-        rewrite_credentials_read(&mut view.body);
-    }
-}
-
-fn rewrite_credentials_read(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite_credentials_read);
+fn rewrite_credentials_node(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
         return;
     };
@@ -185,16 +220,8 @@ fn is_credentials_root(e: &Expr) -> bool {
         && matches!(&*rr.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Rails")
 }
 
-fn ground_cable_mount_path(app: &mut App) {
-    super::for_each_hook_body(app, &mut rewrite_cable_mount_path);
-    for view in &mut app.views {
-        rewrite_cable_mount_path(&mut view.body);
-    }
-}
-
 /// `ActionCable.server.config.mount_path` → `"/cable"`.
-fn rewrite_cable_mount_path(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite_cable_mount_path);
+fn rewrite_cable_node(expr: &mut Expr) {
     if !is_cable_mount_path(expr) {
         return;
     }

@@ -35,6 +35,7 @@ const JOB_FILTER_HELPERS: &[&str] = &[
     "assert_enqueued_with",
 ];
 
+#[allow(dead_code)]
 pub fn apply_job_test_only_lowering(app: &mut App) {
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
@@ -51,6 +52,10 @@ pub fn apply_job_test_only_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     // `assert_enqueued_email_with PasswordsMailer, :reset` — the mailer
     // is the first POSITIONAL argument, and a name like a job's.

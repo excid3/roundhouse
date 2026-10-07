@@ -58,7 +58,7 @@ const SKIP: &[&str] = &["tmp", "log", "storage", "node_modules", ".git"];
 
 /// Start from `fixtures/real-blog`.
 pub fn real_blog() -> Overlay {
-    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), edits: Vec::new() }
+    Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new() }
 }
 
 /// Start from an empty tree and `write` the app file by file, for a
@@ -66,11 +66,13 @@ pub fn real_blog() -> Overlay {
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
     std::fs::create_dir_all(&base).expect("mkdir");
-    Overlay { base, edits: Vec::new() }
+    Overlay { base, scratch_base: true, edits: Vec::new() }
 }
 
 pub struct Overlay {
     base: PathBuf,
+    /// `base` is this overlay's own scratch tree, removed once copied.
+    scratch_base: bool,
     edits: Vec<Edit>,
 }
 
@@ -124,7 +126,7 @@ impl Overlay {
     }
 
     fn run_test_with(self, flags: &[&str], test_path: &str) -> Run {
-        let (emitted, errors) = self.emit(BuildTarget::Ruby);
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
         let output = ruby()
             .args(flags)
             .args(["-Itest", "-I."])
@@ -141,7 +143,7 @@ impl Overlay {
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
     pub fn run_ruby(self, script: &str) -> Run {
-        let (emitted, errors) = self.emit(BuildTarget::Ruby);
+        let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
         let script = format!(
             "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\n{script}"
         );
@@ -158,7 +160,7 @@ impl Overlay {
     /// Compile the unchanged Spinel output and run its native binary.
     /// The consumer boots libraries, not the HTTP server or a database.
     pub fn run_spinel(self, script: &str) -> Run {
-        let (emitted, errors) = self.emit(BuildTarget::Spinel);
+        let (emitted, errors) = self.emit_tree(BuildTarget::Spinel);
         std::fs::write(emitted.join("contract.rb"), format!("require_relative \"boot\"\n{script}"))
             .expect("write native consumer");
         let compiler = std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into());
@@ -175,11 +177,20 @@ impl Overlay {
     }
 
     /// Copy the fixture, apply the edits, analyze, and write the Ruby
-    /// target. Returns the emitted tree and `check`'s error diagnostics.
-    pub fn emit(self, target: BuildTarget) -> (PathBuf, Vec<String>) {
+    /// target. Returns the emitted tree, removed with its scratch when
+    /// dropped (see `Run`'s `Drop`), and `check`'s error diagnostics.
+    pub fn emit(self, target: BuildTarget) -> (Emitted, Vec<String>) {
+        let (dir, errors) = self.emit_tree(target);
+        (Emitted(dir), errors)
+    }
+
+    fn emit_tree(self, target: BuildTarget) -> (PathBuf, Vec<String>) {
         let scratch = scratch_dir();
         let source = scratch.join("app");
         copy_tree(&self.base, &source);
+        if self.scratch_base {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
         for edit in &self.edits {
             match edit {
                 Edit::Write { path, content } => {
@@ -268,6 +279,48 @@ impl Run {
             self.stdout,
             self.stderr,
         );
+    }
+}
+
+/// A run takes its scratch tree with it, unless its test is failing (the
+/// failure names the tree) or `ROUNDHOUSE_KEEP_EMITTED=1` keeps every one.
+/// A run expected to fail is a passing test and is removed too. Left
+/// behind, a full suite fills `/tmp`'s inodes.
+impl Drop for Run {
+    fn drop(&mut self) {
+        remove_scratch(&self.emitted);
+    }
+}
+
+/// An emitted tree, read as its path; removed like a `Run`'s.
+pub struct Emitted(PathBuf);
+
+impl std::ops::Deref for Emitted {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+// So `Command::current_dir(&emitted)` and the other `AsRef<Path>` APIs
+// take it as they took the PathBuf it replaced.
+impl AsRef<Path> for Emitted {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Emitted {
+    fn drop(&mut self) {
+        remove_scratch(&self.0);
+    }
+}
+
+fn remove_scratch(emitted: &Path) {
+    if !std::thread::panicking() && std::env::var_os("ROUNDHOUSE_KEEP_EMITTED").is_none() {
+        if let Some(scratch) = emitted.parent() {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
     }
 }
 

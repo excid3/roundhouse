@@ -34,12 +34,35 @@ module ActiveSupport
 
   def self.format_db_date(value)
     return nil if value.nil?
+    return nil if value.is_a?(String) && value.empty?
     date = case value
     when Date then value.to_date
     when String then Date.iso8601(value)
     else raise TypeError, "expected Date or ISO date text"
     end
     date.iso8601
+  end
+
+  # Not `Date.today`: that reads the host clock, ignoring the app's zone and `travel`.
+  def self.current_date
+    now = ActiveSupport.now
+    Date.new(now.year, now.month, now.day)
+  end
+
+  def self.date_beginning_of_month(date)
+    Date.new(date.year, date.month, 1)
+  end
+
+  def self.date_end_of_month(date)
+    Date.new(date.year, date.month, -1)
+  end
+
+  def self.date_beginning_of_day(date)
+    ActiveSupport.local_time(date.year, date.month, date.day, 0, 0, 0, 0)
+  end
+
+  def self.date_end_of_day(date)
+    ActiveSupport.local_time(date.year, date.month, date.day, 23, 59, 59, 999_999_999)
   end
 
   # Rails zone name → IANA identifier (the ActiveSupport::TimeZone::

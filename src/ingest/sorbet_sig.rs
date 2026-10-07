@@ -31,12 +31,26 @@ use super::util::constant_id_str;
 /// Method signatures declared with `sig` in one Ruby file, keyed by the
 /// enclosing class's qualified name.
 pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbol, Ty>> {
+    ingest_sorbet_declarations(source).0
+}
+
+/// Signatures plus the names declared `sig { abstract… }` per class or
+/// module. An abstract method is a declaration with no implementation to
+/// carry: the includer supplies it.
+pub fn ingest_sorbet_declarations(
+    source: &[u8],
+) -> (
+    HashMap<ClassId, HashMap<Symbol, Ty>>,
+    HashMap<ClassId, std::collections::HashSet<Symbol>>,
+) {
     let result = ruby_prism::parse(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut abstracts = HashMap::new();
+    let mut sides = MethodSides::new();
     walk(
         &program.statements().body().iter().collect::<Vec<_>>(),
         None,
@@ -44,10 +58,31 @@ pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbo
         &HashMap::new(),
         &HashMap::new(),
         &mut out,
+        &mut abstracts,
+        &mut sides,
         source,
     );
-    out
+    // The table holds one signature per (class, name), read by both the
+    // instance and the singleton side. A class that defines `def
+    // self.to_entity(record)` beside `def to_entity(lookup: nil)` has
+    // two different signatures under one key, and whichever was read
+    // last used to type both bodies: the class method's `record` came out
+    // as the instance method's keyword `lookup`. A signature that would
+    // apply to the wrong side is worse than none, so a name defined on
+    // both sides keeps neither and is inferred as before.
+    for (class, methods) in out.iter_mut() {
+        methods.retain(|name, _| {
+            !sides
+                .get(&(class.clone(), name.clone()))
+                .is_some_and(|(instance, singleton)| *instance && *singleton)
+        });
+    }
+    (out, abstracts)
 }
+
+/// Which sides of a class define each method name: `(instance,
+/// singleton)`.
+type MethodSides = HashMap<(ClassId, Symbol), (bool, bool)>;
 
 /// `in_singleton_class` is true while walking a `class << self` body.
 /// The methods there are the enclosing class's SINGLETON methods even
@@ -61,6 +96,8 @@ fn walk(
     aliases: &HashMap<String, Ty>,
     rbs_aliases: &crate::rbs::AliasTable,
     out: &mut HashMap<ClassId, HashMap<Symbol, Ty>>,
+    abstracts: &mut HashMap<ClassId, std::collections::HashSet<Symbol>>,
+    sides: &mut MethodSides,
     source: &[u8],
 ) {
     // The `sig` immediately above a `def` is the one that applies to
@@ -92,7 +129,7 @@ fn walk(
                     // matter; an enclosing scope's aliases stay visible.
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, class.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -105,7 +142,7 @@ fn walk(
                     let statements = body.body().iter().collect::<Vec<_>>();
                     let inner = collect_type_aliases(&statements, aliases);
                     let inner_rbs = scoped_rbs_aliases(source, module.location(), &statements, rbs_aliases);
-                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, source);
+                    walk(&statements, Some(&name), false, &inner, &inner_rbs, out, abstracts, sides, source);
                 }
             }
             pending = None;
@@ -120,14 +157,30 @@ fn walk(
         if let Some(singleton) = statement.as_singleton_class_node() {
             if let Some(body) = singleton.body() {
                 if let Some(body) = body.as_statements_node() {
-                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, source);
+                    walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases, rbs_aliases, out, abstracts, sides, source);
                 }
             }
             pending = None;
             continue;
         }
         if let Some(def) = statement.as_def_node() {
+            if let Some(scope) = scope {
+                let entry = sides
+                    .entry((ClassId(Symbol::new(scope)), Symbol::new(constant_id_str(&def.name()))))
+                    .or_default();
+                if in_singleton_class || def.receiver().is_some() {
+                    entry.1 = true;
+                } else {
+                    entry.0 = true;
+                }
+            }
             if let (Some(sig), Some(scope)) = (pending.take(), scope) {
+                if !in_singleton_class && def.receiver().is_none() && sig_is_abstract(&statements[sig]) {
+                    abstracts
+                        .entry(ClassId(Symbol::new(scope)))
+                        .or_default()
+                        .insert(Symbol::new(constant_id_str(&def.name())));
+                }
                 if let Some(ty) = signature_ty(&statements[sig], &def, in_singleton_class, aliases) {
                     out.entry(ClassId(Symbol::new(scope)))
                         .or_default()
@@ -292,18 +345,36 @@ fn literal_ty(node: &Node<'_>) -> Option<Ty> {
     None
 }
 
-fn symbol_name(node: &Node<'_>) -> Option<String> {
+pub(super) fn symbol_name(node: &Node<'_>) -> Option<String> {
     let symbol = node.as_symbol_node()?;
     Some(String::from_utf8_lossy(symbol.value_loc()?.as_slice()).into_owned())
 }
 
-fn is_sig_call(call: &ruby_prism::CallNode<'_>) -> bool {
+/// Does the `sig` chain carry the `abstract` modifier?
+fn sig_is_abstract(sig: &Node<'_>) -> bool {
+    let Some(call) = sig.as_call_node() else { return false };
+    let Some(block) = call.block() else { return false };
+    let Some(block) = block.as_block_node() else { return false };
+    let Some(body) = block.body() else { return false };
+    let Some(body) = body.as_statements_node() else { return false };
+    let mut link = body.body().iter().next();
+    while let Some(node) = link {
+        let Some(call) = node.as_call_node() else { return false };
+        if constant_id_str(&call.name()) == "abstract" {
+            return true;
+        }
+        link = call.receiver();
+    }
+    false
+}
+
+pub(super) fn is_sig_call(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     constant_id_str(&name) == "sig" && call.receiver().is_none() && call.block().is_some()
 }
 
 /// `Foo`, `Foo::Bar` — the class's own path as written.
-fn constant_path_name(node: &Node<'_>) -> String {
+pub(super) fn constant_path_name(node: &Node<'_>) -> String {
     if let Some(read) = node.as_constant_read_node() {
         return constant_id_str(&read.name()).to_string();
     }
@@ -320,7 +391,7 @@ fn constant_path_name(node: &Node<'_>) -> String {
     String::new()
 }
 
-fn qualify(scope: Option<&str>, name: &str) -> String {
+pub(super) fn qualify(scope: Option<&str>, name: &str) -> String {
     match scope {
         Some(scope) if !name.is_empty() => format!("{scope}::{name}"),
         _ => name.to_string(),
@@ -386,7 +457,11 @@ fn signature_ty(
             }
             // Modifiers carry no type: `override`, `overridable`,
             // `abstract`, `final`, `checked(:never)`, `type_parameters`.
-            "override" | "overridable" | "abstract" | "final" | "checked" => {}
+            // `type_parameters(:U)` only DECLARES the variables a
+            // `T.type_parameter(:U)` below names; `bind(Foo)` says what
+            // `self` is inside a block the method takes.
+            "override" | "overridable" | "abstract" | "final" | "checked" | "type_parameters"
+            | "bind" => {}
             _ => return None,
         }
         link = call.receiver();
@@ -396,9 +471,24 @@ fn signature_ty(
     }
 
     let mut params = Vec::new();
+    let mut block = None;
     if let Some(parameters) = def.parameters() {
         for (name, kind) in def_parameters(&parameters)? {
-            let ty = declared.remove(&name)?;
+            let mut ty = declared.remove(&name)?;
+            // The block parameter is the method's block: `T.proc…`, or
+            // `T.nilable(T.proc…)` when a caller may omit it. Recorded
+            // both as the block and as the parameter, the way the RBS
+            // reader does, holding the callable itself.
+            if kind == ParamKind::Block {
+                if let Ty::Union { variants } = &ty {
+                    if let [only @ Ty::Fn { .. }, Ty::Nil] = variants.as_slice() {
+                        ty = only.clone();
+                    }
+                }
+                if matches!(ty, Ty::Fn { .. }) {
+                    block = Some(Box::new(ty.clone()));
+                }
+            }
             params.push(Param { name: Symbol::new(&name), ty, kind });
         }
     }
@@ -410,7 +500,7 @@ fn signature_ty(
 
     Some(Ty::Fn {
         params,
-        block: None,
+        block,
         ret: Box::new(returns?),
         effects: EffectSet::pure(),
     })
@@ -419,7 +509,7 @@ fn signature_ty(
 /// The def's own parameters, in order, with the kind Ruby gives them —
 /// the sig names them all the same way, so the def is what says whether
 /// `x` is positional, optional or keyword.
-fn def_parameters(
+pub(super) fn def_parameters(
     parameters: &ruby_prism::ParametersNode<'_>,
 ) -> Option<Vec<(String, ParamKind)>> {
     let mut out = Vec::new();
@@ -473,7 +563,7 @@ fn def_parameters(
 /// parameter declared with one typed as a class nobody defines. The
 /// emit already drops these constants for having no runtime; this is
 /// the other half, reading what they were for.
-fn collect_type_aliases(
+pub(super) fn collect_type_aliases(
     statements: &[Node<'_>],
     outer: &HashMap<String, Ty>,
 ) -> HashMap<String, Ty> {
@@ -518,7 +608,7 @@ fn collect_type_aliases(
 /// cannot spell, so it stays unread. `T.attached_class` needs no such
 /// test — it MEANS "an instance of the attached class" and sorbet only
 /// admits it where that is what it is.
-fn sorbet_ty(
+pub(super) fn sorbet_ty(
     node: &Node<'_>,
     self_is_instance: bool,
     aliases: &HashMap<String, Ty>,
@@ -543,13 +633,69 @@ fn sorbet_ty(
         }
         return Some(named_ty(&name));
     }
+    // `{ max_per_pod: Integer, in: Duration }` — a shape, the hash
+    // whose keys are known. The same thing RBS spells `{ key: T }`.
+    if let Some(hash) = node.as_hash_node() {
+        let mut fields = indexmap::IndexMap::new();
+        for element in hash.elements().iter() {
+            let assoc = element.as_assoc_node()?;
+            let key = assoc.key();
+            let key = key.as_symbol_node()?;
+            let name = String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+            fields.insert(
+                Symbol::new(&name),
+                sorbet_ty(&assoc.value(), self_is_instance, aliases)?,
+            );
+        }
+        return Some(Ty::Record { row: crate::ty::Row { fields, rest: None } });
+    }
+    // `[Integer, String]` — a tuple.
+    if let Some(array) = node.as_array_node() {
+        let elems: Vec<Ty> = array
+            .elements()
+            .iter()
+            .map(|e| sorbet_ty(&e, self_is_instance, aliases))
+            .collect::<Option<_>>()?;
+        return Some(Ty::Tuple { elems });
+    }
+    // `(Foo)` around a type is the type.
+    if let Some(parens) = node.as_parentheses_node() {
+        let body = parens.body()?.as_statements_node()?;
+        let mut statements = body.body().iter();
+        let only = statements.next()?;
+        return if statements.next().is_none() {
+            sorbet_ty(&only, self_is_instance, aliases)
+        } else {
+            None
+        };
+    }
     // `T::Array[String]`, `T::Hash[Symbol, Integer]`, `T::Set[X]`
     if let Some(index) = node.as_call_node() {
         let name = index.name();
         let method = constant_id_str(&name).to_string();
+        // `T.proc.params(a: A).returns(R)` / `.void` — a block or
+        // callable, the type RBS spells `^(A) -> R`. `bind(Foo)` says
+        // what `self` is inside it and `checked` how hard runtime
+        // checks it; neither is a type.
+        if let Some(fn_ty) = sorbet_proc_ty(&index, self_is_instance, aliases) {
+            return fn_ty;
+        }
         if method == "[]" {
             let receiver = index.receiver()?;
             let container = constant_path_name(&receiver);
+            // A generic app or gem class: `Result[Ok, Err]`
+            // is an instance of that class whatever its parameters; a
+            // parameter this grammar cannot read is `untyped`, not a
+            // reason to lose the class.
+            if !container.is_empty() && !container.starts_with("T::") {
+                let args = index
+                    .arguments()?
+                    .arguments()
+                    .iter()
+                    .map(|a| sorbet_ty(&a, self_is_instance, aliases).unwrap_or(Ty::Untyped))
+                    .collect();
+                return Some(Ty::Class { id: ClassId(Symbol::new(&container)), args });
+            }
             let args: Vec<Ty> = index
                 .arguments()?
                 .arguments()
@@ -571,6 +717,33 @@ fn sorbet_ty(
             // it. `dispatch` substitutes it there.
             "attached_class" => Some(Ty::SelfInstance),
             "self_type" if self_is_instance => Some(Ty::SelfInstance),
+            // A class object. `Ty` has no class-object type — a
+            // constant read types as the class itself and dispatch
+            // consults both sides — so the class stands for it, named
+            // as written (`T.class_of(String)` is the class String).
+            "class_of" => {
+                let argument = index.arguments()?.arguments().iter().next()?;
+                let id = constant_path_name(&argument);
+                (!id.is_empty()).then(|| Ty::Class { id: ClassId(Symbol::new(&id)), args: Vec::new() })
+            }
+            // What `raise` returns: no value.
+            "noreturn" => Some(Ty::Bottom),
+            // The supertype of everything; nothing can be called on it,
+            // so `untyped` answers the same.
+            "anything" => Some(Ty::Untyped),
+            // `T.type_parameter(:U)`, declared by `type_parameters(:U)`.
+            // The analyzer does not instantiate a signature's variables
+            // per call: an unmodelled boundary, so `untyped`.
+            "type_parameter" => Some(Ty::Untyped),
+            "all" => {
+                let members: Vec<Ty> = index
+                    .arguments()?
+                    .arguments()
+                    .iter()
+                    .map(|a| sorbet_ty(&a, self_is_instance, aliases))
+                    .collect::<Option<_>>()?;
+                (!members.is_empty()).then(|| crate::rbs::intersection_ty(members))
+            }
             "nilable" => {
                 let inner =
                     sorbet_ty(&index.arguments()?.arguments().iter().next()?, self_is_instance, aliases)?;
@@ -591,6 +764,75 @@ fn sorbet_ty(
     None
 }
 
+/// A `T.proc` chain read as `Ty::Fn`. `Some(None)` when the chain is a
+/// `T.proc` this grammar cannot read (the caller drops the signature),
+/// `None` when the call is not a `T.proc` chain at all.
+fn sorbet_proc_ty(
+    call: &ruby_prism::CallNode<'_>,
+    self_is_instance: bool,
+    aliases: &HashMap<String, Ty>,
+) -> Option<Option<Ty>> {
+    // Walk to the root first: only `T.proc` heads such a chain.
+    let mut chain = vec![call.as_node().as_call_node()?];
+    loop {
+        let receiver = chain.last()?.receiver()?;
+        match receiver.as_call_node() {
+            Some(next) => chain.push(next),
+            None => {
+                let root = chain.pop()?;
+                let names_t = receiver
+                    .as_constant_read_node()
+                    .is_some_and(|c| constant_id_str(&c.name()) == "T");
+                if !names_t || constant_id_str(&root.name()) != "proc" {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    let read = || -> Option<Ty> {
+        let mut params = Vec::new();
+        let mut ret: Option<Ty> = None;
+        // Outermost link first; the inner `params` is written first, so
+        // walk from the root outward.
+        for link in chain.iter().rev() {
+            match constant_id_str(&link.name()) {
+                "params" => {
+                    for argument in link.arguments()?.arguments().iter() {
+                        let hash = argument.as_keyword_hash_node()?;
+                        for element in hash.elements().iter() {
+                            let assoc = element.as_assoc_node()?;
+                            let key = assoc.key();
+                            let key = key.as_symbol_node()?;
+                            let name =
+                                String::from_utf8_lossy(key.value_loc()?.as_slice()).into_owned();
+                            params.push(Param {
+                                name: Symbol::new(&name),
+                                ty: sorbet_ty(&assoc.value(), self_is_instance, aliases)?,
+                                kind: ParamKind::Required,
+                            });
+                        }
+                    }
+                }
+                "returns" => {
+                    let argument = link.arguments()?.arguments().iter().next()?;
+                    ret = Some(sorbet_ty(&argument, self_is_instance, aliases)?);
+                }
+                "void" => ret = Some(Ty::Nil),
+                "bind" | "checked" => {}
+                _ => return None,
+            }
+        }
+        Some(Ty::Fn {
+            params,
+            block: None,
+            ret: Box::new(ret.unwrap_or(Ty::Untyped)),
+            effects: EffectSet::default(),
+        })
+    };
+    Some(read())
+}
+
 /// A constant in type position, mapped the way the RBS reader maps the
 /// same names so both sources agree.
 fn named_ty(name: &str) -> Ty {
@@ -598,6 +840,8 @@ fn named_ty(name: &str) -> Ty {
         "Integer" => Ty::Int,
         "Float" => Ty::Float,
         "String" => Ty::Str,
+        "Hash" => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
+        "Array" => Ty::Array { elem: Box::new(Ty::Untyped) },
         "Symbol" => Ty::Sym,
         "TrueClass" | "FalseClass" => Ty::Bool,
         "NilClass" => Ty::Nil,
@@ -791,4 +1035,10 @@ fn rbs_comment_text(source: &[u8], def_start: usize) -> Option<String> {
         }
     }
     (!sig.is_empty()).then_some(sig)
+}
+
+/// A Sorbet type expression (`T.nilable(Foo)`, `T::Array[String]`, ...)
+/// read as a `Ty`, for `T.let(x, Type)`.
+pub(super) fn sorbet_type_node(node: &Node<'_>) -> Option<Ty> {
+    sorbet_ty(node, true, &HashMap::new())
 }

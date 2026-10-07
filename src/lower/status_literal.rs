@@ -86,6 +86,10 @@ fn int_to_sym(e: &mut Expr) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     match method.as_str() {
         "render" | "redirect_to" | "head" => {}

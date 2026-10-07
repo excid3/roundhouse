@@ -242,12 +242,20 @@ fi
 # Newest mise install of each tool, if present. Existence-guarded so a
 # box without go/elixir is unchanged; not a pinned patch (3.4.11) so
 # the next MRI bump does not leave this script looking at a hole.
+#
+# PLAIN VERSION DIRECTORIES ONLY (`4.0.5`, `1.26.4`). mise installs other
+# implementations beside them under the same tool — `truffleruby-40.0.0`
+# and `jruby-10.1.1.0` live in installs/ruby — and `sort -V` puts those
+# AFTER every MRI version, so "newest ruby" was TruffleRuby. The Rails
+# oracle then booted under it and died loading the `debug` gem (unknown
+# event: call): every nightly campfire run on the box from 10-05.
 mise_prepend_latest() {
     local tool="$1"
     local base="$HOME/.local/share/mise/installs/$tool"
     local d
     [[ -d "$base" ]] || return 0
     d="$(find "$base" -mindepth 2 -maxdepth 2 -type d -name bin ! -path '*/latest/*' 2>/dev/null \
+        | grep -E '/[0-9][0-9.]*(-otp-[0-9]+)?/bin$' \
         | sort -V | tail -1 || true)"
     if [[ -n "$d" && -d "$d" ]]; then PATH="$d:$PATH"; fi
     return 0

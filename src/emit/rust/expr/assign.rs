@@ -153,6 +153,18 @@ pub(super) fn emit_assign(target: &LValue, value: &Expr) -> String {
                         emit_expr(index),
                     );
                 }
+                let leaf = cls.rsplit("::").next().unwrap_or(cls);
+                if leaf == "HeaderStore" {
+                    let opt_str = crate::ty::Ty::Union {
+                        variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil],
+                    };
+                    let wrapped = super::coerce_arg_for_param_ty(value, &opt_str);
+                    return format!(
+                        "{}.set_index({}, {wrapped})",
+                        emit_expr(recv),
+                        emit_expr(index),
+                    );
+                }
                 // Other Ty::Class receivers route through `set_index`
                 // (per the operator-method rewrite in `sanitize_ident`).
                 // Wrap String RHS with `serde_json::Value::from`

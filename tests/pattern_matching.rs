@@ -21,6 +21,24 @@ fn parse(source: &str) -> Expr {
     .unwrap()
 }
 
+/// Analyzer unions are canonicalized by structural `ty_tag` (Nil last), not
+/// Debug-string order. Treat variant lists as sets so a sort-key change
+/// cannot flake an otherwise equivalent type.
+fn same_ty(a: &Ty, b: &Ty) -> bool {
+    match (a, b) {
+        (Ty::Union { variants: av }, Ty::Union { variants: bv }) => {
+            av.len() == bv.len()
+                && av.iter().all(|v| bv.iter().any(|w| same_ty(v, w)))
+                && bv.iter().all(|v| av.iter().any(|w| same_ty(v, w)))
+        }
+        (Ty::Array { elem: a }, Ty::Array { elem: b }) => same_ty(a, b),
+        (Ty::Hash { key: ak, value: av }, Ty::Hash { key: bk, value: bv }) => {
+            same_ty(ak, bk) && same_ty(av, bv)
+        }
+        _ => a == b,
+    }
+}
+
 #[test]
 fn native_matches_preserve_expression_precedence_and_pattern_syntax() {
     for (source, expected) in [
@@ -110,8 +128,11 @@ fn pattern_locals_survive_guard_failure_predicates_and_required_matches() {
         ),
         (
             "(7 in n) && n",
+            // Canonicalizer is structural (`ty_tag`, Nil last), not Debug
+            // string order — Int before Bool. Compare unions as sets below
+            // so this does not flake if the sort key changes again.
             Ty::Union {
-                variants: vec![Ty::Bool, Ty::Int, Ty::Nil],
+                variants: vec![Ty::Int, Ty::Bool, Ty::Nil],
             },
         ),
         (
@@ -122,10 +143,10 @@ fn pattern_locals_survive_guard_failure_predicates_and_required_matches() {
         ),
     ] {
         let mut expr = parse(source);
-        assert_eq!(
-            typer.analyze_expr(&mut expr, &Ctx::default()),
-            expected,
-            "{source}"
+        let got = typer.analyze_expr(&mut expr, &Ctx::default());
+        assert!(
+            same_ty(&got, &expected),
+            "{source}\n  left:  {got:?}\n  right: {expected:?}"
         );
     }
 }

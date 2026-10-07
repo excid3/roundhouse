@@ -17,12 +17,18 @@ use crate::app::App;
 use crate::expr::{BoolOpKind, BoolOpSurface, Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
 
+#[allow(dead_code)]
 pub fn apply_system_exception_lowering(app: &mut App) {
     super::for_each_hook_body(app, &mut rewrite);
 }
 
+#[allow(dead_code)]
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
         return;
     };

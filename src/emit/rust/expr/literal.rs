@@ -321,35 +321,42 @@ pub(super) fn string_interp_fmt_and_args(parts: &[InterpPart]) -> (String, Vec<S
                 // format spec uses `Display`, which for
                 // `serde_json::Value` is the JSON serialization —
                 // `Value::String("foo")` displays as `"\"foo\""`,
-                // not `foo`. Route Untyped/Record-typed exprs
-                // through `RubyToS::ruby_to_s` (defined in
-                // `runtime/rust/http.rs`) so the interpolation
-                // matches Ruby's identity-on-String semantics. The
-                // trait dispatches at compile time to the right
-                // impl for `&str`/`String`/`&Value`, so emitting
-                // `.ruby_to_s()` for Untyped exprs is safe even
-                // when the body-typer's annotation imprecisely
-                // marks an actually-`&String` closure param as
-                // Untyped.
+                // not `foo`. Route Value-shaped exprs through
+                // `RubyToS::ruby_to_s` (defined in `runtime/rust/http.rs`)
+                // so the interpolation matches Ruby's identity-on-String
+                // semantics. The trait dispatches at compile time to the
+                // right impl for `&str`/`String`/`&Value`, so emitting
+                // `.ruby_to_s()` is safe even when the body-typer's
+                // annotation imprecisely marks an actually-`&String`
+                // closure param as Untyped.
                 let arg = emit_expr(expr);
-                // Fire on Untyped / Record (lowered IR's serde_json
-                // ::Value alias) and on missing-Ty Sends whose recv
-                // is itself Value-shaped — the body-typer doesn't
-                // always propagate the result Ty through nested
-                // `value[key]` index Sends, but emit-side
-                // inspection of the recv catches the same pattern.
-                // The trait dispatch picks the right impl at
-                // compile time, so a false positive on a `&str`
-                // expression still compiles (the impl for `str`
-                // returns `self.to_string()`).
-                let needs_ruby_to_s = matches!(
-                    expr.ty.as_ref(),
-                    Some(crate::ty::Ty::Untyped) | Some(crate::ty::Ty::Record { .. })
-                ) || expr_recv_is_value(expr);
-                if needs_ruby_to_s {
-                    args.push(format!("({arg}).ruby_to_s()"));
-                } else {
-                    args.push(arg);
+                // Fire on Untyped / Record (method-style; those files
+                // import `RubyToS`) and on other rust_value_shaped
+                // types via UFCS so ActionController compiles without
+                // the trait in scope. Missing-Ty Sends whose recv is
+                // itself Untyped/Record still get method-style — the
+                // body-typer doesn't always propagate the result Ty
+                // through nested `value[key]` index Sends.
+                match expr.ty.as_ref() {
+                    Some(crate::ty::Ty::Untyped) | Some(crate::ty::Ty::Record { .. }) => {
+                        args.push(format!("({arg}).ruby_to_s()"));
+                    }
+                    Some(ty)
+                        if super::super::ty::rust_value_shaped(ty)
+                            && matches!(
+                                &*expr.node,
+                                crate::expr::ExprNode::Var { .. }
+                                    | crate::expr::ExprNode::Ivar { .. }
+                            ) =>
+                    {
+                        args.push(format!(
+                            "<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({arg}))"
+                        ));
+                    }
+                    _ if expr_recv_is_value(expr) => {
+                        args.push(format!("({arg}).ruby_to_s()"));
+                    }
+                    _ => args.push(arg),
                 }
             }
         }
@@ -362,7 +369,10 @@ pub(super) fn string_interp_fmt_and_args(parts: &[InterpPart]) -> (String, Vec<S
 /// at runtime even though the typing pass didn't propagate the
 /// inner result Ty. Currently only catches `recv[key]` and
 /// `recv.method()` shapes; deeper chains land here recursively
-/// through the index recv.
+/// through the index recv. Unions / ParamValue are handled via
+/// `rust_value_shaped` on `expr.ty` itself (UFCS), not this recv
+/// walk — walking them here would wrap Hash/Session `.get()` Option
+/// returns that rust-emit as `Option<T>`.
 fn expr_recv_is_value(expr: &Expr) -> bool {
     use crate::expr::ExprNode;
     let recv_opt: Option<&Expr> = match &*expr.node {
@@ -382,7 +392,18 @@ fn expr_recv_is_value(expr: &Expr) -> bool {
 /// floating-typed when the value has no fractional part.
 pub(crate) fn emit_literal(lit: &Literal) -> String {
     match lit {
-        Literal::Nil => "None".to_string(),
+        Literal::Nil => {
+            // Tail `nil` in an untyped/Value-returning method is
+            // `Value::Null`, not Option::None (`request_for_csrf`).
+            if in_return_tail() {
+                if let Some(ty) = current_return_ty() {
+                    if super::super::ty::rust_value_shaped(&ty) {
+                        return "serde_json::Value::Null".to_string();
+                    }
+                }
+            }
+            "None".to_string()
+        }
         Literal::Bool { value } => value.to_string(),
         Literal::Int { value } => format!("{value}_i64"),
         Literal::Float { value } => {

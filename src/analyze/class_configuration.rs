@@ -47,8 +47,8 @@ impl Analyzer {
             for item in &controller.body {
                 if let ControllerBodyItem::ClassMethod {
                     method,
-                    configuration_slot: key,
-                    configuration_role: ClassConfigurationRole::Writer,
+                    configuration_slot: Some(key),
+                    configuration_role: Some(ClassConfigurationRole::Writer),
                     ..
                 } = item
                 {
@@ -72,8 +72,8 @@ impl Analyzer {
             for item in &mut controller.body {
                 let ControllerBodyItem::ClassMethod {
                     method,
-                    configuration_slot,
-                    configuration_role,
+                    configuration_slot: Some(configuration_slot),
+                    configuration_role: Some(configuration_role),
                     ..
                 } = item
                 else {
@@ -101,7 +101,6 @@ impl Analyzer {
                 }
                 seed_empty_hashes(&mut method.body, &ty);
                 self.body_typer().analyze_expr(&mut method.body, &ctx);
-                method.effects = self.collect_effects(&mut method.body, &ctx);
                 method.signature = Some(Ty::Fn {
                     params: method
                         .params

@@ -55,15 +55,26 @@ pub fn apply_enumerable_ext_grounding(app: &mut App) {
 /// `<<~HTML.squish` in a test is a String only after that pass, and
 /// this module's own walk runs before it. Sibling of
 /// `array_ordinal::rewrite_body`, called from the same place.
-pub(crate) fn rewrite_body(expr: &mut Expr) {
-    rewrite(expr);
+/// Returns whether any site was rewritten so the caller can skip a
+/// follow-up type.
+pub(crate) fn rewrite_body(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if rewrite_body(c) {
+            changed = true;
+        }
+    });
+    rewrite_node(expr) || changed
 }
 
 fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
+    let _ = rewrite_body(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     let span = expr.span;
     let ExprNode::Send { recv, method, args, block, parenthesized } = &mut *expr.node else {
-        return;
+        return false;
     };
     // `first(n)` / `last(n)` on the same Relation-or-Array union `many?`
     // meets below: campfire's direct-room sidebar goes on to
@@ -88,21 +99,21 @@ fn rewrite(expr: &mut Expr) {
             );
             to_a.ty = Some(array_ty);
             *recv = Some(to_a);
+            return true;
         }
-        return;
+        return false;
     }
     // `index_by` takes the block and `many?` refuses one — the bare
     // call is the form Rails' counter-and-`any?` body reduces to a
     // length test, and the block form counts MATCHES instead, which is
     // a different question no corpus app asks.
     if method.as_str() == "wrap" {
-        ground_array_wrap(expr);
-        return;
+        return ground_array_wrap(expr);
     }
     let wants_block = match method.as_str() {
         "index_by" => true,
         "many?" | "to_sentence" | "sole" | "squish" => false,
-        _ => return,
+        _ => return false,
     };
     // `to_sentence` takes Rails' three connector options; the module
     // function takes them positionally, so a keyword Hash of those keys
@@ -112,15 +123,15 @@ fn rewrite(expr: &mut Expr) {
     let connectors = match (method.as_str(), args.len()) {
         ("to_sentence", 0) => Some(SENTENCE_DEFAULTS.map(String::from)),
         ("to_sentence", 1) => {
-            let Some(c) = sentence_connectors(&args[0]) else { return };
+            let Some(c) = sentence_connectors(&args[0]) else { return false };
             Some(c)
         }
         _ => None,
     };
     if (connectors.is_none() && !args.is_empty()) || block.is_some() != wants_block {
-        return;
+        return false;
     }
-    let Some(receiver) = recv.as_ref() else { return };
+    let Some(receiver) = recv.as_ref() else { return false };
     // A Relation-or-Array receiver — campfire's direct-room sidebar,
     // `members = room.users.without(user).presence || [user]`, then
     // `members.many?`. Neither grounding fits: the Relation half has a
@@ -156,10 +167,10 @@ fn rewrite(expr: &mut Expr) {
             parenthesized: false,
         };
         expr.ty = Some(Ty::Bool);
-        return;
+        return true;
     }
     if is_relation(receiver.ty.as_ref()) {
-        return;
+        return false;
     }
     // `many?` names an `Array` parameter, so only an Array receiver
     // goes. `index_by` keeps the wider gate it has always had (its
@@ -170,14 +181,14 @@ fn rewrite(expr: &mut Expr) {
         && !matches!(receiver.ty.as_ref(), Some(Ty::Array { .. }))
         && !(method.as_str() == "to_sentence" && is_block_map(receiver))
     {
-        return;
+        return false;
     }
     // `squish` names a `String` parameter, so only a String receiver
     // goes — and it is the only one of these whose name a model could
     // plausibly define itself, which is the second reason to gate on
     // the analyzer's answer rather than on the spelling.
     if method.as_str() == "squish" && !matches!(receiver.ty.as_ref(), Some(Ty::Str)) {
-        return;
+        return false;
     }
     let receiver = recv.take().expect("checked above");
     *recv = Some(Expr::new(
@@ -194,25 +205,26 @@ fn rewrite(expr: &mut Expr) {
         }));
     }
     *parenthesized = true;
+    true
 }
 
 /// `Array.wrap(value)` → `ActiveSupport.wrap(value)`. A receiverless
 /// `wrap`, or a wrap on something other than the Array class, stays.
-fn ground_array_wrap(expr: &mut Expr) {
+fn ground_array_wrap(expr: &mut Expr) -> bool {
     let span = expr.span;
     let ExprNode::Send { recv, method, args, block, parenthesized: _ } = &mut *expr.node else {
-        return;
+        return false;
     };
     if method.as_str() != "wrap" || block.is_some() || args.len() != 1 {
-        return;
+        return false;
     }
-    let Some(receiver) = recv.as_ref() else { return };
-    let ExprNode::Const { path } = &*receiver.node else { return };
+    let Some(receiver) = recv.as_ref() else { return false };
+    let ExprNode::Const { path } = &*receiver.node else { return false };
     // `Reports::Array.wrap` is not ActiveSupport's method. Only the
     // top-level constant, written `Array` or `::Array`, is.
     let names: Vec<&str> = path.iter().map(|name| name.as_str()).collect();
     if names != ["Array"] && names != ["::Array"] {
-        return;
+        return false;
     }
     // Folded here, not hosted as `ActiveSupport.wrap`. That method
     // reads an untyped parameter, and each read counts against the
@@ -224,9 +236,10 @@ fn ground_array_wrap(expr: &mut Expr) {
     // `to_ary` is dropped, which would wrap the object instead of its
     // records.
     let arg = args[0].clone();
-    let Some(folded) = fold_array_wrap(span, &arg) else { return };
+    let Some(folded) = fold_array_wrap(span, &arg) else { return false };
     expr.ty = folded.ty.clone();
     *expr.node = *folded.node;
+    true
 }
 
 fn empty_array(span: crate::span::Span) -> Expr {

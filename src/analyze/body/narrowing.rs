@@ -22,15 +22,29 @@ use super::Ctx;
 
 /// A variable reference that narrowing can target: either a local
 /// binding (`x`) or an instance variable (`@x`).
+#[derive(Clone)]
 pub(super) enum VarKey {
     Local(Symbol),
     Ivar(Symbol),
+    /// A receiver-less, zero-argument read of an attribute of `self`
+    /// (`expires_at.present? && expires_at > now` in a model: a column or
+    /// `attr_accessor` reader). It is not a binding, so the type the
+    /// condition saw rides along, and a narrowing of it binds the name as
+    /// a local for the guarded region (bare `x` resolves local-first).
+    Reader(Symbol, Ty),
 }
 
 /// A condition that narrows a variable's type in the branches of an
 /// `if`. Only nil-shaped and class-shaped predicates are recognized —
 /// more complex conditions fall through with no narrowing applied.
+#[derive(Clone)]
 pub(super) enum NarrowPred {
+    /// A compound condition. `if_true` holds when the whole condition is
+    /// true, `if_false` when it is false; every entry is a leaf predicate
+    /// applied as if TRUE. `a && b`: both hold when true, nothing certain
+    /// when false (either may have failed). `a || b`: both are false when
+    /// false, nothing certain when true. Negation swaps the two lists.
+    Compound { if_true: Vec<NarrowPred>, if_false: Vec<NarrowPred> },
     /// `x.nil?` or `x == nil` — true in then, false in else.
     IsNil(VarKey),
     /// `!x.nil?` or `x != nil` — false in then, true in else.
@@ -48,9 +62,26 @@ pub(super) enum NarrowPred {
     IsTruthy(VarKey),
     /// Negated truthiness (`if !x` / `unless x`).
     IsFalsy(VarKey),
+    /// `x.present?` — Rails' `!blank?`. A present value is never nil, so the
+    /// then side drops the nil arm; the else side is only "nil, false or
+    /// empty", which says nothing certain about the type.
+    IsPresent(VarKey),
+    /// `x.blank?` / `!x.present?` — the inverse: the else side is non-nil.
+    IsBlank(VarKey),
 }
 
 pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
+    extract_narrowing_with(cond, &|_| None)
+}
+
+/// What a condition guarantees on each side. `is_reader` says whether a bare
+/// name is an attribute reader of `self` (see [`VarKey::Reader`]).
+pub(super) fn extract_narrowing_with(
+    cond: &Expr,
+    is_reader: &dyn Fn(&Symbol) -> Option<Ty>,
+) -> Option<NarrowPred> {
+    let extract_narrowing = |e: &Expr| extract_narrowing_with(e, is_reader);
+    let var_key = |e: &Expr| var_key(e, is_reader);
     match &*cond.node {
         // Ruby's `!` is a method call: `!x` parses as `x.!`. So
         // `!x.nil?` is Send(method="!", recv=Some(Send(method="nil?", recv=Var(x)))).
@@ -69,9 +100,20 @@ pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
         {
             extract_narrowing(&args[0]).map(negate_pred)
         }
+        // `max_qty?` -- ActiveRecord's attribute query, true only when the
+        // attribute is present (set, non-blank, non-zero), so it says what
+        // `max_qty.present?` says.
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if args.is_empty() && method.as_str().len() > 1 && method.as_str().ends_with('?') =>
+        {
+            let attr = Symbol::from(&method.as_str()[..method.as_str().len() - 1]);
+            is_reader(&attr).map(|ty| NarrowPred::IsPresent(VarKey::Reader(attr, ty)))
+        }
         ExprNode::Send { recv: Some(target), method, args, .. } => {
             match (method.as_str(), args.as_slice()) {
                 ("nil?", []) => var_key(target).map(NarrowPred::IsNil),
+                ("present?", []) => var_key(target).map(NarrowPred::IsPresent),
+                ("blank?", []) => var_key(target).map(NarrowPred::IsBlank),
                 ("==", [arg]) if is_nil_lit(arg) => {
                     var_key(target).map(NarrowPred::IsNil)
                 }
@@ -86,16 +128,30 @@ pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
                 _ => None,
             }
         }
-        // `A && B` is true iff both A and B are true, so a narrowing
-        // predicate in either conjunct applies in the surrounding If's
-        // then-branch. Single-pred return is the common-case
-        // approximation — the dominant pattern is the nil-guarded
-        // method call (`!x.nil? && x.foo != "bar"`) where the
-        // narrowing rides on the left conjunct. Composing narrowings
-        // on different vars across both conjuncts would need a Vec
-        // return; defer until a real shape demands it.
-        ExprNode::BoolOp { op: BoolOpKind::And, left, right, .. } => {
-            extract_narrowing(left).or_else(|| extract_narrowing(right))
+        // `A && B` is true iff both are true, so a predicate in either
+        // conjunct holds in the then-branch; when it is false either may
+        // have failed, so the else-branch learns nothing. `A || B` is the
+        // mirror image: false only if both are false. Predicates on
+        // different variables compose (`a.present? && b.present? && a < b`).
+        ExprNode::BoolOp { op, left, right, .. }
+            if matches!(op, BoolOpKind::And | BoolOpKind::Or) =>
+        {
+            let sides = [extract_narrowing(left), extract_narrowing(right)];
+            let mut on_true: Vec<NarrowPred> = Vec::new();
+            let mut on_false: Vec<NarrowPred> = Vec::new();
+            for p in sides.into_iter().flatten() {
+                let (t, f) = p.sides();
+                if matches!(op, BoolOpKind::And) {
+                    on_true.extend(t);
+                } else {
+                    on_false.extend(f);
+                }
+            }
+            if on_true.is_empty() && on_false.is_empty() {
+                None
+            } else {
+                Some(NarrowPred::Compound { if_true: on_true, if_false: on_false })
+            }
         }
         // Assignment as the condition: `if user = User.authenticate_by(…)`
         // (the Rails authentication generator's idiom) tests the
@@ -119,18 +175,33 @@ pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
     }
 }
 
+impl NarrowPred {
+    /// The leaf predicates that hold when this one is true, and when false.
+    fn sides(self) -> (Vec<NarrowPred>, Vec<NarrowPred>) {
+        match self {
+            NarrowPred::Compound { if_true, if_false } => (if_true, if_false),
+            leaf => (vec![leaf.clone()], vec![negate_pred(leaf)]),
+        }
+    }
+}
+
 fn negate_pred(p: NarrowPred) -> NarrowPred {
     match p {
+        NarrowPred::Compound { if_true, if_false } => {
+            NarrowPred::Compound { if_true: if_false, if_false: if_true }
+        }
         NarrowPred::IsNil(k) => NarrowPred::IsNotNil(k),
         NarrowPred::IsNotNil(k) => NarrowPred::IsNil(k),
         NarrowPred::IsA(k, t) => NarrowPred::IsNotA(k, t),
         NarrowPred::IsNotA(k, t) => NarrowPred::IsA(k, t),
         NarrowPred::IsTruthy(k) => NarrowPred::IsFalsy(k),
         NarrowPred::IsFalsy(k) => NarrowPred::IsTruthy(k),
+        NarrowPred::IsPresent(k) => NarrowPred::IsBlank(k),
+        NarrowPred::IsBlank(k) => NarrowPred::IsPresent(k),
     }
 }
 
-fn var_key(e: &Expr) -> Option<VarKey> {
+fn var_key(e: &Expr, is_reader: &dyn Fn(&Symbol) -> Option<Ty>) -> Option<VarKey> {
     match &*e.node {
         ExprNode::Var { name, .. } => Some(VarKey::Local(name.clone())),
         ExprNode::Ivar { name } => Some(VarKey::Ivar(name.clone())),
@@ -148,7 +219,10 @@ fn var_key(e: &Expr) -> Option<VarKey> {
         ExprNode::Send { recv: None, method, args, block: None, .. }
             if args.is_empty() =>
         {
-            Some(VarKey::Local(method.clone()))
+            match is_reader(method) {
+                Some(ty) => Some(VarKey::Reader(method.clone(), ty)),
+                None => Some(VarKey::Local(method.clone())),
+            }
         }
         _ => None,
     }
@@ -199,6 +273,11 @@ fn const_to_ty(e: &Expr) -> Option<Ty> {
 pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -> Ctx {
     let mut new_ctx = ctx.clone();
     match pred {
+        NarrowPred::Compound { if_true, if_false } => {
+            for p in if then_branch { if_true } else { if_false } {
+                new_ctx = apply_narrowing(&new_ctx, p, true);
+            }
+        }
         NarrowPred::IsNil(k) | NarrowPred::IsNotNil(k) => {
             let is_is_nil = matches!(pred, NarrowPred::IsNil(_));
             let narrow_to_nil = is_is_nil == then_branch;
@@ -220,6 +299,12 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
                     remove_variant(current, ty)
                 }
             });
+        }
+        NarrowPred::IsPresent(k) | NarrowPred::IsBlank(k) => {
+            let is_present = matches!(pred, NarrowPred::IsPresent(_));
+            if is_present == then_branch {
+                narrow_binding(&mut new_ctx, k, |current| remove_nil(current));
+            }
         }
         NarrowPred::IsTruthy(k) | NarrowPred::IsFalsy(k) => {
             // Only narrow the truthy side. The falsy side would
@@ -243,6 +328,20 @@ fn narrow_binding<F: FnOnce(&Ty) -> Ty>(ctx: &mut Ctx, key: &VarKey, f: F) {
     let (name, bindings) = match key {
         VarKey::Local(n) => (n, &mut ctx.local_bindings),
         VarKey::Ivar(n) => (n, &mut ctx.ivar_bindings),
+        VarKey::Reader(n, ty) => {
+            // A real local of that name shadows the reader and narrows as
+            // usual; otherwise the reader's own type is what narrows. Only
+            // the "it is there" direction is recorded: a reader proved nil
+            // is not worth rebinding, and re-reading it may say otherwise.
+            if !ctx.local_bindings.contains_key(n) {
+                let narrowed = f(ty);
+                if narrowed != Ty::Nil && &narrowed != ty {
+                    ctx.local_bindings.insert(n.clone(), narrowed);
+                }
+                return;
+            }
+            (n, &mut ctx.local_bindings)
+        }
     };
     if let Some(current) = bindings.get(name).cloned() {
         let narrowed = f(&current);

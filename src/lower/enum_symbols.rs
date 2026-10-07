@@ -42,7 +42,7 @@ const ATTR_METHODS: &[&str] = &[
     "merge",
 ];
 
-type EnumMap = std::collections::HashMap<String, std::collections::HashMap<String, Literal>>;
+pub(crate) type EnumMap = std::collections::HashMap<String, std::collections::HashMap<String, Literal>>;
 
 pub fn apply_enum_symbol_lowering(app: &mut App) {
     let map = enum_columns(app);
@@ -71,7 +71,7 @@ pub fn apply_enum_symbol_lowering(app: &mut App) {
 /// the result: the rewrite is keyed by column name, so an inconsistent
 /// mapping has no single right answer and guessing one would write the
 /// wrong integer into a real query.
-fn enum_columns(app: &App) -> EnumMap {
+pub(crate) fn enum_columns(app: &App) -> EnumMap {
     let mut out: EnumMap = Default::default();
     let mut conflicted: std::collections::HashSet<String> = Default::default();
     for model in &app.models {
@@ -116,6 +116,10 @@ fn literal_eq(a: &Literal, b: &Literal) -> bool {
 
 fn rewrite(expr: &mut Expr, map: &EnumMap) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, map));
+    rewrite_node(expr, map);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, map: &EnumMap) {
     let ExprNode::Send { method, args, .. } = &mut *expr.node else {
         return;
     };

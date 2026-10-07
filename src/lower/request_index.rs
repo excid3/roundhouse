@@ -64,6 +64,10 @@ fn to_bare_params(e: &mut Expr) {
 fn rewrite_request_index(expr: &mut Expr) {
     expr.node
         .for_each_child_mut(&mut rewrite_request_index);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     // Indexed READS are `Send "[]"` (`LValue::Index` is the write side,
     // and `request[k] = v` isn't a thing).
     if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node {

@@ -183,6 +183,37 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("exist?", Ty::Bool), ("exists?", Ty::Bool), ("mkdir", Ty::Int),
         ("pwd", Ty::Str), ("home", Ty::Str),
     ], &[]);
+    // Psych/YAML — campfire's Purchaser loads `config/purchased_by.yml`
+    // via `YAML.load_file`. Register the class-side surface the corpus
+    // writes so the constant is modeled (not a silent raise stub) and
+    // ruby-family emit keeps the call. Return types stay gradual: the
+    // document shape is whatever the file held.
+    register_stdlib_class(classes, "YAML", &[
+        ("load", Ty::Untyped), ("load_file", Ty::Untyped),
+        ("safe_load", Ty::Untyped), ("safe_load_file", Ty::Untyped),
+        ("dump", Ty::Str),
+    ], &[]);
+    // Framework modules an app `include`s that emit already handles
+    // (Attachable sgid, Turbo stream names, ActiveModel callbacks,
+    // SanitizeHelper). Empty module markers so the unresolved-include
+    // gate does not refuse known seams; methods come from lowering /
+    // other registry entries.
+    for name in [
+        "ActionText::Attachable",
+        "Turbo::Streams::StreamName",
+        "Turbo::Streams::StreamName::ClassMethods",
+        "ActiveModel::Validations::Callbacks",
+        "ActionView::Helpers::SanitizeHelper",
+    ] {
+        let info = classes.entry(ClassId(Symbol::from(name))).or_default();
+        info.is_module = true;
+    }
+    // SanitizeHelper readers Opengraph::Metadata calls after include.
+    if let Some(sanitize) = classes.get_mut(&ClassId(Symbol::from("ActionView::Helpers::SanitizeHelper"))) {
+        for m in ["sanitize", "strip_tags", "sanitize_css"] {
+            sanitize.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+    }
     register_stdlib_class(classes, "Math", &[
         ("sqrt", Ty::Float), ("cbrt", Ty::Float), ("log", Ty::Float),
         ("log2", Ty::Float), ("log10", Ty::Float), ("exp", Ty::Float),
@@ -281,9 +312,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // would hand a strict target a non-null it has to trust.
     let match_data = Ty::Class { id: ClassId(Symbol::from("MatchData")), args: vec![] };
     let str_or_nil_m = Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
-    register_stdlib_class(classes, "Regexp", &[], &[
+    register_stdlib_class(classes, "Regexp", &[
+        // Class side: escaping is a pure String -> String function, `last_match` reads the
+        // `$~` of the previous match, `union` builds a Regexp.
+        ("escape", Ty::Str),
+        ("quote", Ty::Str),
+        ("last_match", Ty::Union { variants: vec![match_data.clone(), Ty::Nil] }),
+        ("union", Ty::Class { id: ClassId(Symbol::from("Regexp")), args: vec![] }),
+    ], &[
         ("match", Ty::Union { variants: vec![match_data.clone(), Ty::Nil] }),
         ("match?", Ty::Bool),
+        ("=~", Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
+        ("===", Ty::Bool),
         ("source", Ty::Str),
     ]);
     register_stdlib_class(classes, "MatchData", &[], &[
@@ -401,6 +441,29 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // loop below repeats itself. The list is Ruby's own hierarchy under
     // `StandardError` plus `Exception` itself, which `rescue Exception`
     // names and campfire's `MessagesHelper` actually writes.
+    // `cause` is the exception being handled when this one was raised, or
+    // nil; `exception` answers the exception itself (`raise e` and
+    // `e.exception("msg")` both go through it).
+    let exception_surface = [
+        ("message", Ty::Str),
+        ("to_s", Ty::Str),
+        ("full_message", Ty::Str),
+        ("detailed_message", Ty::Str),
+        ("inspect", Ty::Str),
+        ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("backtrace_locations", Ty::Array { elem: Box::new(Ty::Untyped) }),
+        ("set_backtrace", Ty::Untyped),
+        ("exception", Ty::Untyped),
+        (
+            "cause",
+            Ty::Union {
+                variants: vec![
+                    Ty::Class { id: ClassId(Symbol::from("Exception")), args: vec![] },
+                    Ty::Nil,
+                ],
+            },
+        ),
+    ];
     for exc in [
         "Exception", "StandardError", "RuntimeError", "ArgumentError",
         "TypeError", "NameError", "NoMethodError", "IndexError",
@@ -411,21 +474,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
         "OpenSSL::OpenSSLError", "JSON::ParserError",
     ] {
-        register_stdlib_class(classes, exc, &[], &[
-            ("message", Ty::Str),
-            ("to_s", Ty::Str),
-            ("full_message", Ty::Str),
-            ("inspect", Ty::Str),
-            ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
-        ]);
+        register_stdlib_class(classes, exc, &[], &exception_surface);
     }
-    let exception_surface = [
-        ("message", Ty::Str),
-        ("to_s", Ty::Str),
-        ("full_message", Ty::Str),
-        ("inspect", Ty::Str),
-        ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
-    ];
     for (exc, extra) in [
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
@@ -540,7 +590,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // implement the collection operations the app uses; don't invent
     // one concrete representation for the two runtimes.
     register_stdlib_class(classes, "Rails::HTML5::SafeListSanitizer", &[
-        ("allowed_tags", Ty::Untyped), ("allowed_attributes", Ty::Untyped),
+        ("allowed_tags", Ty::Union { variants: vec![Ty::Array { elem: Box::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] }] }),
+        ("allowed_attributes", Ty::Union { variants: vec![Ty::Array { elem: Box::new(Ty::Str) }, Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] }] }),
     ], &[]);
     // `Set` is a value type: `Set.new` yields `Class { Set }` (via the
     // universal `.new`), then these instance methods dispatch on it.

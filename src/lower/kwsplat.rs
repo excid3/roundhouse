@@ -624,8 +624,20 @@ fn sym_key(name: &Symbol, span: crate::span::Span) -> Expr {
     e
 }
 
-/// `<hash>[:<key>]`, typed as the hash's value type.
+/// `<hash>[:<key>]`, typed the same way `hash_method` types `[]`:
+/// `value | nil`. An open (Var) value is stamped `Untyped` — the gradual
+/// escape — so diagnose does not report a false `send_dispatch_failed`
+/// for an index we just synthesized. Campfire's preview
+/// `notification(badge: …, **params)` expands to `params[:title]` etc.;
+/// with only `badge:`'s default typed, `params` stays `Hash[Var, Var]`
+/// and a raw Var stamp on `[]` was misread as "no known method".
 fn index(hash: &Expr, key: &Symbol, value_ty: Ty) -> Expr {
+    let ty = match &value_ty {
+        Ty::Var { .. } | Ty::Untyped => Ty::Untyped,
+        other => Ty::Union {
+            variants: vec![other.clone(), Ty::Nil],
+        },
+    };
     let mut e = Expr::new(
         hash.span,
         ExprNode::Send {
@@ -636,7 +648,7 @@ fn index(hash: &Expr, key: &Symbol, value_ty: Ty) -> Expr {
             parenthesized: false,
         },
     );
-    e.ty = Some(value_ty);
+    e.ty = Some(ty);
     e
 }
 

@@ -63,7 +63,10 @@ fn factor(method: &str) -> Option<i64> {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
 
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let Some(mult) = byte_factor(expr) else { return };
 
     let ExprNode::Send { recv, .. } = &mut *expr.node else { unreachable!() };

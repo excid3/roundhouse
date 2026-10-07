@@ -6,9 +6,11 @@
 //! runtime avoids); the runtime's `group_count` builds the
 //! SELECT … GROUP BY and hydrates the Hash.
 //!
-//! Shape-directed: a zero-arg block-less `count` whose receiver is a
-//! `group(...)` send (the corpus spelling — `group` directly before
-//! the terminal). Runs on the post-analyze hook with its siblings so
+//! Shape-directed: a zero-arg block-less `count` whose receiver chain
+//! contains `group(...)` (directly, or through query refiners such as
+//! `having` / `distinct` / `select`). Rails still answers a Hash for
+//! those; only the immediate `group.count` pair is simple enough for
+//! the Arel fold. Runs on the post-analyze hook with its siblings so
 //! every target consumes the grounded form.
 
 use crate::app::App;
@@ -53,18 +55,75 @@ pub fn grouped_count_parts(expr: &Expr) -> Option<GroupedCount<'_>> {
     if !matches!(method.as_str(), "count" | "group_count") || !args.is_empty() {
         return None;
     }
-    let ExprNode::Send { recv: base, method: gm, args: group_args, block: None, .. } = &*recv.node
-    else {
-        return None;
+    group_in_relation_chain(recv)
+}
+
+/// Query methods that refine a grouped relation without changing that
+/// it is grouped. `analyze::body::send::grouped_count_ty` walks this
+/// same list via [`group_in_relation_chain`]. `group` itself is the
+/// stop, not a skip.
+pub const COUNT_CHAIN_REFINERS: &[&str] = &[
+    "having",
+    "distinct",
+    "select",
+    "where",
+    "not",
+    "joins",
+    "left_outer_joins",
+    "left_joins",
+    "order",
+    "reorder",
+    "rewhere",
+    "where!",
+    "order!",
+    "limit",
+    "offset",
+    "from",
+    "includes",
+    "preload",
+    "eager_load",
+    "merge",
+    "references",
+];
+
+/// Arel may fold only `rel.group(:col).count` — intervening `having` /
+/// `distinct` / `select` belong on Relation SQL so GROUP BY, HAVING,
+/// and the DISTINCT projection stay in one place (#343).
+pub fn group_immediately_precedes_count(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+        return false;
     };
-    if gm.as_str() != "group" {
-        return None;
+    if !matches!(method.as_str(), "count" | "group_count") || !args.is_empty() {
+        return false;
     }
-    Some(GroupedCount { base: base.as_ref(), group_args })
+    matches!(
+        &*recv.node,
+        ExprNode::Send { method: gm, block: None, .. } if gm.as_str() == "group"
+    )
+}
+
+pub fn group_in_relation_chain(expr: &Expr) -> Option<GroupedCount<'_>> {
+    let mut cur = expr;
+    loop {
+        let ExprNode::Send { recv, method, args, block: None, .. } = &*cur.node else {
+            return None;
+        };
+        if method.as_str() == "group" {
+            return Some(GroupedCount { base: recv.as_ref(), group_args: args });
+        }
+        if !COUNT_CHAIN_REFINERS.contains(&method.as_str()) {
+            return None;
+        }
+        cur = recv.as_ref()?;
+    }
 }
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     // The SOURCE spelling only — `grouped_count_parts` accepts both, so
     // a second pass over an already-renamed tree is a no-op rather than
     // a rename of a rename.

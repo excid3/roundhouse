@@ -64,6 +64,7 @@ use crate::ty::Ty;
 /// model) collapses to ONE arm through its common base.
 const MAX_ARMS: usize = 3;
 
+#[allow(dead_code)]
 pub fn apply_try_guard_lowering(app: &mut App) {
     let definers = collect_definers(app);
     let parents = collect_parents(app);
@@ -112,7 +113,14 @@ fn rewrite(
     parents: &HashMap<Symbol, Symbol>,
 ) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, definers, parents));
+    rewrite_node(expr, definers, parents);
+}
 
+pub(crate) fn rewrite_node(
+    expr: &mut Expr,
+    definers: &HashMap<Symbol, HashSet<Symbol>>,
+    parents: &HashMap<Symbol, Symbol>,
+) {
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else {
         return;
     };
@@ -338,7 +346,7 @@ fn is_a(span: crate::span::Span, recv: &Expr, klass: &Symbol) -> Expr {
 const SYNTHESIZED_ON_EVERY_MODEL: [&str; 1] = ["to_gid_param"];
 
 /// method name -> the app classes defining it as an INSTANCE method.
-fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
+pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
     let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
     for m in &app.models {
         let owner = m.name.0.clone();
@@ -365,7 +373,7 @@ fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
 }
 
 /// class -> superclass, over models and library classes both.
-fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
+pub(crate) fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
     let mut out = HashMap::new();
     for m in &app.models {
         if let Some(p) = &m.parent {

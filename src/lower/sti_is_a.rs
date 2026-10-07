@@ -53,13 +53,22 @@ use crate::ty::Ty;
 /// The column Rails writes an STI row's class name into.
 const INHERITANCE_COLUMN: &str = "type";
 
+#[allow(dead_code)]
 pub fn apply_sti_is_a_lowering(app: &mut App) {
-    let bases = crate::lower::sti_scope::sti_bases(app);
-    if bases.is_empty() {
+    let names = subclass_type_names(app);
+    if names.is_empty() {
         return;
     }
-    // Subclass → every name a row of that class can carry in `type`:
-    // itself plus anything descending from it.
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &names));
+    for view in &mut app.views {
+        rewrite(&mut view.body, &names);
+    }
+}
+
+/// Subclass → every name a row of that class can carry in `type`:
+/// itself plus anything descending from it.
+pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, Vec<String>> {
+    let bases = crate::lower::sti_scope::sti_bases(app);
     let mut names: HashMap<ClassId, Vec<String>> = HashMap::new();
     for sub in bases.keys() {
         let mut set: Vec<String> = vec![sub.0.as_str().to_string()];
@@ -71,10 +80,7 @@ pub fn apply_sti_is_a_lowering(app: &mut App) {
         set.sort();
         names.insert(sub.clone(), set);
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &names));
-    for view in &mut app.views {
-        rewrite(&mut view.body, &names);
-    }
+    names
 }
 
 /// Does `class_id`'s parent chain reach `ancestor`?
@@ -104,6 +110,10 @@ fn descends_from(app: &App, class_id: &ClassId, ancestor: &ClassId) -> bool {
 
 fn rewrite(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, names));
+    rewrite_node(expr, names);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>>) {
     let ExprNode::Send { recv, method, args, .. } = &*expr.node else { return };
     if method.as_str() != "is_a?" && method.as_str() != "kind_of?" {
         return;

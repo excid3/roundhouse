@@ -263,15 +263,8 @@ module Tep
     def build_head(req, res)
       reason = Tep.reason(res.status)
       head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
-      res.headers.each do |k, v|
-        head << k + ": " + v + "\r\n"
-      end
-      # Set-Cookie can repeat; emit each on its own line.
-      ci = 0
-      while ci < res.set_cookies.length
-        head << "Set-Cookie: " + res.set_cookies[ci] + "\r\n"
-        ci += 1
-      end
+      # Set-Cookie can repeat; header_lines emits each on its own line.
+      head << Tep.header_lines(res)
       head + "\r\n"
     end
 

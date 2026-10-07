@@ -1,0 +1,5 @@
+module ActiveSupport
+  module SecurityUtils
+    def self.secure_compare: (String a, String b) -> bool
+  end
+end

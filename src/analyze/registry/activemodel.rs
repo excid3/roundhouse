@@ -89,6 +89,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }
+    // Additional collection APIs require shared runtime/lowering support.
     classes.insert(
         ClassId(Symbol::from("ActiveModel::Errors")),
         errors_cls,

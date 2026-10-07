@@ -237,7 +237,12 @@ pub(crate) fn lower_models_inner(
                 // Preserve original source inputs for late derivations
                 // (e.g. raw helpers) without treating them as framework
                 // claims. Both kinds traverse the canonical Arel/typer.
-                methods.extend(model.methods().filter(|m| !m.name_span.is_synthetic()).cloned());
+                methods.extend(model.methods().filter(|m| !m.name_span.is_synthetic()).cloned().map(|mut method| {
+                    // Match build_methods' provenance backfill even when a source
+                    // method was retained beside the generated probe surface.
+                    method.body.inherit_span(model.span);
+                    method
+                }));
                 methods
             }
         };
@@ -513,8 +518,26 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         origin: None,
         constants: collect_model_constants(model),
         unknown_calls: Vec::new(),
-        class_ivar_initializers: Vec::new(),
+        class_ivar_initializers: collect_class_attr_initializers(model),
     }
+}
+
+/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
+/// ivar writes emitted once on the model class object.
+fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
+    model
+        .class_attr_defaults
+        .iter()
+        .map(|(name, value)| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: name.clone() },
+                    value: value.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -581,9 +604,9 @@ fn report_unclaimed_unknowns(model: &Model) {
             {
                 continue;
             }
-            // Literal table names are consumed by ingest::model; other
-            // class settings remain unsupported unless a recognizer claims them.
-            if name == "table_name="
+            // Literal table settings are consumed by ingest::model's
+            // explicit_class_setting; dynamic values remain unsupported.
+            if matches!(name, "table_name=" | "table_name_prefix=")
                 && args.len() == 1
                 && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
             {
@@ -656,6 +679,15 @@ fn report_unclaimed_unknowns(model: &Model) {
         // re-deriving the shape (same dance as `has_rich_text`).
         if name == "has_json"
             && crate::lower::has_json::has_json_decls(&model.body)
+                .iter()
+                .any(|d| d.span == expr.span)
+        {
+            continue;
+        }
+        // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
+        // claimed by lower::serialize; accessors go through JsonColumn.
+        if name == "serialize"
+            && crate::lower::serialize::serialize_decls(model)
                 .iter()
                 .any(|d| d.span == expr.span)
         {
@@ -1117,18 +1149,64 @@ pub(crate) fn build_methods(
 /// `def as_json`, …). These were dropped — `build_methods` synthesized
 /// schema/association/scope methods but never carried the model's own
 /// method bodies through. Emit them now; their bodies ride the same
-/// arel-rewrite + body-typer the synthesized methods do. Skips a name a
-/// synthesized method already defined (column/association/scope accessors
-/// win — the corpus doesn't redefine those, and this avoids duplicate
-/// definitions).
+/// arel-rewrite + body-typer the synthesized methods do.
+///
+/// Name collisions:
+///   * A synthesized **attr_accessor / attr_reader / attr_writer**
+///     half yields to a later real `def` of that name — Ruby's
+///     last-definition-wins. Campfire's `Opengraph::Location` declares
+///     `attr_accessor :parsed_url` and then memoizes
+///     `def parsed_url; … URI.parse …; end`; keeping the bare
+///     `@parsed_url` reader left the ivar untyped/unread and Spinel's
+///     strict emit failed with `error[ivar_unresolved]`.
+///   * Column / association / scope synthesizers still win over a
+///     duplicate body name (the corpus does not redefine those). The
+///     replace predicate matches unsigned bare-ivar attr_* halves only
+///     (`signature: None`); schema column readers stamp a signature and
+///     are never replaced.
 fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
-    use crate::dialect::ModelBodyItem;
+    use crate::dialect::{AccessorKind, ModelBodyItem};
+    use crate::expr::{ExprNode, LValue};
     for item in &model.body {
         let ModelBodyItem::Method { method, .. } = item else { continue };
-        if methods
+        if let Some(idx) = methods
             .iter()
-            .any(|m| m.name == method.name && m.receiver == method.receiver)
+            .position(|m| m.name == method.name && m.receiver == method.receiver)
         {
+            let existing = &methods[idx];
+            let incoming_is_real = matches!(method.kind, AccessorKind::Method);
+            // Only bare-ivar attr_* halves (attr_accessor/reader/writer
+            // synth, which carry no signature) yield to a later real
+            // `def`. Schema column AttributeReaders are also bare
+            // `@col` reads for scalar columns, but they stamp a
+            // signature — keep those winning (documented above).
+            let existing_is_attr_half = existing.signature.is_none()
+                && match existing.kind {
+                    AccessorKind::AttributeReader => {
+                        matches!(
+                            &*existing.body.node,
+                            ExprNode::Ivar { name } if name == &existing.name
+                        )
+                    }
+                    AccessorKind::AttributeWriter => {
+                        let base = existing
+                            .name
+                            .as_str()
+                            .strip_suffix('=')
+                            .unwrap_or(existing.name.as_str());
+                        matches!(
+                            &*existing.body.node,
+                            ExprNode::Assign {
+                                target: LValue::Ivar { name },
+                                ..
+                            } if name.as_str() == base
+                        )
+                    }
+                    AccessorKind::Method => false,
+                };
+            if incoming_is_real && existing_is_attr_half {
+                methods[idx] = method.clone();
+            }
             continue;
         }
         methods.push(method.clone());
@@ -1143,6 +1221,8 @@ pub(crate) fn push_scope_methods(
     assocs: &crate::lower::scope_chain::AssocRegistry,
 ) {
     use crate::dialect::{AccessorKind, ModelBodyItem, Param};
+    use crate::expr::{Expr, ExprNode, LValue};
+    use crate::ty::Ty;
     let rel_param = Symbol::from("__rel");
     for item in &model.body {
         let ModelBodyItem::Scope { scope, .. } = item else { continue };
@@ -1167,6 +1247,51 @@ pub(crate) fn push_scope_methods(
             scopes,
             models_set,
             assocs,
+        );
+
+        // Rails scopes spawn on entry: `rel.visible.with_direct_rooms`
+        // must not leave joins/orders on `rel.visible` for a sibling
+        // `rel.visible.with_ordered_room`. Our chain methods mutate in
+        // place, so the scope method itself takes a copy first.
+        let span = body.span;
+        let rel_ty = Ty::Relation {
+            of: model.name.clone(),
+        };
+        let mut rel_var = Expr::new(
+            span,
+            ExprNode::Var {
+                id: crate::ident::VarId(0),
+                name: rel_param.clone(),
+            },
+        );
+        rel_var.ty = Some(rel_ty.clone());
+        let mut spawn_send = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(rel_var),
+                method: Symbol::from("spawn"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        // `Relation#spawn` returns a Relation of the same model.
+        spawn_send.ty = Some(rel_ty);
+        let spawn_assign = Expr::new(
+            span,
+            ExprNode::Assign {
+                target: LValue::Var {
+                    id: crate::ident::VarId(0),
+                    name: rel_param.clone(),
+                },
+                value: spawn_send,
+            },
+        );
+        body = Expr::new(
+            span,
+            ExprNode::Seq {
+                exprs: vec![spawn_assign, body],
+            },
         );
 
         methods.push(MethodDef {
@@ -1752,6 +1877,11 @@ pub(crate) fn build_class_info(
         &mut info.class_methods,
         "_adapter_count",
         fn_sig(vec![], Ty::Int),
+    );
+    insert_default(
+        &mut info.class_methods,
+        "_adapter_any?",
+        fn_sig(vec![], Ty::Bool),
     );
     insert_default(
         &mut info.class_methods,

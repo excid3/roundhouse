@@ -43,5 +43,7 @@ use crate::diagnostic::Diagnostic;
 pub fn analyze_and_lower(app: &mut App) -> Vec<Diagnostic> {
     let mut analyzer = crate::analyze::Analyzer::new(app);
     analyzer.analyze(app);
-    crate::lower::apply_post_analyze_lowerings(app, analyzer.class_registry())
+    crate::timings::phase("post-analyze lowerings", || {
+        crate::lower::apply_post_analyze_lowerings(app, analyzer.class_registry())
+    })
 }

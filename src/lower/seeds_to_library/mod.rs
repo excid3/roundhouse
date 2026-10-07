@@ -83,6 +83,21 @@ pub fn rewrite_assoc_create(expr: &Expr) -> Expr {
 }
 
 pub fn rewrite_assoc_create_with_models(expr: &Expr, models: &[crate::dialect::Model]) -> Expr {
+    crate::lower::controller_to_library::util::map_expr(expr, &|e| assoc_create_rewrite(e, models))
+}
+
+/// In-place twin. Returns whether any node changed so the test
+/// lowerer can skip a follow-up typing pass.
+pub fn rewrite_assoc_create_with_models_in_place(
+    expr: &mut Expr,
+    models: &[crate::dialect::Model],
+) -> bool {
+    crate::lower::controller_to_library::util::map_expr_mut(expr, &|e| {
+        assoc_create_rewrite(e, models)
+    })
+}
+
+fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model]) -> Option<Expr> {
     let declared_target = |parent: &str, assoc: &str| -> Option<String> {
         let model = models.iter().find(|m| m.name.0.as_str() == parent)?;
         model.associations().find_map(|a| match a {
@@ -94,100 +109,98 @@ pub fn rewrite_assoc_create_with_models(expr: &Expr, models: &[crate::dialect::M
             _ => None,
         })
     };
-    crate::lower::controller_to_library::util::map_expr(expr, &|e| {
-        let ExprNode::Send {
-            recv: Some(outer_recv),
-            method: outer_method,
-            args: outer_args,
+    let ExprNode::Send {
+        recv: Some(outer_recv),
+        method: outer_method,
+        args: outer_args,
+        block: None,
+        ..
+    } = &*e.node
+    else {
+        return None;
+    };
+    let outer_method_str = outer_method.as_str();
+    // `create` / `create!` map to the same-named class methods.
+    // `build` is Rails-specific (instantiate without saving) —
+    // map to `new` so Ruby/CRuby callers get `<Class>.new(attrs)`
+    // and the TS emitter renders that as `new <Class>(attrs)`.
+    let target_method = match outer_method_str {
+        "create" | "create!" => outer_method.clone(),
+        "build" => Symbol::from("new"),
+        _ => return None,
+    };
+    let ExprNode::Send {
+        recv: Some(parent_expr),
+        method: assoc_method,
+        args: inner_args,
+        block: None,
+        ..
+    } = &*outer_recv.node
+    else {
+        return None;
+    };
+    if !inner_args.is_empty() {
+        return None;
+    }
+    // Resolve parent class from the typer-set type. Without the
+    // class type we can't derive the FK name; fall through.
+    let parent_class = match parent_expr.ty.as_ref() {
+        Some(Ty::Class { id, .. }) => id.0.as_str().to_string(),
+        _ => return None,
+    };
+    let assoc_class = declared_target(&parent_class, assoc_method.as_str())
+        .unwrap_or_else(|| crate::naming::singularize_camelize(assoc_method.as_str()));
+    let fk = format!("{}_id", crate::naming::snake_case(&parent_class));
+
+    // Build the FK-id expr: `<parent_expr>.id`.
+    let parent_id = Expr::new(
+        parent_expr.span,
+        ExprNode::Send {
+            recv: Some(parent_expr.clone()),
+            method: Symbol::from("id"),
+            args: vec![],
             block: None,
-            ..
-        } = &*e.node
-        else {
-            return None;
-        };
-        let outer_method_str = outer_method.as_str();
-        // `create` / `create!` map to the same-named class methods.
-        // `build` is Rails-specific (instantiate without saving) —
-        // map to `new` so Ruby/CRuby callers get `<Class>.new(attrs)`
-        // and the TS emitter renders that as `new <Class>(attrs)`.
-        let target_method = match outer_method_str {
-            "create" | "create!" => outer_method.clone(),
-            "build" => Symbol::from("new"),
-            _ => return None,
-        };
-        let ExprNode::Send {
-            recv: Some(parent_expr),
-            method: assoc_method,
-            args: inner_args,
-            block: None,
-            ..
-        } = &*outer_recv.node
-        else {
-            return None;
-        };
-        if !inner_args.is_empty() {
-            return None;
-        }
-        // Resolve parent class from the typer-set type. Without the
-        // class type we can't derive the FK name; fall through.
-        let parent_class = match parent_expr.ty.as_ref() {
-            Some(Ty::Class { id, .. }) => id.0.as_str().to_string(),
-            _ => return None,
-        };
-        let assoc_class = declared_target(&parent_class, assoc_method.as_str())
-            .unwrap_or_else(|| crate::naming::singularize_camelize(assoc_method.as_str()));
-        let fk = format!("{}_id", crate::naming::snake_case(&parent_class));
-
-        // Build the FK-id expr: `<parent_expr>.id`.
-        let parent_id = Expr::new(
-            parent_expr.span,
-            ExprNode::Send {
-                recv: Some(parent_expr.clone()),
-                method: Symbol::from("id"),
-                args: vec![],
-                block: None,
-                parenthesized: false,
-            },
-        );
-        let fk_entry = (
-            Expr::new(
-                e.span,
-                ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(fk) } },
-            ),
-            parent_id,
-        );
-
-        // Merge FK entry with original kwargs/hash. Real-blog's
-        // `article.comments.create!(commenter:, body:)` parses the
-        // trailing kwargs as a single Hash arg.
-        let merged_hash = match outer_args.first().map(|a| (&*a.node, a.span)) {
-            Some((ExprNode::Hash { entries, kwargs }, span)) => {
-                let mut new_entries = vec![fk_entry];
-                new_entries.extend(entries.iter().cloned());
-                Expr::new(span, ExprNode::Hash { entries: new_entries, kwargs: *kwargs })
-            }
-            _ => Expr::new(
-                e.span,
-                ExprNode::Hash { entries: vec![fk_entry], kwargs: true },
-            ),
-        };
-
-        Some(Expr::new(
+            parenthesized: false,
+        },
+    );
+    let fk_entry = (
+        Expr::new(
             e.span,
-            ExprNode::Send {
-                recv: Some(Expr::new(
-                    e.span,
-                    ExprNode::Const {
-                        path: assoc_class.split("::").map(Symbol::from).collect(),
-                    },
-                )),
-                method: target_method,
-                args: vec![merged_hash],
-                block: None,
-                parenthesized: true,
-            },
-        ))
-    })
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value: Symbol::from(fk) } },
+        ),
+        parent_id,
+    );
+
+    // Merge FK entry with original kwargs/hash. Real-blog's
+    // `article.comments.create!(commenter:, body:)` parses the
+    // trailing kwargs as a single Hash arg.
+    let merged_hash = match outer_args.first().map(|a| (&*a.node, a.span)) {
+        Some((ExprNode::Hash { entries, kwargs }, span)) => {
+            let mut new_entries = vec![fk_entry];
+            new_entries.extend(entries.iter().cloned());
+            Expr::new(span, ExprNode::Hash { entries: new_entries, kwargs: *kwargs })
+        }
+        _ => Expr::new(
+            e.span,
+            ExprNode::Hash { entries: vec![fk_entry], kwargs: true },
+        ),
+    };
+
+    Some(Expr::new(
+        e.span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                e.span,
+                ExprNode::Const {
+                    path: assoc_class.split("::").map(Symbol::from).collect(),
+                },
+            )),
+            method: target_method,
+            args: vec![merged_hash],
+            block: None,
+            parenthesized: true,
+        },
+    ))
 }
 
 // `Span` used in synthesized expressions above.

@@ -14,6 +14,7 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
+#[allow(dead_code)]
 pub fn apply_sum_symbol_lowering(app: &mut App) {
     for model in &mut app.models {
         for item in &mut model.body {
@@ -30,6 +31,10 @@ pub fn apply_sum_symbol_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let span = expr.span;
     let sym = match &*expr.node {
         ExprNode::Send { recv: Some(_), method, args, block: None, .. }

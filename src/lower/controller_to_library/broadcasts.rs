@@ -36,15 +36,23 @@ use crate::span::Span;
 use crate::ty::Ty;
 
 use super::rewrites::partial_view_call_with_record;
-use super::util::map_expr;
 
 /// Rewrite every recognized broadcast call in a controller method body.
+#[allow(dead_code)]
 pub(super) fn rewrite_broadcast_to(
     expr: &Expr,
     module_name: Option<&str>,
     partials: &super::PartialMap,
 ) -> Expr {
-    map_expr(expr, &|e| try_rewrite(e, module_name, partials))
+    super::util::map_expr(expr, &|e| try_rewrite(e, module_name, partials))
+}
+
+pub(super) fn rewrite_broadcast_to_in_place(
+    expr: &mut Expr,
+    module_name: Option<&str>,
+    partials: &super::PartialMap,
+) -> bool {
+    super::util::map_expr_mut(expr, &|e| try_rewrite(e, module_name, partials))
 }
 
 fn try_rewrite(

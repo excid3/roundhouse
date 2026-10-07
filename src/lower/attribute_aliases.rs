@@ -4,6 +4,7 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 
+#[allow(dead_code)]
 pub fn apply_attribute_alias_lowering(app: &mut App) {
     let models: std::collections::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
@@ -37,6 +38,10 @@ pub fn apply_attribute_alias_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr, models: &std::collections::HashSet<String>, in_model: bool) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, models, in_model));
+    rewrite_node(expr, models, in_model);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, models: &std::collections::HashSet<String>, in_model: bool) {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else { return };
     let to = match (method.as_str(), args.len()) {
         ("read_attribute", 1) => "[]",

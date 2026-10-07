@@ -127,6 +127,12 @@ pub fn try_build_arel_with_assocs(
             // reached any other way stays on the runtime Relation
             // (issue #78).
             if let Some(grouped) = crate::lower::group_count::grouped_count_parts(send) {
+                // HAVING / DISTINCT / an explicit select list stay on
+                // Relation SQL (#343). The Arel fold is COUNT(*) per
+                // group with no HAVING.
+                if !crate::lower::group_count::group_immediately_precedes_count(send) {
+                    return None;
+                }
                 let base = grouped.base?;
                 let (op, owner) = try_chain_recv(base, schema, registry, assocs)?;
                 return apply_group_count(op, grouped.group_args, schema)

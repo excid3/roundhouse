@@ -36,20 +36,40 @@ fn peak_rss_mb() -> Option<u64> {
 
 /// Run a phase and print measurements only when requested.
 pub fn phase<T>(name: impl std::fmt::Display, f: impl FnOnce() -> T) -> T {
+    let _guard = begin(name);
+    f()
+}
+
+/// Start a timed span that prints when dropped. `None` when timings are off.
+pub fn begin(name: impl std::fmt::Display) -> Option<Guard> {
     if !*ENABLED {
-        return f();
+        return None;
     }
-    let start = Instant::now();
-    let output = f();
-    match peak_rss_mb() {
-        Some(mb) => eprintln!(
-            "roundhouse-timing: {name}: {:.2}s (peak rss {mb} MB)",
-            start.elapsed().as_secs_f64(),
-        ),
-        None => eprintln!(
-            "roundhouse-timing: {name}: {:.2}s (peak rss unavailable)",
-            start.elapsed().as_secs_f64(),
-        ),
+    Some(Guard {
+        name: name.to_string(),
+        start: Instant::now(),
+    })
+}
+
+/// Prints one `roundhouse-timing:` line on drop.
+pub struct Guard {
+    name: String,
+    start: Instant,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        match peak_rss_mb() {
+            Some(mb) => eprintln!(
+                "roundhouse-timing: {}: {:.2}s (peak rss {mb} MB)",
+                self.name,
+                self.start.elapsed().as_secs_f64(),
+            ),
+            None => eprintln!(
+                "roundhouse-timing: {}: {:.2}s (peak rss unavailable)",
+                self.name,
+                self.start.elapsed().as_secs_f64(),
+            ),
+        }
     }
-    output
 }

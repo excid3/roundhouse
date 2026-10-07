@@ -110,8 +110,67 @@ class ActionControllerCookiesTest < Minitest::Test
     # `cookies.signed.permanent[:k] = {value:, httponly:, same_site:}`
     # — how campfire's Authentication concern writes the session.
     jar = ActionController::CookieJar.new({})
-    jar.signed.permanent[:session_token] = { value: "tok", httponly: true, same_site: :lax }
+    jar.signed.permanent[:session_token] = { value: "tok", httponly: true, same_site: :lax, secure: true }
     assert_equal "tok", jar.signed[:session_token]
+    assert jar.flag_httponly?(:session_token)
+    assert_equal "Lax", jar.flag_samesite(:session_token)
+    assert jar.flag_secure?(:session_token)
+  end
+
+  # ── permanence ───────────────────────────────────────────────
+  # `permanent` was the identity until 2026-10-06, so every "permanent"
+  # cookie went out without Expires and died with the browser session:
+  # campfire's sign-in did not survive a restart. Each spelling Rails
+  # accepts must record the twenty-year expiry, and nothing else may.
+
+  def test_permanent_writes_carry_a_twenty_year_expiry
+    jar = ActionController::CookieJar.new({})
+    jar.permanent[:last_room] = 7
+    assert_equal "7", jar[:last_room], "a permanent write is still an ordinary write"
+    assert_equal "7", jar.permanent[:last_room]
+    exp = jar.flag_expires(:last_room)
+    assert_match(/\A\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT\z/, exp)
+    assert_equal (Time.now.utc.year + 20).to_s, exp.split(" ")[3]
+  end
+
+  def test_signed_permanent_in_either_order_carries_the_expiry
+    jar = ActionController::CookieJar.new({})
+    jar.signed.permanent[:session_token] = { value: "tok", httponly: true, same_site: :lax }
+    jar.permanent.signed[:remember] = "me"
+    assert_equal "tok", jar.signed[:session_token]
+    assert_equal "me", jar.signed[:remember]
+    refute_equal "", jar.flag_expires(:session_token)
+    refute_equal "", jar.flag_expires(:remember)
+    assert_equal "Lax", jar.flag_samesite(:session_token), "options still apply under permanent"
+  end
+
+  def test_only_permanent_writes_expire
+    jar = ActionController::CookieJar.new({})
+    jar[:plain] = "x"
+    jar.signed[:signed_only] = "y"
+    jar.permanent[:kept] = "z"
+    assert_equal "", jar.flag_expires(:plain)
+    assert_equal "", jar.flag_expires(:signed_only)
+    jar.delete(:kept)
+    assert_equal "", jar.flag_expires(:kept), "a deleted cookie is cleared, not kept for twenty years"
+  end
+
+  def test_bare_writes_default_httponly_and_honor_an_explicit_opt_out
+    jar = ActionController::CookieJar.new({})
+    jar[:last_room] = 7
+    jar.signed[:session_token] = "abc123"
+    assert jar.flag_httponly?(:last_room), "unsigned bare write keeps the HttpOnly default"
+    assert jar.flag_httponly?(:session_token), "signed bare write keeps the HttpOnly default"
+    jar.signed[:open_token] = { value: "tok", httponly: false }
+    refute jar.flag_httponly?(:open_token)
+    refute jar.flag_secure?(:last_room)
+    jar.signed[:cross] = { value: "tok", same_site: :none, secure: true }
+    assert_equal "None", jar.flag_samesite(:cross)
+    assert jar.flag_secure?(:cross)
+    assert jar.flag_httponly?(:cross), "options hash without httponly keeps the default"
+    jar.signed[:strict] = { value: "tok", same_site: :strict }
+    assert_equal "Strict", jar.flag_samesite(:strict)
+    assert jar.flag_httponly?(:strict)
   end
 
   # NIL, as Rails answers — the signed read is the one nullable read in

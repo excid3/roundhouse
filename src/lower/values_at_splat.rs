@@ -21,6 +21,10 @@ pub fn apply_values_at_splat_lowering(app: &mut App) {
 
 fn rewrite(e: &mut Expr) {
     e.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(e);
+}
+
+pub(crate) fn rewrite_node(e: &mut Expr) {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else {
         return;
     };

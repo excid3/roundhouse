@@ -678,7 +678,11 @@ fn emit_block_with_value(e: &Expr) -> String {
 
 // ---- expression emit ------------------------------------------------
 
+/// Render an Elixir expression while preserving complete-call primitive semantics.
 pub(super) fn emit_expr(e: &Expr) -> String {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::Elixir, emit_expr) {
+        return s;
+    }
     // String-builder hint sites (`io = String.new; io << "..."; io`,
     // tagged by the view/jbuilder lowerer) → the iolist idiom. One hook
     // covers the Append + terminal-Result sites; Init is intercepted in
@@ -848,6 +852,13 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 return s;
             }
         }
+        // Mutable SCREAMING_SNAKE constants (`FORGERY_SLOT[0] = …`) —
+        // module attributes are compile-time only, so index assign/
+        // read go through the process dictionary with the attribute
+        // as the unset default.
+        if let Some(s) = emit_const_slot_send(r, method, args) {
+            return s;
+        }
     }
 
     // Ruby stdlib module calls (`Base64`, `JSON`) → their Elixir
@@ -901,9 +912,10 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
         return "__MODULE__".to_string();
     }
 
-    // `recv.__index_put__(k, v)` (from local_accumulation's `x[k]=v`)
-    // rendered by receiver type: a struct routes to its `put` setter,
-    // a map (or unknown) to `Map.put`.
+    // `recv.__index_put__(k, v)` (from local_accumulation's `x[k]=v`
+    // and mutation_to_struct_return's `@x[k]=v`) rendered by receiver
+    // type: a struct routes to its `put` setter; an Int-indexed write
+    // is a List slot (`List.replace_at`); otherwise Map.put.
     if method == "__index_put__" && args.len() == 2 {
         if let Some(r) = recv {
             let r_s = emit_expr(r);
@@ -911,6 +923,16 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
             if let Some(crate::ty::Ty::Class { id, .. }) = r.ty.as_ref() {
                 let module = super::library::v2_module_name(id.0.as_str());
                 return format!("{module}.put({r_s}, {k}, {v})");
+            }
+            // Array slot write: HeaderStore `@vals[i] = value` and similar.
+            // Int index → List; Hash key → Map. A Hash with integer keys
+            // (`counts[record.id] = n`) must stay Map.put — same guard as
+            // C#/Kotlin `list_index_needs_int_cast`.
+            let index_is_int = !recv_is_hash(r)
+                && (matches!(args[0].ty.as_ref(), Some(crate::ty::Ty::Int))
+                    || recv_is_array(r));
+            if index_is_int {
+                return format!("List.replace_at({r_s}, {k}, {v})");
             }
             return format!("Map.put({r_s}, {k}, {v})");
         }
@@ -1561,7 +1583,7 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                     format!("{fname}(record, {})", arg_strs.join(", "))
                 };
             }
-            format!("{}({})", method, arg_strs.join(", "))
+            format!("{fname}({})", arg_strs.join(", "))
         }
         Some(r) => {
             let r_s = emit_expr(r);
@@ -2058,6 +2080,45 @@ fn emit_ivar_state_send(name: &str, method: &str, args: &[Expr]) -> Option<Strin
             Some(format!("Map.get({get}, {}, {})", emit_expr(&args[0]), emit_expr(&args[1])))
         }
         ("fetch", 1) => Some(format!("Map.fetch!({get}, {})", emit_expr(&args[0]))),
+        _ => None,
+    }
+}
+
+/// Mutable declared module constants used as array slots
+/// (`FORGERY_SLOT[0] = value`, `Resolv::STUB_ADDRS << …`). Module
+/// attributes cannot be reassigned at runtime — mirror the ivar path
+/// through `Process` with the attribute as the default so every mutate
+/// and read sees the same value.
+fn emit_const_slot_send(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
+    let ExprNode::Const { path } = &*recv.node else {
+        return None;
+    };
+    if path.len() != 1 || !is_screaming_snake(path[0].as_str()) {
+        return None;
+    }
+    let name = path[0].as_str();
+    if !DECLARED_CONSTANTS.with(|c| c.borrow().contains(name)) {
+        return None;
+    }
+    let attr = format!("@{}", name.to_lowercase());
+    let key = format!(":rh_const_{}", name.to_lowercase());
+    let get = format!("Process.get({key}, {attr})");
+    match (method, args.len()) {
+        ("[]=", 2) => Some(format!(
+            "Process.put({key}, List.replace_at({get}, {}, {}))",
+            emit_expr(&args[0]),
+            emit_expr(&args[1])
+        )),
+        ("[]", 1) => Some(format!("Enum.at({get}, {})", emit_expr(&args[0]))),
+        // `STUB_ADDRS << addrs` / `STUB_HOSTS.clear` must update the same
+        // Process entry as `[]=`; otherwise teardown leaves a stale list
+        // that a later indexed read would still see.
+        ("<<", 1) => Some(format!(
+            "Process.put({key}, {get} ++ [{}])",
+            emit_expr(&args[0])
+        )),
+        ("clear", 0) => Some(format!("Process.put({key}, [])")),
+        ("length" | "size", 0) => Some(format!("Kernel.length({get})")),
         _ => None,
     }
 }
@@ -2995,6 +3056,47 @@ mod tests {
         // An all-caps MODULE reference (not declared) stays a module name,
         // not a bogus `@json` attribute.
         assert_eq!(emit_expr(&const_ref("JSON")), "JSON");
+        clear_declared_constants();
+    }
+
+    #[test]
+    fn hash_int_key_index_put_uses_map_put() {
+        // `counts[record.id] = n` is Hash[Integer, Integer] — not a List.
+        let recv = var_t(
+            "counts",
+            Ty::Hash {
+                key: Box::new(Ty::Int),
+                value: Box::new(Ty::Int),
+            },
+        );
+        let key = var_t("id", Ty::Int);
+        let val = var_t("n", Ty::Int);
+        let e = call(recv, "__index_put__", vec![key, val]);
+        assert_eq!(emit_expr(&e), "Map.put(counts, id, n)");
+    }
+
+    #[test]
+    fn declared_const_array_mutators_share_process_dict() {
+        fn const_ref(name: &str) -> Expr {
+            Expr::new(crate::span::Span::synthetic(), ExprNode::Const {
+                path: vec![Symbol::from(name)],
+            })
+        }
+        clear_declared_constants();
+        register_declared_constant("STUB_ADDRS");
+        let recv = || const_ref("STUB_ADDRS");
+        assert_eq!(
+            emit_expr(&call(recv(), "<<", vec![var_t("addrs", arr())])),
+            "Process.put(:rh_const_stub_addrs, Process.get(:rh_const_stub_addrs, @stub_addrs) ++ [addrs])"
+        );
+        assert_eq!(
+            emit_expr(&call(recv(), "clear", vec![])),
+            "Process.put(:rh_const_stub_addrs, [])"
+        );
+        assert_eq!(
+            emit_expr(&call(recv(), "length", vec![])),
+            "Kernel.length(Process.get(:rh_const_stub_addrs, @stub_addrs))"
+        );
         clear_declared_constants();
     }
 

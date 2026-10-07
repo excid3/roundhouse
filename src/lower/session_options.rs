@@ -75,6 +75,10 @@ fn session_options_base(e: &Expr) -> Option<&Expr> {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     // Indexed reads are `Send "[]"` (the write side is `LValue::Index`,
     // which is why `request.session_options[:skip] = true` can't match).
     let base = match &*expr.node {

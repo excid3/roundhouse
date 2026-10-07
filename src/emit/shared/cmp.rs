@@ -62,17 +62,39 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
 
     match (lhs_ty, rhs_ty) {
         // Not SameType: Go's `time.Time` has no native `<`, so leave the rendering to each target.
-        (l, r) if is_time(l) && is_time(r) => CmpCase::Unknown,
+        (l, r) if temporal_kind(l).is_some() && temporal_kind(l) == temporal_kind(r) => CmpCase::Unknown,
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => CmpCase::SameType,
         (Ty::Str, Ty::Str) | (Ty::Sym, Ty::Sym) => CmpCase::SameType,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => CmpCase::NumericPromote,
-        (Ty::Class { .. }, Ty::Class { .. }) => CmpCase::ClassSubclass,
+        (Ty::Class { .. }, Ty::Class { .. }) if lhs.decisions & crate::expr::CLASS_OBJECT_VALUE != 0
+            && rhs.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 => CmpCase::ClassSubclass,
+        // `Gem::Version < Integer?`, `Money <= Money?`: `<` is `Comparable`
+        // on the lhs class; whether it accepts the rhs is that class's
+        // business, not decidable here.
+        _ if super::operand::is_user_operator_receiver(lhs) => CmpCase::Unknown,
+        // `(score || BEST) <= LIMIT` where the arms are Integer and
+        // `Numeric`: every arm is an ordered number.
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => CmpCase::NumericPromote,
         _ => CmpCase::Incompatible,
     }
 }
 
-fn is_time(ty: &Ty) -> bool {
-    matches!(ty, Ty::Time) || matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "Time")
+/// A point in time, of whatever class: the first-class `Time`, the legacy
+/// `Class { Time }`, and the other classes Rails orders against it
+/// (`DateTime`, `Date`, `ActiveSupport::TimeWithZone`), or a union of
+/// only those. Equal temporal representations can compare directly. Cross-kind coercion
+/// requires runtime support; a nil arm never proves temporal ordering.
+fn temporal_kind(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::Time => Some("Time"),
+        Ty::Date => Some("Date"),
+        Ty::Class { id, .. } if matches!(id.0.as_str(), "Time" | "DateTime" | "Date") => Some(id.0.as_str()),
+        Ty::Union { variants } => {
+            let first = temporal_kind(variants.first()?);
+            first.filter(|kind| variants.iter().all(|v| temporal_kind(v) == Some(*kind)))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn date_vs_date_is_not_incompatible() {
+        use crate::ident::ClassId;
+        let legacy = Ty::Class { id: ClassId(Symbol::from("Date")), args: vec![] };
+        for (l, r) in [
+            (Ty::Date, Ty::Date),
+            (Ty::Date, legacy.clone()),
+            (legacy.clone(), Ty::Date),
+            (legacy.clone(), legacy),
+        ] {
+            let l = var_typed("a", l);
+            let r = var_typed("b", r);
+            assert!(matches!(classify_cmp(&l, &r), CmpCase::Unknown));
+        }
+    }
+
+    #[test]
     fn nullable_time_vs_time_is_incompatible() {
         let l = var_typed("a", Ty::Union { variants: vec![Ty::Time, Ty::Nil] });
         let r = var_typed("b", Ty::Time);
@@ -211,14 +249,17 @@ mod tests {
         // must surface this so emitters render a target-appropriate
         // relation check instead of raising "incompatible operands".
         use crate::ident::ClassId;
-        let lhs = var_typed(
+        let mut lhs = var_typed(
             "L",
             Ty::Class { id: ClassId(Symbol::from("RecordNotFound")), args: vec![] },
         );
-        let rhs = var_typed(
+        let mut rhs = var_typed(
             "R",
             Ty::Class { id: ClassId(Symbol::from("StandardError")), args: vec![] },
         );
+        assert!(matches!(classify_cmp(&lhs, &rhs), CmpCase::Incompatible));
+        lhs.decisions |= crate::expr::CLASS_OBJECT_VALUE;
+        rhs.decisions |= crate::expr::CLASS_OBJECT_VALUE;
         assert!(matches!(classify_cmp(&lhs, &rhs), CmpCase::ClassSubclass));
     }
 }

@@ -682,6 +682,7 @@ fn block_of(param: &str, body: Expr) -> Expr {
     )
 }
 
+
 fn self_class() -> Expr {
     Expr::new(Span::synthetic(), ExprNode::SelfRef)
 }
@@ -1044,7 +1045,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// `is_module: true` and `parent: None`. The `is_module` flag is
 /// load-bearing: callers using `include` on the result need it to be
 /// emitted as `module`, not `class`, or Ruby will raise TypeError.
-fn library_class_from_module_node_with_scope(
+pub(super) fn library_class_from_module_node_with_scope(
     module: &ruby_prism::ModuleNode<'_>,
     scope: &[String],
     file: &str,
@@ -1185,7 +1186,7 @@ impl DeclBody {
 /// `include T::Struct::ActsAsComparable` is deliberately NOT here: it
 /// gives a struct its `==`, which is behavior, and it goes when the
 /// struct itself is lowered.
-fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     if !matches!(constant_id_str(&name), "extend" | "include") {
         return false;
@@ -1231,7 +1232,7 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
-const SORBET_ANNOTATIONS: &[&str] = &[
+pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
     "interface!",
@@ -1562,8 +1563,56 @@ fn walk_decl_body_with_visibility<'pr>(
             if force_class_receiver || module_function_active || extend_self_active {
                 m.receiver = MethodReceiver::Class;
             }
-            direct_def_positions.push(out.methods.len());
-            out.methods.push(m);
+            // A real `def` replaces a synthesized attr_* half of the
+            // same name (Ruby last-definition-wins for
+            // `attr_accessor :x` then `def x; … end`). An earlier real
+            // `def` is kept as duplicate evidence — `initialize` hooks
+            // and visibility tests rely on both surviving ingest. Match
+            // `push_user_methods`: only unsigned bare-ivar attr halves.
+            if let Some(idx) = out
+                .methods
+                .iter()
+                .position(|e| e.name == m.name && e.receiver == m.receiver)
+            {
+                let existing = &out.methods[idx];
+                let existing_is_attr_half = existing.signature.is_none()
+                    && match existing.kind {
+                        crate::dialect::AccessorKind::AttributeReader => {
+                            matches!(
+                                &*existing.body.node,
+                                ExprNode::Ivar { name } if name == &existing.name
+                            )
+                        }
+                        crate::dialect::AccessorKind::AttributeWriter => {
+                            let base = existing
+                                .name
+                                .as_str()
+                                .strip_suffix('=')
+                                .unwrap_or(existing.name.as_str());
+                            matches!(
+                                &*existing.body.node,
+                                ExprNode::Assign {
+                                    target: LValue::Ivar { name },
+                                    ..
+                                } if name.as_str() == base
+                            )
+                        }
+                        crate::dialect::AccessorKind::Method => false,
+                    };
+                if existing_is_attr_half {
+                    out.methods[idx] = m;
+                    if !direct_def_positions.iter().any(|p| *p == idx) {
+                        direct_def_positions.push(idx);
+                    }
+                } else {
+                    // Duplicate real `def` — keep both.
+                    direct_def_positions.push(out.methods.len());
+                    out.methods.push(m);
+                }
+            } else {
+                direct_def_positions.push(out.methods.len());
+                out.methods.push(m);
+            }
             continue;
         }
         // `class << self ... end` — singleton class block. Body
@@ -1616,7 +1665,12 @@ fn walk_decl_body_with_visibility<'pr>(
             });
         }
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none() {
+            // `include X` and `self.include(X)` are the same call: the
+            // explicit-self spelling is how a file that must satisfy a
+            // type checker writes it (`self #: as untyped` on the line
+            // before `.include(Rails.application.routes.url_helpers)`),
+            // and it means the body's own self, exactly as the bare form.
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
                 let kw = constant_id_str(&call.name());
                 // `class_methods do … end` — ActiveSupport::Concern's
                 // class-side block: its defs become class methods of
@@ -1640,7 +1694,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             // replays it, the rest see a class body they
                             // cannot model.
                             if args.arguments().iter().any(|arg| {
-                                constant_path_of(&arg).is_none() && !is_rails_url_helpers_chain(&arg)
+                                constant_path_of(&arg).is_none() && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                             }) {
                                 if let Ok(e) = ingest_expr(&stmt, file) {
                                     out.unknown_calls.push(e);
@@ -1662,7 +1716,7 @@ fn walk_decl_body_with_visibility<'pr>(
                                         continue;
                                     }
                                     out.includes.push(ClassId(Symbol::from(path.join("::"))));
-                                } else if is_rails_url_helpers_chain(&arg) {
+                                } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,
                                     // inside `class << self`) — the whole
@@ -1723,12 +1777,23 @@ fn walk_decl_body_with_visibility<'pr>(
                             if want_reader {
                                 let mut method = synth_attr_reader(owner, name, recv);
                                 visibility.apply(&statement, &mut method);
-                                out.methods.push(method);
+                                // Skip when a `def` of this name already
+                                // walked (unusual order); a later `def`
+                                // replaces via the push path above.
+                                if !out.methods.iter().any(|e| {
+                                    e.name == method.name && e.receiver == method.receiver
+                                }) {
+                                    out.methods.push(method);
+                                }
                             }
                             if want_writer {
                                 let mut method = synth_attr_writer(owner, name, recv);
                                 visibility.apply(&statement, &mut method);
-                                out.methods.push(method);
+                                if !out.methods.iter().any(|e| {
+                                    e.name == method.name && e.receiver == method.receiver
+                                }) {
+                                    out.methods.push(method);
+                                }
                             }
                         }
                     }
@@ -1886,35 +1951,6 @@ fn walk_decl_body_with_visibility<'pr>(
     Ok(out)
 }
 
-/// Match the `Rails.application.routes.url_helpers` receiver chain (a
-/// nested CallNode ladder rooted at the `Rails` constant).
-fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
-    let mut cur = match node.as_call_node() {
-        Some(c) => c,
-        None => return false,
-    };
-    loop {
-        let Some(want) = expected.next() else { return false };
-        if cur.name().as_slice() != want.as_bytes() {
-            return false;
-        }
-        match cur.receiver() {
-            Some(r) => {
-                if let Some(cr) = r.as_constant_read_node() {
-                    return expected.next().is_none()
-                        && cr.name().as_slice() == b"Rails";
-                }
-                match r.as_call_node() {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            None => return false,
-        }
-    }
-}
-
 /// Only declared cattr/mattr reads use the existing class-ivar approximation.
 /// Ordinary class-variable reads retain native shared inheritance storage.
 fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
@@ -1943,7 +1979,7 @@ pub(super) fn alias_keyword_name(node: &ruby_prism::Node<'_>) -> Option<String> 
         .map(|call| constant_id_str(&call.name()).to_string())
 }
 
-fn alias_source(
+pub(super) fn alias_source(
     call: &ruby_prism::CallNode<'_>,
     methods: &[MethodDef],
     class_side: bool,
@@ -2225,15 +2261,18 @@ pub(super) fn ingest_library_method(
     // `&block` rides in `MethodDef.block_param`, not the flat list —
     // it occupies the call-site `block:` slot, never `args:`. Mirrors
     // the runtime_src split (see runtime_src::method_params).
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
-            // name so body-side bare-`&` forwarding (`__blk`) binds.
-            .unwrap_or("__blk");
-        Param::positional(Symbol::from(name))
-    });
+    let block_param = def
+        .parameters()
+        .and_then(|pn| pn.block())
+        .map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
+                // name so body-side bare-`&` forwarding (`__blk`) binds.
+                .unwrap_or("__blk");
+            Param::positional(Symbol::from(name))
+        });
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
@@ -2314,7 +2353,60 @@ impl ModelBases {
         let mut names = std::collections::HashSet::new();
         names.insert("ApplicationRecord".to_string());
         names.insert("ActiveRecord::Base".to_string());
+        // Rails' Action Text abstract base (`ActionText::Record <
+        // ActiveRecord::Base; self.abstract_class = true`). The gem
+        // file is not ingested, but Writebook's
+        // `lib/rails_ext/action_text_markdown.rb` subclasses the
+        // lexical bare `Record` under `module ActionText`. Seeding the
+        // qualified name lets `has_active_record_base` + lexical
+        // resolution classify that class as a model rather than a
+        // library class that emits `class Markdown < Record`.
+        names.insert("ActionText::Record".to_string());
         Self { names }
+    }
+
+    /// Is `name` (possibly after lexical qualification) an AR base?
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// Superclass name written into emitted model IR. Gem abstract bases
+    /// that are seeded for classification but not ingested (today:
+    /// `ActionText::Record`) parent as `ApplicationRecord`, matching
+    /// RichText synthesis — callers must not special-case the name.
+    pub fn emit_superclass(&self, resolved: &str) -> String {
+        if resolved == "ActionText::Record" {
+            "ApplicationRecord".to_string()
+        } else {
+            resolved.to_string()
+        }
+    }
+
+    /// Resolve a superclass path against enclosing modules the way Ruby
+    /// constant lookup walks `module_parents`: bare `Record` under
+    /// `module ActionText` becomes `ActionText::Record` when that base
+    /// is known. Qualified paths are unchanged. Falls back to the
+    /// lexical spelling when no enclosing candidate is a known base.
+    pub fn resolve_superclass(&self, scope: &[String], parent_path: &[String]) -> String {
+        let joined = parent_path.join("::");
+        // Bare names: search enclosing scopes first (Ruby constant
+        // lookup). A global `ApplicationRecord` base must not win over
+        // a closer `Foo::ApplicationRecord` when both are known.
+        if parent_path.len() == 1 {
+            let bare = &parent_path[0];
+            let mut segs = scope.to_vec();
+            while !segs.is_empty() {
+                let candidate = format!("{}::{}", segs.join("::"), bare);
+                if self.contains(&candidate) {
+                    return candidate;
+                }
+                segs.pop();
+            }
+        }
+        if self.contains(&joined) {
+            return joined;
+        }
+        joined
     }
 
     /// One file's `class X < Y` pairs, for the closure below — but
@@ -2340,18 +2432,28 @@ impl ModelBases {
             if !declares_abstract_class(&class) {
                 continue;
             }
-            pairs.push((full.join("::"), parent.join("::")));
+            // Resolve bare parents (`Record` under `module ActionText`)
+            // before close_over, which matches on the stored parent
+            // spelling against seeded qualified bases.
+            let parent = self.resolve_superclass(&scope, &parent);
+            pairs.push((full.join("::"), parent));
         }
     }
 
     /// Close the set: anything whose parent is already a base is one.
     /// Iterated rather than recursive because the pairs arrive in file
     /// order, and a base can be declared after its user.
+    ///
+    /// `record` stores a bare parent (`MidBase`) when that name is not
+    /// yet a known base. After a later iteration inserts the qualified
+    /// form (`ActionText::MidBase`), match the stored spelling against
+    /// the child's enclosing modules the same way `resolve_superclass`
+    /// does at record time.
     pub fn close_over(&mut self, pairs: &[(String, String)]) {
         loop {
             let before = self.names.len();
             for (child, parent) in pairs {
-                if self.names.contains(parent) {
+                if self.parent_is_known_base(child, parent) {
                     self.names.insert(child.clone());
                 }
             }
@@ -2361,9 +2463,28 @@ impl ModelBases {
         }
     }
 
-    fn contains(&self, name: &str) -> bool {
-        self.names.contains(name)
+    fn parent_is_known_base(&self, child: &str, parent: &str) -> bool {
+        if self.names.contains(parent) {
+            return true;
+        }
+        if parent.contains("::") {
+            return false;
+        }
+        let mut segs: Vec<&str> = child.split("::").collect();
+        if segs.len() < 2 {
+            return false;
+        }
+        segs.pop();
+        while !segs.is_empty() {
+            let candidate = format!("{}::{}", segs.join("::"), parent);
+            if self.names.contains(&candidate) {
+                return true;
+            }
+            segs.pop();
+        }
+        false
     }
+
 }
 
 /// Does this file's first class descend from an ActiveRecord base?
@@ -2376,21 +2497,25 @@ impl ModelBases {
 /// own way, and routing it to the model path breaks that.
 ///
 /// So the rule outside `app/models` is ancestry to ActiveRecord, and
-/// nothing else.
+/// nothing else. Lexical superclass resolution applies: bare `Record`
+/// under `module ActionText` matches the seeded `ActionText::Record`
+/// base (Writebook Markdown).
 pub fn has_active_record_base(source: &[u8], bases: &ModelBases) -> bool {
     let result = parse(source);
     let root = result.node();
-    let Some(class) = find_first_class(&root) else { return false };
+    let Some((scope, class)) = find_all_classes_with_scope(&root).into_iter().next() else {
+        return false;
+    };
     class
         .superclass()
         .and_then(|n| constant_path_of(&n))
-        .is_some_and(|p| bases.contains(&p.join("::")))
+        .is_some_and(|p| bases.contains(&bases.resolve_superclass(&scope, &p)))
 }
 
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {
     let result = parse(source);
     let root = result.node();
-    let Some(class) = find_first_class(&root) else {
+    let Some((scope, class)) = find_all_classes_with_scope(&root).into_iter().next() else {
         // No class node. A bare top-level module under app/models/
         // (`module InactiveUser; def self.x; …; end`) is a namespace of
         // singleton methods, not a model — classify it as a library
@@ -2407,7 +2532,7 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
     let parent_path = class
         .superclass()
         .and_then(|n| constant_path_of(&n))
-        .map(|p| p.join("::"));
+        .map(|p| bases.resolve_superclass(&scope, &p));
 
     Some(match parent_path.as_deref() {
         // Resolved through the app's own bases, not against two
@@ -2954,13 +3079,17 @@ fn unknown_is_model_macro(item: &crate::dialect::ModelBodyItem) -> bool {
     CONCERN_MODEL_MACROS.contains(&method.as_str())
 }
 
+/// Re-export: table payload lives next to [`super::model::EnumExpansion`].
+pub use super::model::ConcernEnumDecl;
+
 /// Second return value: `enum` columns declared inside an `included
 /// do`, keyed by the concern module. They belong to every includer
 /// exactly as the DSL items do; the splice folds them into each
-/// including model's own `enums` table.
+/// including model's own `enums` table (and `enum_defaults` when
+/// `default:` is present).
 pub type ConcernModelItems = (
     Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    Vec<(ClassId, Vec<(Symbol, Vec<(String, crate::expr::Literal)>)>)>,
+    Vec<(ClassId, Vec<ConcernEnumDecl>)>,
 );
 
 fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::Node<'pr>>) {
@@ -2988,13 +3117,24 @@ pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId,
     walk_dsl_stmts(body, &mut stmts);
     super::survey::without_recording(|| {
         stmts.iter().any(|stmt| {
-            super::model::ingest_model_body_items(stmt, owner, file, Vec::new())
+            super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None)
                 .is_ok_and(|items| items.iter().any(super::concern_accessors::is_candidate))
         })
     })
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
+    ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default())
+}
+
+/// Same as [`ingest_concern_model_items`], with the app-wide constant
+/// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
+/// resolve the way model-side class-body DSL does.
+pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+) -> ConcernModelItems {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -3007,10 +3147,18 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
         let mut full_path: Vec<String> = scope.clone();
         full_path.extend(name_path);
         let id = ClassId(Symbol::from(full_path.join("::")));
+        let enum_owners = enum_constants
+            .nesting
+            .get(&(file.to_string(), module.location().start_offset()))
+            .cloned()
+            .unwrap_or_default();
+        let resolve_constant = |node: &ruby_prism::Node<'_>| {
+            enum_constants.resolve(node, &enum_owners)
+        };
 
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
-        let mut enums: Vec<(Symbol, Vec<(String, crate::expr::Literal)>)> = Vec::new();
+        let mut enums: Vec<ConcernEnumDecl> = Vec::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -3030,11 +3178,25 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_enum_decl(
-                        &call, file, &[], &|_| None,
+                    match super::model::expand_class_body_dsl(
+                        &call,
+                        file,
+                        &[],
+                        &super::model::ClassConsts::default(),
+                        &resolve_constant,
                     ) {
-                        Ok(Some(expanded)) => {
-                            enums.push((expanded.column, expanded.mapping));
+                        Ok(Some(super::model::ClassBodyExpansion::DelegatedType(expanded))) => {
+                            items.extend(expanded);
+                            continue;
+                        }
+                        Ok(Some(super::model::ClassBodyExpansion::Enum(expanded))) => {
+                            if let Some(mapping) = expanded.mapping {
+                                enums.push(ConcernEnumDecl {
+                                    column: expanded.column,
+                                    mapping,
+                                    default: expanded.default,
+                                });
+                            }
                             items.extend(expanded.items);
                             continue;
                         }
@@ -3051,7 +3213,7 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new()) {
+                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
                             match item {

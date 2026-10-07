@@ -45,30 +45,40 @@ pub fn apply_array_ordinal_lowering(app: &mut App) {
 /// to run once that body is typed — a test's `@messages` is bound in
 /// its inlined setup and typed there, nowhere earlier. campfire's
 /// messages_controller_test pages through `@messages.third` /
-/// `.fourth` / `.fifth` over a `to_a`.
-pub(crate) fn rewrite_body(expr: &mut Expr) {
-    rewrite(expr);
+/// `.fourth` / `.fifth` over a `to_a`. Returns whether any ordinal
+/// was rewritten so the caller can skip a follow-up type.
+pub(crate) fn rewrite_body(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if rewrite_body(c) {
+            changed = true;
+        }
+    });
+    rewrite_node(expr) || changed
 }
 
 fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
+    let _ = rewrite_body(expr);
+}
 
+pub(crate) fn rewrite_node(expr: &mut Expr) -> bool {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else {
-        return;
+        return false;
     };
     if !args.is_empty() {
-        return;
+        return false;
     }
     let Some((_, index)) = ORDINALS.iter().find(|(name, _)| *name == method.as_str()) else {
-        return;
+        return false;
     };
     if !matches!(recv.ty, Some(Ty::Array { .. })) {
-        return;
+        return false;
     }
     let span = expr.span;
     let mut idx = Expr::new(span, ExprNode::Lit { value: Literal::Int { value: *index } });
     idx.ty = Some(Ty::Int);
     *method = Symbol::from("[]");
-    let ExprNode::Send { args, .. } = &mut *expr.node else { return };
+    let ExprNode::Send { args, .. } = &mut *expr.node else { return false };
     args.push(idx);
+    true
 }

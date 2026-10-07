@@ -299,12 +299,7 @@ module Tep
           end
           reason = Tep.reason(res.status)
           head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
-          res.headers.each do |k, v|
-            head << k + ": " + v + "\r\n"
-          end
-          res.set_cookies.each do |line|
-            head << "Set-Cookie: " + line + "\r\n"
-          end
+          head << Tep.header_lines(res)
           head << "Connection: close\r\n\r\n"
           Sock.sphttp_write_str(client, head)
           out = Tep::Stream.new(client)
@@ -320,12 +315,7 @@ module Tep
         Tep.maybe_gzip!(req, res)
         reason = Tep.reason(res.status)
         head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
-        res.headers.each do |k, v|
-          head << k + ": " + v + "\r\n"
-        end
-        res.set_cookies.each do |line|
-          head << "Set-Cookie: " + line + "\r\n"
-        end
+        head << Tep.header_lines(res)
         if keep_alive
           head << "Connection: keep-alive\r\n"
         else

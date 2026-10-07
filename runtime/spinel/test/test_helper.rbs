@@ -95,6 +95,15 @@ module ActionDispatch
   end
 end
 
+# rack-test's StringIO form; it is the file params carry.
+module Rack
+  module Test
+    class UploadedFile < ActionDispatch::Http::UploadedFile
+      def initialize: (StringIO io, ?String content_type, ?bool binary, original_filename: String) -> void
+    end
+  end
+end
+
 class ActionResponse
   def status: () -> Integer
   def body: () -> String

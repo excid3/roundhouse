@@ -30,10 +30,22 @@ use roundhouse::dialect::{LibraryClass, MethodDef};
 use roundhouse::expr::{Expr, ExprNode, InterpPart};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_library_classes;
-use roundhouse::rbs::parse_app_signatures;
+use roundhouse::rbs::{parse_app_ivars, parse_app_signatures};
 use roundhouse::ty::Ty;
 
 const RUNTIME_DIR: &str = "runtime/ruby/active_record";
+
+/// Sidecars outside `active_record/` that AR bodies call. Without these
+/// the probe reports Ty::Var on real, already-declared surfaces (Db,
+/// Rails.application, MessageVerifier, ActiveSupport.json_time) — the
+/// same gap `runtime_src_integration` avoids via `insert_db_stub` /
+/// stdlib seeding. Not an app inventory; shared-runtime contracts only.
+const DEPENDENCY_RBS: &[&str] = &[
+    "runtime/ruby/db.rbs",
+    "runtime/ruby/rails.rbs",
+    "runtime/ruby/action_controller/message_verifier.rbs",
+    "runtime/ruby/active_support_time_parsing.rbs",
+];
 
 /// Walk a typed expression tree, collecting every node whose `ty` is
 /// missing or `Ty::Var`. Same shape as the no-RBS probe so the two
@@ -217,59 +229,113 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Walk one method body collecting every `@x = expr` assignment so
-/// the second typing pass can seed `ivar_bindings` with discovered
-/// types. Mirrors the analyzer's two-pass discipline (model + library
-/// passes).
-fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
-    match &*expr.node {
-        ExprNode::Assign {
-            target: roundhouse::expr::LValue::Ivar { name },
-            value,
-        } => {
-            if let Some(ty) = value.ty.clone() {
-                out.entry(name.clone()).or_insert(ty);
+/// Seed ivar_bindings: union-merge flow assignments (so `initialize`'s
+/// `@limit = nil` does not permanently beat `limit`'s `@limit = n`),
+/// then overlay RBS-declared ivars for this class (single source of
+/// truth — no parallel class-name match table).
+///
+/// `ActiveRecord::Base` methods are split across stems (`base.rb`,
+/// `connection.rb`, …). Callers must merge seeds for the same
+/// `ClassId` — a per-stem insert would drop `initialize`'s writes.
+fn seed_ivars_for_class(
+    class_id: &ClassId,
+    methods: &[roundhouse::dialect::MethodDef],
+    rbs_ivars: &HashMap<ClassId, HashMap<Symbol, Ty>>,
+) -> HashMap<Symbol, Ty> {
+    let mut flow: HashMap<Symbol, Ty> = HashMap::new();
+    for method in methods {
+        roundhouse::analyze::extract_ivar_assignments(&method.body, &mut flow);
+    }
+    if let Some(declared) = rbs_ivars.get(class_id) {
+        for (name, ty) in declared {
+            flow.insert(name.clone(), ty.clone());
+        }
+    }
+    // Short-name RBS keys (rare) — only when exact ClassId missed.
+    // Do not merge short-only ivars onto a class that already has its
+    // own declaration map (would widen unrelated siblings).
+    if !rbs_ivars.contains_key(class_id) {
+        if let Some(short) = class_id.0.as_str().rsplit("::").next() {
+            let short_id = ClassId(Symbol::new(short));
+            if short_id != *class_id {
+                if let Some(declared) = rbs_ivars.get(&short_id) {
+                    for (name, ty) in declared {
+                        flow.entry(name.clone()).or_insert_with(|| ty.clone());
+                    }
+                }
             }
         }
-        ExprNode::Seq { exprs } => {
-            for e in exprs {
-                extract_ivar_assignments(e, out);
+    }
+    flow
+        .into_iter()
+        .map(|(name, ty)| {
+            // Already nilable overlays stay; flow Int becomes Int|Nil.
+            let wrapped = match &ty {
+                Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)) => ty,
+                other => Ty::Union {
+                    variants: vec![other.clone(), Ty::Nil],
+                },
+            };
+            (name, wrapped)
+        })
+        .collect()
+}
+
+/// Union-merge two ivar maps (same join as the analyzer harvest).
+fn merge_ivar_maps(into: &mut HashMap<Symbol, Ty>, from: HashMap<Symbol, Ty>) {
+    for (name, ty) in from {
+        match into.remove(&name) {
+            Some(prev) => {
+                into.insert(name, match (prev, ty) {
+                    (a, b) if a == b => a,
+                    (a, b) => {
+                        // Flatten nested unions so `Array[Int]|Nil` ⨝ `Nil`
+                        // stays a flat union (collection_elem still sees Int).
+                        let mut variants = Vec::new();
+                        let mut push = |t: Ty| match t {
+                            Ty::Union { variants: inner } => {
+                                for v in inner {
+                                    if !variants.iter().any(|e| e == &v) {
+                                        variants.push(v);
+                                    }
+                                }
+                            }
+                            other => {
+                                if !variants.iter().any(|e| e == &other) {
+                                    variants.push(other);
+                                }
+                            }
+                        };
+                        push(a);
+                        push(b);
+                        match variants.len() {
+                            0 => Ty::Nil,
+                            1 => variants.pop().unwrap(),
+                            _ => Ty::Union { variants },
+                        }
+                    }
+                });
+            }
+            None => {
+                into.insert(name, ty);
             }
         }
-        ExprNode::If { then_branch, else_branch, .. } => {
-            extract_ivar_assignments(then_branch, out);
-            extract_ivar_assignments(else_branch, out);
-        }
-        ExprNode::BoolOp { left, right, .. } => {
-            extract_ivar_assignments(left, out);
-            extract_ivar_assignments(right, out);
-        }
-        ExprNode::Lambda { body, .. } => extract_ivar_assignments(body, out),
-        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            extract_ivar_assignments(body, out);
-            for r in rescues {
-                extract_ivar_assignments(&r.body, out);
-            }
-            if let Some(e) = else_branch {
-                extract_ivar_assignments(e, out);
-            }
-            if let Some(e) = ensure {
-                extract_ivar_assignments(e, out);
-            }
-        }
-        ExprNode::Return { value } => extract_ivar_assignments(value, out),
-        _ => {}
     }
 }
 
-/// Build a `ClassInfo` for each class declared in any of the
-/// `.rbs` files, keyed by the class's last name segment. Mirrors
-/// the existing `runtime_src_integration` registry-building
-/// pattern (lines 300–348 of that file): RBS uses fully-qualified
-/// names (`ActiveRecord::Base`) but the body-typer dispatches via
-/// `Ty::Class { id }` whose id comes from `Const { path }.last()`.
-/// Stripping to the last segment keeps lookups consistent.
-fn build_class_registry() -> (HashMap<ClassId, ClassInfo>, HashMap<ClassId, HashMap<Symbol, Ty>>) {
+/// Preserve canonical RBS class identities for method parameters and
+/// dispatch. This probe has no ConstantResolver, so unique short-name
+/// aliases also serve bare constants. Ambiguous suffixes must never
+/// merge unrelated classes.
+///
+/// Also merges dependency sidecars + the Db stub the production /
+/// Bar-A paths already seed, so AR bodies are not scored as unresolved
+/// for calls that are already contracted elsewhere in `runtime/ruby/`.
+fn build_class_registry() -> (
+    HashMap<ClassId, ClassInfo>,
+    HashMap<ClassId, HashMap<Symbol, Ty>>,
+    HashMap<ClassId, HashMap<Symbol, Ty>>,
+) {
     let dir = Path::new(RUNTIME_DIR);
     let mut entries: Vec<_> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read_dir {RUNTIME_DIR}: {e}"))
@@ -278,13 +344,12 @@ fn build_class_registry() -> (HashMap<ClassId, ClassInfo>, HashMap<ClassId, Hash
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rbs"))
         .collect();
     entries.sort();
+    for dep in DEPENDENCY_RBS {
+        entries.push(Path::new(dep).to_path_buf());
+    }
 
-    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::new();
-    // Keep the full Ty::Fn signatures alongside (the registry stores
-    // return types after unwrap_fn_ret; the body Ctx needs the full
-    // params Vec).
     let mut sigs: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
-
+    let mut ivars: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
     for path in entries {
         let source = fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read {}: {e}", path.display())
@@ -293,28 +358,59 @@ fn build_class_registry() -> (HashMap<ClassId, ClassInfo>, HashMap<ClassId, Hash
             panic!("parse {}: {e}", path.display())
         });
         for (class_id, methods) in by_class {
-            // Strip fully-qualified to last segment.
-            let short = class_id
-                .0
-                .as_str()
-                .rsplit("::")
-                .next()
-                .unwrap_or(class_id.0.as_str())
-                .to_string();
-            let short_id = ClassId(Symbol::new(&short));
-            let entry = registry.entry(short_id.clone()).or_default();
-            let sig_entry = sigs.entry(short_id).or_default();
-            for (name, ty) in methods {
-                // Registry stores the Ty::Fn directly so dispatch's
-                // `unwrap_fn_ret` returns the declared result. Both
-                // class and instance methods land in instance_methods
-                // (matches the existing app-RBS overlay convention).
-                entry.instance_methods.insert(name.clone(), ty.clone());
-                sig_entry.insert(name, ty);
-            }
+            // Sorted sidecars retain the existing reopen/override order.
+            sigs.entry(class_id).or_default().extend(methods);
+        }
+        let by_ivar = parse_app_ivars(&source).unwrap_or_else(|e| {
+            panic!("parse ivars {}: {e}", path.display())
+        });
+        for (class_id, class_ivars) in by_ivar {
+            ivars.entry(class_id).or_default().extend(class_ivars);
         }
     }
-    (registry, sigs)
+    let mut registry = registry_with_unique_aliases(&sigs);
+    // Db lives in class_methods on the production stub; mirror that so
+    // `Db.exec` / `Db.escape_string` resolve the same way as Bar A.
+    roundhouse::lower::view_to_library::insert_db_stub(&mut registry);
+    (registry, sigs, ivars)
+}
+
+/// Build exact entries first, then alias only unambiguous short references.
+/// Keep full Fn signatures so dispatch and body contexts see the same RBS.
+/// Mirror each sig into `class_methods` too: `parse_app_signatures` does
+/// not split `def self`, and Const receivers consult class_methods first.
+fn registry_with_unique_aliases(
+    sigs: &HashMap<ClassId, HashMap<Symbol, Ty>>,
+) -> HashMap<ClassId, ClassInfo> {
+    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::new();
+    let mut aliases: HashMap<ClassId, Option<ClassId>> = HashMap::new();
+    for (class_id, methods) in sigs {
+        let entry = registry.entry(class_id.clone()).or_default();
+        entry.instance_methods = methods.clone();
+        entry.class_methods = methods.clone();
+        let short = ClassId(Symbol::new(
+            class_id.0.as_str().rsplit("::").next().unwrap_or(class_id.0.as_str()),
+        ));
+        aliases
+            .entry(short)
+            .and_modify(|owner| {
+                if owner.as_ref() != Some(class_id) {
+                    *owner = None;
+                }
+            })
+            .or_insert_with(|| Some(class_id.clone()));
+    }
+    for (short, owner) in aliases {
+        if let Some(owner) = owner {
+            registry.entry(short).or_insert_with(|| {
+                let mut info = ClassInfo::default();
+                info.instance_methods = sigs[&owner].clone();
+                info.class_methods = sigs[&owner].clone();
+                info
+            });
+        }
+    }
+    registry
 }
 
 /// Build a method-body Ctx by seeding `self_ty` from the enclosing
@@ -368,9 +464,74 @@ fn ingest_runtime_classes() -> Vec<(String, LibraryClass)> {
     out
 }
 
+/// Existing nested runtime classes must receive their declared parameter
+/// types, and fully-qualified receiver types must resolve their readers.
+#[test]
+fn qualified_runtime_signatures_seed_contexts_and_results() {
+    let (registry, sigs, _) = build_class_registry();
+    let classes = ingest_runtime_classes();
+    let row = Ty::Hash {
+        key: Box::new(Ty::Str),
+        value: Box::new(Ty::Untyped),
+    };
+    let rows = Ty::Array { elem: Box::new(row) };
+    for (class, method, name, expected) in [
+        ("ActiveRecord::Result", "initialize", "rows", rows.clone()),
+        ("ActiveRecord::Connection", "quote_string", "str", Ty::Str),
+    ] {
+        let (_, lc) = classes
+            .iter()
+            .find(|(_, lc)| lc.name.0.as_str() == class)
+            .expect("runtime class");
+        let method = lc.methods.iter().find(|m| m.name.as_str() == method).unwrap();
+        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::new());
+        assert_eq!(
+            ctx.local_bindings.get(&Symbol::new(name)),
+            Some(&expected),
+            "{class}.{name}"
+        );
+    }
+    let source = b"class Probe; def rows(result); result.rows; end; end";
+    let typer = BodyTyper::new(&registry);
+    for class in ["ActiveRecord::Result", "Result"] {
+        // Each spelling starts untyped so prior annotations cannot mask a miss.
+        let mut probes = ingest_library_classes(source, "probe.rb").unwrap();
+        let mut ctx = Ctx::default();
+        ctx.local_bindings.insert(
+            Symbol::new("result"),
+            Ty::Class {
+                id: ClassId(Symbol::new(class)),
+                args: vec![],
+            },
+        );
+        typer.analyze_expr(&mut probes[0].methods[0].body, &ctx);
+        assert_eq!(
+            probes[0].methods[0].body.ty,
+            Some(rows.clone()),
+            "{class}"
+        );
+    }
+}
+
+/// A short alias may not combine identically named classes in distinct modules.
+#[test]
+fn ambiguous_short_aliases_do_not_merge_signatures() {
+    let signatures = parse_app_signatures(
+        "module One\n class Shared\n def first: () -> Integer\n end\nend\n\
+         module Two\n class Shared\n def second: () -> String\n end\nend\n",
+    )
+    .unwrap();
+    let registry = registry_with_unique_aliases(&signatures);
+    assert!(!registry.contains_key(&ClassId(Symbol::new("Shared"))));
+    let one = &registry[&ClassId(Symbol::new("One::Shared"))].instance_methods;
+    let two = &registry[&ClassId(Symbol::new("Two::Shared"))].instance_methods;
+    assert!(one.contains_key(&Symbol::new("first")) && !one.contains_key(&Symbol::new("second")));
+    assert!(two.contains_key(&Symbol::new("second")) && !two.contains_key(&Symbol::new("first")));
+}
+
 #[test]
 fn untyped_subexpressions_with_rbs_baseline() {
-    let (registry, sigs) = build_class_registry();
+    let (registry, sigs, rbs_ivars) = build_class_registry();
     let mut classes = ingest_runtime_classes();
     let typer = BodyTyper::new(&registry);
 
@@ -384,25 +545,18 @@ fn untyped_subexpressions_with_rbs_baseline() {
         }
     }
 
-    // Harvest ivar assignments per class. Then re-type with the
-    // discovered ivars (each wrapped in `Union<T, Nil>` to reflect
-    // a possible pre-write nil read) seeded into Ctx.
+    // Harvest ivars per ClassId across every stem (Base spans base.rb
+    // + connection.rb). Union-merge so a later stem cannot wipe
+    // initialize's writes. Overlay from parsed RBS `@ivar` decls.
     let mut ivars_by_class: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
     for (_, lc) in &classes {
-        let entry = ivars_by_class.entry(lc.name.clone()).or_default();
-        for method in &lc.methods {
-            extract_ivar_assignments(&method.body, entry);
-        }
+        let seeded = seed_ivars_for_class(&lc.name, &lc.methods, &rbs_ivars);
+        merge_ivar_maps(ivars_by_class.entry(lc.name.clone()).or_default(), seeded);
     }
 
     for (_, lc) in &mut classes {
         let lc_name = lc.name.clone();
-        let mut wrapped: HashMap<Symbol, Ty> = HashMap::new();
-        if let Some(found) = ivars_by_class.get(&lc_name) {
-            for (k, v) in found {
-                wrapped.insert(k.clone(), Ty::Union { variants: vec![v.clone(), Ty::Nil] });
-            }
-        }
+        let wrapped = ivars_by_class.get(&lc_name).cloned().unwrap_or_default();
         for method in &mut lc.methods {
             let ctx = build_method_ctx(&lc_name, method, &sigs, &wrapped);
             typer.analyze_expr(&mut method.body, &ctx);
@@ -444,563 +598,12 @@ fn untyped_subexpressions_with_rbs_baseline() {
         }
     }
 
-    // Loose ceiling — current measurement plus some headroom. Tighten
-    // as authoring/inference improves; failing low is good (un-pin
-    // and record the new lower bound). 2026-07-23: 500 → 520 —
-    // measurement moved to 509 when Relation#column_predicate grew the
-    // record/collection runtime-dispatch arms (`where(comment:
-    // comments)` IN-of-records support); those arms inspect untyped
-    // hash values by design. 2026-07-27: 520 → 535 — measurement moved
-    // to 521 when `Arel::Table`/`Attribute` came off the CRuby overlay
-    // into the shared file (this harness does not apply the sidecar RBS
-    // to a nested class, so their `initialize` params read untyped the
-    // same way `SelectManager`'s already did). 2026-07-30: 535 → 610 —
-    // measurement moved to 595 with `Base.upsert`/`upsert_all`
-    // (connection.rb 71 → 124) and `Relation#pick` (304 → 311). The upsert
-    // builder is untyped for the same reason `update_counters` and
-    // `build_where` beside it are: it assembles SQL text out of a
-    // heterogeneous `Hash[Symbol, untyped]` row, and `unique_by` /
-    // `on_duplicate` are Rails-shaped options that arrive as a String, a
-    // Symbol, or an Array. The sidecar RBS does not reach it — this
-    // harness skips nested classes, and `ActiveRecord::Base` here is a
-    // reopen. `Base.primary_key` added 0: it returns a literal. NOTE the
-    // pre-existing headroom was already spent — the tree measured exactly
-    // 535 before this change, so the next author gets 15, not 74.
-    // 2026-07-30 (second bump, same day): 610 -> 625 — measurement moved
-    // to 613 when `has_attribute?` and the two `saved_change_to_attribute`
-    // readers each bound their collection to a local before calling a
-    // collection method on it. That binding is not style: elixir's
-    // receiver typing does not see through a method-call receiver, so the
-    // direct chain lowers `include?`/`key?` as a struct-field access
-    // (`saved_changes(record).__struct__`) and fails mix's
-    // warnings-as-errors gate. Each local is one more untyped site here —
-    // the cost of keeping the elixir lane compiling.
-    // 2026-08-11: 625 -> 626 — `ActiveRecord::RecordNotUnique` joined
-    // errors.rb so campfire's `rescue ActiveRecord::RecordNotUnique`
-    // resolves (without the constant, the rescue clause raises NameError
-    // when EVALUATED, taking the happy path down with it). Its one
-    // untyped node is the `super(message)` call, identical in shape to
-    // the `RecordNotFound` and `ValueTooLong` bodies already counted
-    // here — `super` has no signature for the typer to resolve. A
-    // like-for-like +1 from a corpus that grew by one class, not a
-    // typing regression.
-    // 2026-08-13: 626 -> 633 — `Relation#first_n` / `#last_n`, the
-    // COUNTED forms of `first`/`last`. They are separate methods because
-    // the counted forms answer an Array where the bare forms answer one
-    // record, and one method cannot carry both return types on a strict
-    // target. The 7 nodes are the same shapes already counted all over
-    // this file: an `@limit = n` assign plus its `n` read, a `to_a` call,
-    // and a `to_a.last(n)` send with its receiver and argument. Nothing
-    // here is newly untypable — RBS parameter types do not reach this
-    // runtime's body typer for ANY method (see the `SelectManager
-    // #initialize` / `Table#initialize` entries in the dump, whose `sql`
-    // and `name` params are untyped the same way). A like-for-like
-    // addition of two small methods, not a typing regression.
-    // 2026-08-15: 633 -> 637 — `Relation#where_scope` / `#scope_attributes`,
-    // the association-scope pair. Rails derives a relation's create-scope
-    // from its equality conditions (`where_values_hash` /
-    // `scope_for_create`); ours records them where the association seed
-    // sets them, so `user.sessions.start!` can merge `user_id` into the
-    // `create!` inside `Session.start!`. The 4 nodes are the assign
-    // `@scope_attributes = condition` with its `condition` read, and the
-    // `add_condition(condition, [], false)` call with the same read again
-    // — the RBS-parameter shape already counted for `SelectManager
-    // #initialize`'s `sql` and `Table#initialize`'s `name`, which are
-    // untyped for the same reason (RBS parameter types do not reach this
-    // runtime's body typer for ANY method). Like-for-like, not a typing
-    // regression.
-    // 2026-08-16: 637 -> 645 — `Relation#excluding`, Rails' "everything
-    // except these records". All 8 nodes sit in that one method and all 8
-    // root in its splat parameter: the `if` and both branches, the
-    // `records.length` send with its `records` receiver, and the two
-    // branches' hash values (`records[0]` and bare `records`) plus the
-    // former's own receiver. A `*records` splat is untyped here for
-    // exactly the reason `SelectManager#initialize`'s `sql` is — RBS
-    // parameter types do not reach this runtime's body typer. The method
-    // delegates the typed work to `not`; nothing new became untypable.
-    // 2026-08-16: 645 -> 656 — `Relation#destroy_all` (8) and the
-    // `to_sql` / `to_subquery_sql` / `select_sql_with` split (3).
-    //
-    // `destroy_all`'s 8 all root in `to_a`, which answers
-    // `Array[untyped]` because this Relation is not generic over its
-    // model: the method node, the `records = to_a` assign and its
-    // value, the `records.each` send and its receiver, the block body
-    // `r.destroy` and its `r` receiver, and the trailing `records` read.
-    // Exactly the shape `find` and `first` already contribute here, for
-    // the same reason. The method has to exist separately from
-    // `delete_all` because Rails draws the line there too — one runs
-    // callbacks, the other is a single DELETE.
-    //
-    // The other 3 are bookkeeping from splitting one method into three:
-    // `to_sql` became a one-line delegate, `to_subquery_sql` is a second
-    // delegate (a relation used as a CONDITION value must project one
-    // column, not `*`), and the shared builder moved to
-    // `select_sql_with`, whose `default_cols` parameter is untyped for
-    // the same RBS-parameter reason as `SelectManager#initialize`'s
-    // `sql`. The builder's own nodes moved with it rather than
-    // multiplying.
-    //
-    // Like-for-like: two Rails methods this runtime lacked, plus a
-    // refactor. Nothing that was typed became untyped.
-    // 2026-08-17: 656 -> 673 — the Enumerable surface campfire's own
-    // suite reaches for: `partition`, `detect`, `sort_by`, the block
-    // form of `select`, and `without` (Rails' own alias for
-    // `excluding`). Every one of them is `to_a.<m> { |x| yield x }`,
-    // and every added node roots in `to_a` answering `Array[untyped]`
-    // — the same shape `find`, `first`, `map`, `group_by` and
-    // `destroy_all` already contribute here, and for the same reason:
-    // this Relation is not generic over its model. A generic
-    // `Relation[T]` is what retires the whole class of them at once;
-    // adding these one Enumerable method at a time neither helps nor
-    // hurts that. Nothing that was typed became untyped.
-    // 2026-08-17: 673 -> 685 — `Relation#destroy_by` / `#delete_by`,
-    // Rails' condition-taking bulk writes, measured at 679. Three nodes
-    // each: the method body `where(conditions).destroy_all`, its
-    // `where(conditions)` receiver, and the `conditions` parameter read.
-    // The parameter is untyped for the reason every RBS parameter in
-    // this file is — RBS parameter types do not reach this runtime's
-    // body typer for ANY method (see `SelectManager#initialize`'s `sql`
-    // and `Table#initialize`'s `name` in the dump) — and the two sends
-    // ride on it. Both bodies delegate straight to the already-counted
-    // `where` + `destroy_all`/`delete_all`; nothing that was typed
-    // became untyped, and the pair exists separately for the same
-    // reason `destroy_all` and `delete_all` do, one running callbacks
-    // and the other issuing a single DELETE.
-    //
-    // campfire's `Room has_many :memberships do def revoke_from(users)
-    // destroy_by user: users end end` is the caller. Headroom left: 6.
-    // 2026-08-17: 685 -> 687 — `Relation#exists?(id)` and `Base#touch`,
-    // two methods `src/catalog/mod.rs` has declared for as long as it
-    // has existed with nothing implementing them. ONE node each, and
-    // both are the same RBS-parameter shape as every other entry here:
-    // `exists?`'s optional `id` parameter read (the `@wheres <<`
-    // interpolation that consumes it), and `touch`'s `fill_timestamps
-    // (false)` self-send. Neither method delegates to anything new.
-    // Nothing that was typed became untyped.
-    //
-    // 2026-08-18: 687 -> 705 — `active_record/signed_id.rb`, and this
-    // one is 18 nodes for TWO methods, well past the 1-3 budget below.
-    // The reason is structural, not sloppiness: signed_id.rb is the
-    // first file in `active_record/` that calls OUT of the directory
-    // this test measures. Every send into
-    // `ActionController::MessageVerifier` (`envelope`, `iso8601_ms`,
-    // `verified_json`) and every `Rails.application.secret_key_base`
-    // read resolves against a tree whose RBS this harness does not
-    // load, so the send and each node hanging off it counts —
-    // `generate` contributes 11 and `verified_id` 7, and the dump
-    // shows every one of them rooted in either a cross-tree send or
-    // the RBS-parameter limitation the entries above describe.
-    // Nothing that was typed became untyped, and no node here is one
-    // a better-typed signed_id.rb could retire; widening the harness
-    // to load action_controller's RBS is what would.
-    //
-    // 2026-08-18 705 -> 707 — `Relation#scoped_write_where`, the WHERE
-    // clause `delete_all` / `update_all` take when the scope carries a
-    // JOIN (SQL has no place for one in a DELETE, so the write is
-    // scoped by an `IN (SELECT …)` subquery instead). TWO nodes, both
-    // the shape every entry above describes: the `@model.primary_key`
-    // send and the `key` local it binds. `@model` is the constructor's
-    // untyped parameter, so the send off it is untyped and the local
-    // rides on it. Nothing that was typed became untyped.
-    //
-    // 2026-08-18 707 -> 712 — `Relation#join_fragment`, the guard that
-    // makes `joins(:assoc)` RAISE instead of appending the bare symbol
-    // as SQL (`FROM rooms users`, which SQLite reads as an alias and
-    // answers the wrong rows). FIVE nodes, every one rooted in the
-    // `untyped spec` parameter `joins` has always declared: the param,
-    // the `is_a?` send off it, the guarded return, and the two nodes of
-    // the raise's interpolation. Above the 1-3 budget below, and worth
-    // it: the alternative is a wrong answer nothing reports.
-    //
-    // 2026-08-19 712 -> 727 — the ActiveModel::Dirty VALUE half:
-    // `attribute_previously_was` in both base.rb (the compile surface,
-    // ending in a `saved_changes` read) and connection.rb (the real
-    // one, indexing slot 0 of the `[prev, value]` pair), plus
-    // `_note_hydrated` taking the hydration baseline. FIFTEEN nodes,
-    // every one hanging off the same two untyped things this file's
-    // entries always hang off: the `name` parameter, which is a caller-
-    // chosen Symbol, and the diff's values, which are a heterogeneous
-    // Hash by construction. Nothing that was typed became untyped.
-    //
-    // Above the 1-3 budget below, and the reason is the SPLIT rather
-    // than the feature: the same method exists twice, once per layer,
-    // because the strict lanes cannot index the pair. Each copy pays
-    // its own nodes.
-    //
-    // This ceiling moved on EVERY runtime/ruby method this session, and
-    // `cargo test` is the only gate that reads it — budget ~1-3 nodes
-    // per added method before touching the number here.
-    //
-    // +4 for `Base.sanitize_sql(statement)`. Its parameter is
-    // `Array[untyped]` and honestly so: Rails' array form is a String
-    // fragment followed by ARBITRARY bind values, which is the one
-    // shape a typed element cannot describe. The four nodes are the
-    // reads off it — `statement[0]`, `statement.length`,
-    // `statement[bind]`, and the escape call's argument.
-    // 2026-08-20 731 -> 735 — two surface methods the campfire suite
-    // named, both inside the 1-3 budget: `Relation#collect` (map's
-    // second name, paying what map pays) and `Base#destroy!` (~1 — it
-    // calls `destroy`, which is typed `Base`).
-    //
-    // A `Relation#new` landed here too and was REVERTED at 735: see the
-    // note in runtime/ruby/active_record/relation.rb — a method named
-    // `new` on a class cannot exist under spinel, whose constructor for
-    // that class is already `sp_Relation_new`.
-    //
-    // The STI recast that landed with them adds NOTHING here, and that
-    // is the load-bearing part: its first draft was a shared-runtime
-    // `Base#becomes_state_from` looping over `source.attributes`, worth
-    // 14 nodes AND a rust_toolchain failure (`no method named
-    // attributes for struct Base` — the generic loop needs the
-    // polymorphic dispatch the strict targets are built to avoid). The
-    // copy moved into the lowerer, which knows the schema and unrolls
-    // it column by column. Both problems had the same fix.
-    // 2026-08-20 735 -> 737, +1 each for `Relation#first` and
-    // `Relation#find` closing the same terminal leak `pluck` had — the
-    // saved `prior` limit and the `@wheres.pop` are both untyped reads
-    // off containers declared untyped. Worth naming: this pair greened
-    // ZERO tests. It is here because the previous commit wrote the
-    // terminal invariant into docs/pipeline/runtime.md and named these
-    // two as the outstanding violations of it; a documented invariant
-    // with known live exceptions is worse than two nodes.
-    // 2026-08-21 737 -> 738, +1 for `Relation#one?` — the `count == 1`
-    // reads `count`, whose return the relation's own rbs leaves
-    // untyped, exactly like its `any?` sibling next to it. One node,
-    // and it greened a first-run test that had no other way to ask
-    // "does this user have exactly one room?" now that a `has_many
-    // :through` reader answers a Relation rather than an Array.
-    // 2026-08-21 738 -> 746, +8 for `Relation#find_or_create_by`. Every
-    // one is a read off something the relation's own RBS declares
-    // untyped: the `conditions` parameter is `Hash[Symbol, untyped]`,
-    // `@model` is the model handle, and `find_by`/`new` both answer
-    // untyped — the same four sources `find_by!` and
-    // `first_or_initialize` beside it already draw on. It is EIGHT
-    // rather than two because the method is genuinely two operations,
-    // a find and a scoped build, and the build's
-    // `scope_attributes.merge(conditions)` is three of them on its own.
-    // Trimming the obvious one (a local holding the merge, hoisted
-    // above the find) took it from 10 to 8; the rest are the method.
-    //
-    // It greened campfire's `searches_controller_test` 5/5: `Search
-    // .record` is `find_or_create_by(query: query).touch`, reached as
-    // `user.searches.record(q)`, and until this existed the emitted
-    // body called a method nothing defined. Doing it in the runtime
-    // rather than as a lower-time macro-inline is what lets the SCOPE
-    // reach the create — `merge_scope_attributes` would have had to
-    // merge into a call whose query half needs the same hash.
-    // 2026-08-21 746 -> 758, +12 for `Relation#==` — Rails' relation
-    // equality, which nothing in the emitted trees had. Every node is a
-    // read off the ONE parameter it takes or off an element of a list
-    // the relation's own RBS declares `Array[untyped]`, and the
-    // parameter is untyped for the reason equality always is: `==`
-    // answers for whatever it is handed. The twelve are the two `is_a?`
-    // receivers, the `other.to_a` send and its receiver, the local that
-    // holds the result, the `length` compare, and the `.id` read on
-    // each side of the loop.
-    //
-    // Well above the 1-3 budget, and the number is the method: it is a
-    // type test, a length test and an element walk, and the walk is
-    // where two thirds of it lives. What it buys is not a convenience —
-    // `assert_equal [ message ], Message.search("eel")` was an
-    // assertion NO emitted tree could pass, because Ruby hands an
-    // `Array == <thing that answers to_ary>` comparison to the other
-    // operand and `Object#==` is reference identity between an Array
-    // and a Relation. campfire's suite went 156 -> 160 of 240, 25 -> 26
-    // files, with `message_searchable_test` green.
-    //
-    // Its missing twin `Base#==` adds NOTHING here, and that is worth
-    // naming: written in base.rb it cost 4 more nodes AND broke both
-    // python overlay tests, because no emitter renames an operator
-    // DEFINITION to its host's spelling and `def ==(self, other)`
-    // reached python verbatim. Moved to the ruby-family connection.rb
-    // it cost an UNTYPED `@id`: that reopen is analyzed on its own and
-    // an ivar's type comes from an assignment in the same unit, which a
-    // reopen has none of (the `@x: T` lines in these .rbs files are
-    // documentation — `collect_class_methods` reads methods only). So
-    // the id comparison lives inside this method, where a relation's
-    // records being one model already decides the class half.
-    // 2026-08-22 758 -> 760: `Relation#find` raising `RecordNotFound`
-    // on no match — Rails' distinction between it and `find_by`, and
-    // what makes a missing record a 404 instead of a nil that
-    // NoMethodErrors later. TWO sites, both the `record` local the
-    // terminal answered: the `nil?` guard and the read that returns it.
-    // This counter charges the receiver as well as the send, which is
-    // why it moves by two where the runtime_src_integration ceiling
-    // moves by one.
-    // 2026-08-23 760 -> 767: `SignedId.verified_id!` — the raising twin
-    // of the sentinel read, so `find_signed!` answers
-    // `InvalidSignature` for a token that does not verify and
-    // `RecordNotFound` only for one that does and names no row. The
-    // NAME is what a `rescue_from` matches. SEVEN sites, all one
-    // comparison's worth: this gate's registry carries instance methods
-    // only, so a class-method send stays a TyVar and everything reading
-    // its result goes with it — the assign, its value, the `id` read,
-    // the `==`, its receiver, the guarded raise and the trailing read.
-    // Writing the verify call out a second time instead cost eight.
-    // +8 for the three RELATION TERMINALS that now give their
-    // borrowed state back (`find_by`, `exists?(id)`, `first_n`): each
-    // needs a local to hold the answer across the restore, and every
-    // read of `@wheres`/`@limit` is untyped here because relation.rbs
-    // declares no ivar types. That is the debt this number tracks —
-    // typing those four ivars would retire far more than eight — not
-    // a reason to leave a terminal narrowing the relation it was
-    // asked on. Campfire's room page rendered zero of forty messages
-    // on exactly that leak.
-    // 2026-08-23 775 -> 778, +3 for `Relation#preloaded` — the seam a
-    // `has_many :through` reader hands its eager-loaded records to, in
-    // place of the `return @<name>_cache if @<name>_loaded` guard that
-    // made such a reader answer an Array from one path and a Relation
-    // from the other (`emit::ruby::library::through_reader_body`). The
-    // three are the whole method: the `if` modifier, the ivar assign it
-    // guards, and the assign's value — the `records` parameter, which
-    // relation.rbs declares `Array[untyped]` because a relation is not
-    // generic in its element here, so every read of it is a TyVar. The
-    // `loaded` flag (bool) and the trailing `self` cost nothing.
-    //
-    // Cheap for what it retires: the two-typed reader was a latent
-    // `Array#includes` NoMethodError on a preloaded through
-    // association, and under spinel's AOT — which judges a seeded
-    // return as of its 2368afd7 — a hard compile stop that took the
-    // lobsters bench lane's AOT row down for three days
-    // (`--rbs seed contradicted: User#upvoted_stories is declared to
-    // return Relation but this returns int_array`).
-    // 2026-09-02 778 -> 915, +137 for `Relation#order` sorting a LOADED
-    // relation in memory (`sort_in_place!`, `order_column`,
-    // `order_descending?`, `compare_order_keys`, `order_key_of`): a
-    // stable insertion sort over the loaded records, keyed by
-    // `attributes[col]`. The records are `untyped` (the element type this
-    // Relation has never had), the keys are whatever a column holds, and
-    // `order`'s own `*untyped parts` is untyped by declaration -- so every
-    // local the sort derives from them is a TyVar, some sixty in the sort
-    // alone; and this gate resolves none of Relation's self-sends, so
-    // `sort_in_place!`/`compare_order_keys` results count again at each
-    // call site. MEASURED, not derived: 881 with a pair-returning helper,
-    // 921 after splitting it into a `String?` and a `bool` for the
-    // sibling gate in runtime_src_integration.rs (which counts declared
-    // `untyped` and went 431 -> 403 on the same change), 915 once the
-    // loaded copy is built by pushes instead of `dup` (spinel would not
-    // assign a nilable read's `dup` into the typed records field). What
-    // it retires:
-    // the last N+1 on campfire's room page. `message.boosts.ordered`
-    // under `includes(boosts: :booster)` re-queried once per message
-    // because the scope's `order` dropped the memo the association had
-    // just filled; 40 round trips -> 0, and the page sits at 14 against
-    // Rails' 13. Typing Relation's element (the generic-Relation
-    // refinement its header names) would retire most of this along with
-    // the rest of the file's 400-odd.
-    // 2026-09-06 915 -> 916, +1 for the `after_touch` call `Base#touch`
-    // now makes. MEASURED both ways on this gate: 915 with the line
-    // commented out, 916 with it. It is one more of the same shape the
-    // other eleven lifecycle-hook calls already contribute — the hooks
-    // are declared `() -> void` and this gate resolves none of the
-    // class's own self-sends, so a hook call in statement position is a
-    // TyVar however it is spelled. What it buys: `belongs_to … touch:
-    // true` becomes TRANSITIVE, which is what carries campfire's stamp
-    // from a boost through its Message to its Room. See
-    // docs/pipeline/runtime.md, "`belongs_to … touch:` cascades".
-    // 2026-09-10 916 -> 922, +6, MEASURED one method at a time on this
-    // gate: +3 for the blank family (`blank?`/`present?`/`presence`, each
-    // a self-send of `empty?`), +3 for `include?` (`record.nil?` and
-    // `record.id` on the untyped parameter, plus the `ids` self-send).
-    // Every one is the self-send shape the paragraphs above describe;
-    // none is a new declared `untyped`. What it buys: campfire's has_many
-    // extension `revise(granted: [])` and `room.users.include?(user)` on
-    // the compiled lane — record `==` exists only on the CRuby overlay,
-    // so a compiled target compared pointers.
-    // 2026-09-14 922 -> 931, +9, MEASURED by diffing the dump: the
-    // Relation load path. `Base._columns_sql`, the `_hydrate_all`
-    // compile stub, and connection.rb's Hash fallback (+6: the
-    // `table_name`/`name`/`instantiate` self-sends and the adapter
-    // chain, the same shapes `_adapter_all` already carries) and
-    // `Relation#load_records` (+3 net: `to_sql`/`select_sql_with`/
-    // `load_records` self-sends, the `rows` map moved out of `to_a`).
-    // Every one is the self-send shape; none is a new declared
-    // `untyped`. What it buys: a Relation without `select(...)`
-    // hydrates through the model's positional `from_stmt` and no
-    // String-keyed Hash is built per row.
-    // 2026-09-16 931 -> 933, +2: `take` on the class and on Relation,
-    // each one `first` self-send under the same declared `untyped`
-    // return `first` has always had. What it buys: the Rails 8
-    // authentication generator's `User.take` test setup.
-    // 2026-09-21 933 -> 937, +4: `ViewHelpers.attr_value_text(name, v)`,
-    // the self-send `render_attrs` now routes an attribute's text
-    // through (the ruby family reopens it to render an Array as Rails
-    // does; the shared body is `v.to_s`). The self-send shape the
-    // paragraphs above describe, plus the untyped `v` at both ends.
-    // 2026-09-23 937 -> 969, +32, MEASURED by grouping the dump by
-    // method: the before-save Dirty half. base.rb's `attribute_changed?`
-    // and `attribute_was` stubs (+6 each, exactly what their
-    // `saved_change_to_attribute?`/`saved_change_to_attribute` twins
-    // carry), and connection.rb's real `changes_to_save` (+8, the
-    // `__track_saved_changes` diff over the untyped baseline ivar) and
-    // `attribute_was` (+12, the `[prev, value]` pair and the
-    // `attributes[name]` fallback). What it buys: `<col>_changed?` /
-    // `<col>_was` answer at all; lobsters' `validate_username_timeouts`
-    // stopped 183 of its model specs.
-    // 2026-09-23 969 -> 978, +9, MEASURED by grouping the dump by
-    // method: `Connection#exec_update` (+5) and `#exec_delete` (+4), the
-    // raw-SQL DML-with-binds pair. The binds Array and Rails' `name`
-    // log label are declared untyped (they are anything a caller
-    // binds); the rest is the adapter self-send chain `update_counters`
-    // already carries. What it buys: lobsters' comment score recompute
-    // (`exec_update … unhex(?)`), which every comment and vote save
-    // reaches, and FullTextSearch's index-row delete.
-    // 2026-09-25 978 -> 979, +1, MEASURED from the dump: connection.rb's
-    // `Base.none`, the body `Relation.new(self).none` — the same chained
-    // shape its `where` neighbour already carries. What it buys:
-    // lobsters' `searched_model.none` (#132), a NoMethodError before.
-    // 2026-09-25 979 -> 991, +12, MEASURED by grouping the dump by
-    // method: `Relation#each_with_object` (+6, the `to_a.each` / `yield`
-    // shape `inject` beside it carries, and a memo that is whatever the
-    // caller seeds), `Connection#exec_insert` (+4, `exec_update`'s
-    // untyped `name`/`binds` passed on) and `#select_all` (+2, the
-    // `execute(sql)` forward `exec_query` already carries). What it
-    // buys: lobsters' vote lookup tables on every comment listing, its
-    // FullTextSearch index insert and TrafficHelper's activity range.
-    // 2026-09-25 991 -> 1001, +10, MEASURED from the dump: all
-    // `Relation#touch_all` — the adapter self-sends (`escape_value`,
-    // `execute_ddl`, `changes`) and the `now` / `name` reads in its SQL
-    // interpolation, the shape `update_all` beside it already carries.
-    // `load_async` (a forward to `load`) adds none. What it buys:
-    // lobsters' inbox `after_action :update_read_at`, which now runs.
-    // 2026-09-25 1001 -> 1021, +20, MEASURED by grouping the dump by
-    // method: `joins` / `left_outer_joins` (+3 each, the `frag` local
-    // read twice now that an identical join is added once, as Rails
-    // uniq's `joins_values`), `with_recursive` (+8, the CTE name/parts
-    // block and each part's `to_sql`), `select_sql_with` / `count_sql`
-    // (+3/+2, the `cte_prefix` / `from_source` interpolations) and
-    // `from` (+2 — its param is typed `String` so the runtime ratchet
-    // stays put, and the bare assignment reads here as a local). What it buys: lobsters' profile page (two scopes each
-    // `joins(:story)`) and its comment reply page (`Comment#parents`, a
-    // recursive CTE read `from("parents")`).
-    // 2026-09-25 1021 -> 1031, +10, MEASURED from the dump: connection.rb's
-    // ruby-family `Base#_note_unloaded` (+6) and the `has_attribute?` that
-    // honours it (+4) — `self.class.schema_columns`, the row, and each
-    // column read, the shape base.rb's own `has_attribute?` already
-    // carries here (this probe has no concrete model to type them). What
-    // it buys: a partial `select` answers `has_attribute?` false for the
-    // columns it left out, as Rails does, so lobsters' Token guard no
-    // longer mints a TypeID per `User.select(*attrs)` row (66 -> 2 per
-    // benchmark pass, the 2 being records genuinely built new).
-    // 2026-09-26 1031 -> 1055, +24, MEASURED by grouping the dump by
-    // method: Relation's set operations, `&` / `|` / `-` / `+` (they
-    // were 3 each as one-liners) now load a Relation operand and match
-    // by id through `id_filter`, `ids_of`, `operand_ids` and
-    // `set_operand` — every record read a TyVar, as this probe has no
-    // concrete model. A block per operator cost 35. What it buys:
-    // lobsters' `story.tags & filtered_tags`, which raised TypeError on
-    // every story page, and intersections that no longer come back empty
-    // for two sides that loaded the same rows.
-    // SQL identifier metadata: 1055 -> 1056, +1, MEASURED against the
-    // unchanged upstream corpus by method. Base#_table_sql delegates to
-    // table_name for native ordinary models; this probe does not resolve
-    // class self-sends. Emitted models return a typed SQL identifier
-    // literal instead. Relation's count is unchanged, and the separate
-    // every_runtime_method_body_is_fully_typed gate remains in force.
-    // 1056 -> 1123, +67 (original baseline 1055 -> 1122), MEASURED:
-    // array find_ids +59, scalar find +6, to_a -1 (preloading now
-    // belongs to load_records), connection's primary-key cast +3.
-    // This historical probe lacks the full runtime typing context and
-    // has no concrete model for the record/key reads. Inputs remain
-    // Integer/String scalars or arrays, not new untyped parameters.
-    // runtime_src_integration's zero-unresolved-type gate remains green;
-    // emit_and_run pins the result and exception/state semantics.
-    // 1123 -> 1126, +3 MEASURED: connection's Integer serialization
-    // guard's is_a? / match? receiver reads and match negation.
-    // This limited probe lacks branch-local union narrowing;
-    // the full-context runtime still has 519 gradual sites and zero
-    // unresolved types. The concrete cast result adds nil, never untyped.
-    // 2026-10-02 1126 -> 1130, +4, MEASURED against the pre-merge meta
-    // tree (upstream alone: 1056 -> 1060). Only connection.rb changes,
-    // 204 -> 208: `upsert_all`'s `_conflict_predicate(...)` self-send and its
-    // assignment (+2), and the two reads of the result (+2). Like
-    // `_table_sql` above, this probe does not resolve class self-sends;
-    // the method is typed `(String) -> String` in connection.rbs. What
-    // it buys: `upsert_all(unique_by:)` names a partial unique index
-    // with its `WHERE`, as Rails does, which SQLite needs to match it.
-    // 2026-10-02 1130 -> 1179, +49, MEASURED by method against main
-    // e0d8610e: Kaminari's surface on Relation (relation.rb 691 -> 738)
-    // and `Base.page` (connection.rb 208 -> 210). Almost all of it is
-    // the readers calling one another bare (`next_page` reads
-    // `current_page` and `total_pages`, `total_count` is `count`), which
-    // this probe does not resolve; the rest is the untyped `num`
-    // parameter of `page` / `per`. The full-context gate in
-    // runtime_src_integration counts three. What it buys: Kaminari's
-    // `page` / `per` chains and readers run.
-    // 2026-10-03 1179 -> 1209, +30, MEASURED by method with and without
-    // the new file: active_record/token_for.rb (has_secure_password's
-    // reset token), and nothing else. generate 8, secure_password_data 9,
-    // data_id 8, verified_data 5 — every one a read of a parameter
-    // (`data_json`, `purpose`, `expires_in`, `digest`, `token`, `data`)
-    // or a call taking one, which this probe leaves as a TyVar where
-    // token_for.rbs declares String/Integer. The full-context gate in
-    // runtime_src_integration counts ONE site (`Time.now + expires_in`).
-    // What it buys: the Rails 8 authentication generator's password
-    // reset flow, in Rails' own token format.
-    // 2026-10-05 1209 -> 1273, +64, MEASURED: Relation#last_n SQL tail
-    // plus reversing comma-separated order terms (relation.rb 738 ->
-    // 802). This probe does not resolve self-sends or `@orders`
-    // indexing; the full-context gate counts 16. What it buys: campfire
-    // room pages LIMIT the last 40 in SQL, including `order(a:, b:)`.
-    // 2026-10-05 1273 -> 1280, +7, MEASURED with and without the three
-    // methods (relation.rb 802 -> 809): Relation#reorder,
-    // #skip_preloading! and #preload_associations. This probe leaves the
-    // `*parts` splat, the `records` parameter and the `@model` send as
-    // TyVars; the full-context gate in runtime_src_integration counts
-    // ONE (reorder's splat). What it buys: campfire's message paging after
-    // basecamp/once-campfire#292, and #304/#312's `reorder`.
-    // 2026-10-05 1280 -> 1336, +56, MEASURED (relation.rb 809 -> 865):
-    // Relation#substitute_named_binds and its two character tests, plus
-    // #to_set. This probe resolves neither self-sends nor `sql[i, 1]`
-    // slices, which a character scan is made of; the full-context gate
-    // in runtime_src_integration counts ZERO new sites. What it buys:
-    // named binds in `where`/`having`, without which campfire's direct-
-    // room lookup (basecamp/once-campfire#310) read NULL and created a
-    // room on every Ping.
-    // 2026-10-05 1336 -> 1341, +5, MEASURED (connection.rb 210 -> 215):
-    // Connection#select_rows, a block over the adapter's untyped rows.
-    // What it buys: campfire's tests reading an EXPLAIN QUERY PLAN with
-    // `select_rows(…).map(&:last)`.
-    // 2026-10-05 1341 -> 1350, +9, MEASURED (relation.rb 865 -> 874):
-    // Relation#offset_row_exists?, which this probe sees through the same
-    // unresolved self-sends and `@limit` reads every terminal pays. What
-    // it buys: `offset(n).exists?` asks for a row past n, campfire's
-    // `paged?` (basecamp/once-campfire#297), where a COUNT ignored it.
-    // 2026-10-05 1350 -> 1380, +30, MEASURED (relation.rb 874 -> 904):
-    // `exists_sql` / `probe_existence` (cardinality without COUNT),
-    // `nil_primary_key_lookup?` (find_by id: nil short-circuit), the
-    // size / one? / many? / last_page? paths that share them, and
-    // `find_each`'s duplicated zero-copy loop. Same unresolved
-    // self-send / `@limit` residual every terminal pays.
-    // 2026-10-05 1380 -> 1386, +6, MEASURED (relation.rb 904 -> 910):
-    // limited `size` counts a `SELECT 1` subquery (orders cleared for
-    // the inner select), and `exists_sql` projects `DISTINCT pk` so
-    // `distinct.many?`/`one?` see separate rows. The find_by(id: nil)
-    // short-circuit that this ceiling once paid for is gone; the net
-    // still rises by six unresolved self-send / `@orders` sites.
-    // 2026-10-05 1386 -> 1395, +9, MEASURED (relation.rb / base.rb):
-    // Relation#more_than? (COUNT>n as LIMIT 1 OFFSET n), loaded_records
-    // shared by each/find_each, Base.any?/none? via exists?. Dropped
-    // offset_row_exists?. Residual is the same unresolved self-send /
-    // `@joins` / `@wheres` every SQL composer pays.
-    // 2026-10-05 1395 -> 1400, +5, MEASURED: Base.any?/none? restored
-    // to COUNT for strict targets; Relation.exists? forms moved to
-    // connection.rb reopen. last_page? requires non-empty short page.
-    // This probe sees the connection reopen's new self-sends.
-    // 2026-10-05 1400 -> 1409, +9, MEASURED (token_for.rb 30 -> 39):
-    // TokenFor.value_data and .id_data, and generate's `expires_in > 0`
-    // guard — reads of parameters (`id`, `value`, `expires_in`) this
-    // probe leaves as TyVars where token_for.rbs declares them; the
-    // full-context gate in runtime_src_integration counts no new sites.
-    // What it buys: an app's own `generates_token_for` declarations in
-    // Rails' token format, unexpiring ones included (Jumpstart Pro's
-    // email-change confirmation).
-    // 2026-10-05 1409 -> 1415, +6, MEASURED (token_for.rb 39 -> 45):
-    // TokenFor.int_value_data and .bool_value_data, the same parameter
-    // reads (`id`, `value`) as value_data. What they buy: a token whose
-    // block value is an Integer or a boolean carries the JSON Rails
-    // writes, so it verifies across to Rails.
-    const CEILING: usize = 1415;
+    // Soft ratchet under canonical class-ID lookup (Fixes #435), then
+    // dependency RBS + cross-stem ivar merge + Relation/Base overlays.
+    // Fails only when the residual rises. Not a substitute for Bar B.
+    // TokenFor helpers from generates_token_for may add parameter-read
+    // sites; remeasure and ledger any delta here before pushing.
+    const CEILING: usize = 0;
 
     assert!(
         all_untyped.len() <= CEILING,

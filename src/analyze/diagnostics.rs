@@ -45,6 +45,65 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // graphql-ruby object types: their bodies, and each `null: false`
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
+    out.extend(super::enum_raw_input::diagnose(app));
+    // Rubydex's unresolved constants emit refusal stubs. Collect those
+    // annotations from support methods/defaults/constants as well, so
+    // an emitted raise cannot be hidden by the library diagnostic policy.
+    // Restore the nominal-class operator refusal widened by the fork.
+    // Primitive/nullable arithmetic keeps the existing library policy.
+    fn nominal_class_operand(ty: &Ty) -> bool {
+        match ty {
+            Ty::Class { .. } => true,
+            Ty::Union { variants } => !variants.is_empty() && variants.iter().all(nominal_class_operand),
+            _ => false,
+        }
+    }
+    fn collect_constants(expr: &Expr, out: &mut Vec<Diagnostic>) {
+        if let Some(kind @ DiagnosticKind::IncompatibleBinop { op, lhs_ty, .. }) = &expr.diagnostic {
+            if nominal_class_operand(lhs_ty) {
+            out.push(Diagnostic {
+                span: expr.span,
+                severity: Diagnostic::default_severity(kind),
+                kind: kind.clone(),
+                message: format!("`{op}` with incompatible operand types"),
+            });
+            }
+        }
+        if matches!(&expr.diagnostic,
+            Some(DiagnosticKind::Unsupported { .. }))
+        {
+            if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
+                out.push(Diagnostic::unsupported(expr.span, target.clone(), construct.as_str(), detail.clone()));
+            }
+        }
+        expr.node.for_each_child(&mut |child| collect_constants(child, out));
+    }
+    // Declaration DSL arguments are handled by the class-body ledger;
+    // this pass covers executable support methods and initializers.
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for method in &class.methods {
+            collect_constants(&method.body, &mut out);
+            for param in &method.params {
+                if let Some(default) = &param.default { collect_constants(default, &mut out); }
+            }
+        }
+        for (_, value) in &class.constants { collect_constants(value, &mut out); }
+        for call in &class.unknown_calls { collect_constants(call, &mut out); }
+    }
+    // The analyzer resolves model include identities against the registry.
+    // Collect that edge's refusal; declaration-marker arguments are metadata
+    // handled by the shared model lowerer, rather than executable reads.
+    for model in &app.models {
+        for item in &model.body {
+            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
+                    if construct.as_str() == "include" {
+                        out.push(Diagnostic::unsupported(expr.span, None, "include", detail.clone()));
+                    }
+                }
+            }
+        }
+    }
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
@@ -315,7 +374,10 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
     // is itself unresolved is reported on the receiver node when we
     // recurse, so the outer send is skipped here to avoid double-counting
     // the same root cause.
-    if is_unknown_ty(expr.ty.as_ref())
+    //
+    // A node the compiler synthesized (an `attr_writer`'s `value`) has no
+    // source position: there is nothing for the author to look at or fix.
+    if is_unknown_ty(expr.ty.as_ref()) && !expr.span.is_synthetic()
         && !matches!(expr.diagnostic, Some(DiagnosticKind::Unsupported { .. }))
     {
         let report = matches!(

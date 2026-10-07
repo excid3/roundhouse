@@ -475,18 +475,19 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
 }
 
 #[test]
-fn draft_transitions_replace_the_previous_pr_run() {
+fn head_and_label_changes_replace_the_previous_pr_run_without_draft_churn() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let events = ci["on"]["pull_request"]["types"].as_sequence().unwrap();
-    for event in [
-        "ready_for_review",
-        "converted_to_draft",
-        "labeled",
-        "unlabeled",
-    ] {
-        assert!(events.iter().any(|value| value.as_str() == Some(event)));
-    }
+    assert_eq!(
+        events,
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(
+            "[opened, synchronize, reopened, labeled, unlabeled]"
+        )
+        .unwrap()
+        .as_sequence()
+        .unwrap()
+    );
     assert_eq!(
         ci["concurrency"]["group"].as_str(),
         Some(
@@ -1246,7 +1247,7 @@ fn pr_reuse_receipts_are_checked_against_adversarial_inputs() {
 fn reused_checks_keep_cargo_dependencies_locked_and_upload_only_execution_receipts() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    for (name, expected_cargo_commands) in [("store-check", 1), ("writebook-inventory", 2)] {
+    for (name, expected_cargo_commands) in [("store-check", 1), ("writebook-inventory", 1)] {
         let steps = ci["jobs"][name]["steps"].as_sequence().unwrap();
         let commands: Vec<_> = steps
             .iter()

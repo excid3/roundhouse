@@ -97,6 +97,10 @@ pub fn apply_time_current_lowering(app: &mut App) {
 pub(crate) fn rewrite_time_current(expr: &mut Expr, formats: &TimeFormats) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite_time_current(c, formats));
+    rewrite_node(expr, formats);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
     let is_target = matches!(
         &*expr.node,
         ExprNode::Send { recv: Some(r), method, args, block: None, .. }

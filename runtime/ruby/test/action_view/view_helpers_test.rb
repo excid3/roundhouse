@@ -393,6 +393,12 @@ class ViewHelpersTest < Minitest::Test
     assert_equal "", ViewHelpers.method_override_input(:post)
   end
 
+  def test_form_with_stringifies_method_from_opts
+    out = ViewHelpers.form_with(url: "/articles", method: :patch)
+    assert_includes out, %(name="_method")
+    assert_includes out, %(value="patch")
+  end
+
   def test_optional_value_attr_emits_for_non_empty
     assert_equal %( value="hello"), ViewHelpers.optional_value_attr("hello")
   end

@@ -38,20 +38,20 @@
 //! took for `to: redirect(…)`: a hole nobody can see is how a gap
 //! stays open.
 //!
-//! Direct receiverless `include` calls are also reported: Writebook's
-//! `:active_record` hook installs `ActionText::HasMarkdown` this way,
-//! without reopening a class. Reporting does not install the mixin or
-//! execute the hook. This is not an exhaustive ledger of hook bodies;
+//! Direct receiverless `include` calls with literal module names are carried
+//! for known framework hooks. Other include shapes are reported without
+//! executing the hook. This is not an exhaustive ledger of hook bodies;
 //! nested/conditional calls and other executable statements remain gaps.
 
 use ruby_prism::Node;
 
 use crate::app::App;
-use crate::ident::Symbol;
+use crate::ident::{ClassId, Symbol};
 
+use super::library_class::library_class_from_module_node_with_scope;
 use super::util::{
     class_name_path, constant_id_str, constant_path_of, find_all_classes_with_scope,
-    find_all_modules_with_scope, module_name_path,
+    find_all_modules_with_scope, flatten_statements,
 };
 use super::{survey, IngestError};
 
@@ -94,6 +94,26 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
                 if include.receiver().is_some() || constant_id_str(&include.name()) != "include" {
                     continue;
                 }
+                // Class-method macros are indexed independently of mixin carrying
+                // (`App.load_hook_class_macros`), including carried literal hooks.
+                if hook == "active_record" {
+                    for arg in include.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                        if let Some(path) = constant_path_of(&arg) {
+                            let id = ClassId(Symbol::from(path.join("::")));
+                            if !app.load_hook_class_macros.contains(&id) {
+                                app.load_hook_class_macros.push(id);
+                            }
+                        }
+                    }
+                }
+                let carried = hook_class(&hook).is_some()
+                    && include.arguments().is_some_and(|args| {
+                        args.arguments().iter().next().is_some()
+                            && args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                    });
+                if carried {
+                    continue;
+                }
                 let loc = include.location();
                 let declaration = String::from_utf8_lossy(loc.as_slice());
                 survey::record(&IngestError::Unsupported {
@@ -103,6 +123,7 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
                          load-hook mixin installation is unsupported"
                     ),
                 });
+
             }
         }
 
@@ -119,10 +140,59 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
             not_carried(file, &hook, &name);
         }
         for (scope, module) in find_all_modules_with_scope(&body) {
-            let mut path = scope.clone();
-            path.extend(module_name_path(&module).unwrap_or_default());
-            not_carried(file, &hook, &path.join("::"));
+            // A module DEFINED in the block is an ordinary top-level
+            // module (`module` does not close over the block's self):
+            // carry it as the library class it would be outside the
+            // block, so what the hook includes has methods to resolve.
+            match library_class_from_module_node_with_scope(&module, &scope, file) {
+                Ok(lc) => app.library_classes.push(lc),
+                Err(err) => survey::record(&err),
+            }
         }
+        carry_hook_includes(body, &hook, file, app);
+    }
+}
+
+/// The framework class a load hook hands its block, for the hooks whose
+/// receiver is one class. Deliberately a short list: a hook this does not
+/// name is reported rather than guessed at.
+fn hook_class(hook: &str) -> Option<&'static str> {
+    Some(match hook {
+        "action_dispatch_request" => "ActionDispatch::Request",
+        "action_dispatch_integration_test" => "ActionDispatch::IntegrationTest",
+        "action_controller" | "action_controller_base" => "ActionController::Base",
+        "action_controller_test_case" => "ActionController::TestCase",
+        "action_view" => "ActionView::Base",
+        "action_mailer" => "ActionMailer::Base",
+        "active_job" => "ActiveJob::Base",
+        "active_record" => "ActiveRecord::Base",
+        _ => return None,
+    })
+}
+
+/// `include(X)` / `include X` written straight in a load hook's block
+/// runs against the hooked class: the same mixin as
+/// `class ActionDispatch::Request; include(X); end`, and recorded the
+/// same way, as a reopen of that class.
+fn carry_hook_includes(body: Node<'_>, hook: &str, file: &str, app: &mut App) {
+    let mut mixins: Vec<String> = Vec::new();
+    for stmt in flatten_statements(body) {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "include" {
+            continue;
+        }
+        let Some(args) = call.arguments() else { continue };
+        mixins.extend(args.arguments().iter().filter_map(|a| constant_path_of(&a)).map(|p| p.join("::")));
+    }
+    if mixins.is_empty() {
+        return;
+    }
+    // Unsupported direct includes were reported at their original byte spans.
+    let Some(class) = hook_class(hook) else { return };
+    let source = format!("class {class}\n  include {}\nend\n", mixins.join(", "));
+    match super::library_class::ingest_library_classes(source.as_bytes(), file) {
+        Ok(classes) => app.library_classes.extend(classes),
+        Err(err) => survey::record(&err),
     }
 }
 

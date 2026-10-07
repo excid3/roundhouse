@@ -42,7 +42,7 @@ pub fn apply_including_lowering(app: &mut App) {
 
 /// Does any app class define its own `including`? Then the name doesn't
 /// mean ActiveSupport's and the pass stands down.
-fn app_defines_including(app: &App) -> bool {
+pub(crate) fn app_defines_including(app: &App) -> bool {
     let is_including = |n: &Symbol| n.as_str() == "including";
     let in_model = app.models.iter().any(|m| {
         m.body.iter().any(|item| match item {
@@ -66,6 +66,10 @@ fn app_defines_including(app: &App) -> bool {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &mut *expr.node else {
         return;
     };

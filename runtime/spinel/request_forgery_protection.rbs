@@ -1,9 +1,6 @@
 # Typing for runtime/spinel/request_forgery_protection.rb.
 module ActionController
   class Base
-    def self.allow_forgery_protection: () -> bool?
-    def self.allow_forgery_protection=: (bool? value) -> bool?
-    def verify_authenticity_token: () -> void
     def verified_request?: () -> bool
   end
 

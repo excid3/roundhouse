@@ -113,9 +113,13 @@ fn build_and_run(test_files: &[&str], tag: &str) {
         std::fs::write(&path, &file.content).expect("write emitted file");
     }
 
-    // `swift test` builds main + tests and runs XCTest.
+    // `swift test` builds main + tests and runs XCTest. Skip full
+    // debuginfo: CI only needs the XCTest result. Do not pass
+    // `--disable-index-store`: SPM still looks up the index store
+    // path and `swift test` then fatalErrors on Linux.
     let output = Command::new("swift")
         .arg("test")
+        .args(["-Xswiftc", "-gline-tables-only"])
         .current_dir(&scratch)
         .output()
         .expect("run swift test");

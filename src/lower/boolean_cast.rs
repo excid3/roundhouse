@@ -13,6 +13,10 @@ pub fn apply_boolean_cast_grounding(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send {
         recv: Some(r),
         method,

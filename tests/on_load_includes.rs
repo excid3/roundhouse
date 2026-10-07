@@ -1,4 +1,5 @@
-//! Load-hook mixin installation is a reported gap, not Markdown support.
+//! Known literal load-hook mixins are carried; unsupported hooks and
+//! dynamic includes remain reported gaps. This does not model Markdown DSLs.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,8 +15,14 @@ fn tree(hooks: &str) -> HashMap<PathBuf, Vec<u8>> {
     [
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
         ("lib/rails_ext/hooks.rb", hooks),
-        ("app/models/page.rb", "class Page < ApplicationRecord\n  has_markdown :body\nend\n"),
-        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :pages do |t|\n    t.string :title\n  end\n  create_table :action_text_markdowns do |t|\n    t.string :record_type\n    t.integer :record_id\n    t.string :name\n    t.text :content\n  end\nend\n"),
+        (
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n  labeled :headline\nend\n",
+        ),
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define do\n  create_table :articles do |t|\n    t.string :title\n  end\nend\n",
+        ),
     ]
     .into_iter()
     .map(|(p, s)| (PathBuf::from(p), s.as_bytes().to_vec()))
@@ -23,12 +30,12 @@ fn tree(hooks: &str) -> HashMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
-fn direct_includes_name_the_hook_and_source_without_installing_anything() {
+fn direct_includes_report_only_uncarried_hook_shapes() {
     // First hook is Writebook's installer, verbatim. Later hooks prove
     // that a literal-name-only recognizer cannot silently skip other shapes.
     let files = tree(
         r#"ActiveSupport.on_load :active_record do
-  include ActionText::HasMarkdown
+  include LabelMacro
 end
 ActiveSupport.on_load(:action_text_markdown) do
   include First, Second
@@ -42,9 +49,8 @@ end
     let gaps = survey::drain();
     let mut surveyed = result.expect("survey ingest");
     let messages: Vec<_> = gaps.iter().map(ToString::to_string).collect();
-    assert_eq!(messages.len(), 3, "one gap per include: {messages:?}");
+    assert_eq!(messages.len(), 2, "one gap per uncarried include: {messages:?}");
     for (hook, include) in [
-        ("active_record", "include ActionText::HasMarkdown"),
         ("action_text_markdown", "include First, Second"),
         (
             "action_text_markdown",
@@ -63,18 +69,17 @@ end
         );
     }
     assert_eq!(surveyed, strict, "reporting must not change ingested IR");
-    let page = surveyed
+    assert!(surveyed.library_classes.iter().any(|class|
+        class.name.0.as_str() == "ActiveRecord::Base"
+            && class.includes.iter().any(|id| id.0.as_str() == "LabelMacro")));
+    let article = surveyed
         .models
         .iter()
-        .find(|m| m.name.0.as_str() == "Page")
+        .find(|m| m.name.0.as_str() == "Article")
         .unwrap();
-    assert!(page.body.iter().any(|item| matches!(item,
+    assert!(article.body.iter().any(|item| matches!(item,
         ModelBodyItem::Unknown { expr, .. } if matches!(&*expr.node,
-            ExprNode::Send { method, .. } if method.as_str() == "has_markdown"))));
-    assert!(!surveyed.models.iter().any(|m| matches!(
-        m.name.0.as_str(),
-        "ActionText::Markdown" | "ActionText::RichText"
-    )));
+            ExprNode::Send { method, .. } if method.as_str() == "labeled"))));
     let strict_diags = roundhouse::session::analyze_and_lower(&mut strict);
     let survey_diags = roundhouse::session::analyze_and_lower(&mut surveyed);
     assert_eq!(
@@ -90,31 +95,21 @@ end
     assert_eq!(survey_files, strict_files, "no emitted behavior changed");
     assert_eq!(survey_emit, strict_emit);
     assert!(
-        survey_emit
-            .iter()
-            .any(|d| d.message.contains("has_markdown")),
+        survey_emit.iter().any(|d| d.message.contains("labeled")),
         "declaration warning must remain: {survey_emit:?}"
     );
-    let page = survey_files
+    let article = survey_files
         .iter()
-        .find(|f| f.path.ends_with("page.rb"))
+        .find(|f| f.path.ends_with("article.rb"))
         .unwrap();
-    for method in [
-        "body",
-        "body?",
-        "body=",
-        "markdown_body",
-        "build_markdown_body",
-        "with_markdown_body",
-        "with_markdown_body_and_embeds",
-    ] {
+    for method in ["headline", "headline?", "headline=", "build_headline", "with_headline"] {
         assert!(
-            !page.content.lines().any(|line| line
+            !article.content.lines().any(|line| line
                 .trim_start()
                 .starts_with(&format!("def {method}("))
                 || line.trim() == format!("def {method}")),
             "not supported: {method}\n{}",
-            page.content
+            article.content
         );
     }
 }
@@ -170,8 +165,8 @@ fn binary_encoded_source_uses_original_byte_locations_before_lossy_display() {
     let surveyed = result.expect("survey binary-source ingest");
     assert_eq!(surveyed, strict, "a ledger cannot change binary-source IR");
     let messages: Vec<_> = gaps.iter().map(ToString::to_string).collect();
-    assert_eq!(messages.len(), 2, "{messages:?}");
-    for (message, declaration) in messages.iter().zip(["include First", "include \"�\""]) {
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    for (message, declaration) in messages.iter().zip(["include \"�\""]) {
         assert!(message.contains(&format!("`{declaration}`")), "{message}");
         assert!(message.contains("on_load(:active_record)"), "{message}");
         assert!(message.contains("lib/rails_ext/hooks.rb"), "{message}");
@@ -179,49 +174,32 @@ fn binary_encoded_source_uses_original_byte_locations_before_lossy_display() {
 }
 
 #[test]
-fn emitted_app_does_not_gain_methods_from_a_dropped_installer_or_string_class_eval() {
-    // This is a negative execution check. The provider is a minimal
-    // string-eval macro, not a replacement implementation of Writebook.
-    let run = emit_and_run::real_blog()
-        .write("lib/rails_ext/action_text_has_markdown.rb", r#"module ActionText::HasMarkdown
+fn emitted_app_carries_literal_hook_methods_and_expands_its_class_macro() {
+    emit_and_run::real_blog()
+        .write("lib/rails_ext/title_macro.rb", r#"module TitleMacro
   extend ActiveSupport::Concern
   class_methods do
-    def has_markdown(name)
-      class_eval "def body; 99; end"
+    def titled(name)
+      class_eval <<-CODE, __FILE__, __LINE__ + 1
+        def #{name}
+          title
+        end
+      CODE
     end
   end
-  def markdown_installer_marker
+  def installer_marker
     37
   end
 end
 ActiveSupport.on_load :active_record do
-  include ActionText::HasMarkdown
+  include TitleMacro
 end
 "#)
-        .write("app/models/page.rb", "class Page < ApplicationRecord\n  has_markdown :body\nend\n")
-        .edit("db/schema.rb", "  add_foreign_key \"comments\", \"articles\"", "  create_table :pages do |t|\n    t.string :title\n  end\n  add_foreign_key \"comments\", \"articles\"")
+        .edit("app/models/article.rb", "class Article < ApplicationRecord", "class Article < ApplicationRecord\n  titled :headline")
         .run_ruby(r#"
-page = Page.new
-[:body, :body?, :body=, :markdown_body, :build_markdown_body].each do |name|
-  raise "invented Markdown method #{name}" if page.respond_to?(name, true)
-end
-[page, Article.new].each do |owner|
-  raise "dropped hook installed mixin on #{owner.class}" if owner.respond_to?(:markdown_installer_marker, true)
-end
-[:with_markdown_body, :with_markdown_body_and_embeds].each do |name|
-  raise "invented preload scope #{name}" if Page.respond_to?(name, true)
-end
-begin
-  Page.new.body
-  raise "string class_eval was expanded"
-rescue NoMethodError => e
-  raise "wrong missing method" unless e.name == :body
-end
-puts "unsupported Markdown boundary preserved"
-"#);
-    run.assert_passes();
-    assert!(
-        run.stdout
-            .contains("unsupported Markdown boundary preserved")
-    );
+a = Article.new(title: "hello")
+raise "literal hook lost mixin" unless a.installer_marker == 37
+raise "hook macro did not expand" unless a.headline == "hello"
+"#)
+        .assert_passes();
 }

@@ -62,6 +62,10 @@
 //!
 //!   cargo run --bin dump_ir -- fixtures/real-blog \
 //!       --raw-views --select 'articles/*'
+//!
+//! Survey mode: set `ROUNDHOUSE_INGEST_SURVEY=1` (same env as
+//! `roundhouse check --continue`) to record unsupported constructs and
+//! keep going. Required for profiling apps that are not yet zero-error.
 
 use std::path::PathBuf;
 
@@ -73,7 +77,7 @@ use roundhouse::lower::{
     class_info_from_library_class,
     lower_fixtures_to_library_classes, lower_jbuilder_to_library_classes,
     lower_models_with_registry, lower_test_modules_to_library_classes,
-    lower_views_to_library_classes,
+    preliminary_view_classes, type_view_library_classes,
 };
 use roundhouse::ty::Ty;
 
@@ -91,6 +95,16 @@ fn dump() {
             std::process::exit(2);
         }
     };
+
+    // Honor ROUNDHOUSE_INGEST_SURVEY the same way `roundhouse check` does,
+    // so dump_ir can profile apps that are not yet zero-error (Jumpstart,
+    // Mastodon, etc.) without aborting at the first unsupported construct.
+    if std::env::var("ROUNDHOUSE_INGEST_SURVEY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+    {
+        roundhouse::ingest::survey::activate();
+    }
 
     let mut app = ingest_app(&opts.fixture).unwrap_or_else(|e| {
         eprintln!("ingest {}: {:?}", opts.fixture.display(), e);
@@ -127,7 +141,7 @@ fn dump() {
         return;
     }
 
-    let lcs = lower_all(&app);
+    let lcs = roundhouse::timings::phase("construct-to-library", || lower_all(&app));
 
     let mut printed = 0usize;
     let mut sep = "";
@@ -351,53 +365,65 @@ fn print_usage() {
 // ── Pipeline (mirrors tests/model_lowerer.rs::lowered_real_blog_typing_residual) ─
 
 fn lower_all(app: &roundhouse::App) -> Vec<LibraryClass> {
-    let vctx = roundhouse::lower::ViewLowerCtx::new(app);
-    let preliminary_views: Vec<LibraryClass> = app
-        .views
-        .iter()
-        .map(|v| vctx.lower(v))
-        .collect();
-    let view_extras = build_class_info_extras(&preliminary_views);
+    let vctx = roundhouse::timings::phase("lower: view ctx", || {
+        roundhouse::lower::ViewLowerCtx::new(app)
+    });
+    let mut view_lcs = roundhouse::timings::phase("lower: preliminary views", || {
+        preliminary_view_classes(&app.views, &vctx)
+    });
+    let view_extras = build_class_info_extras(&view_lcs);
     let (model_lcs, model_registry) =
-        lower_models_with_registry(&app.models, &app.schema, view_extras);
-    let view_lcs = lower_views_to_library_classes(
-        &app.views,
-        app,
-        model_registry.clone().into_iter().collect(),
-    );
-    let jbuilder_lcs = lower_jbuilder_to_library_classes(
-        &app.views,
-        app,
-        model_registry.clone().into_iter().collect(),
-    );
+        roundhouse::timings::phase("lower: models", || {
+            lower_models_with_registry(&app.models, &app.schema, view_extras)
+        });
+    roundhouse::timings::phase("lower: views type", || {
+        type_view_library_classes(
+            &mut view_lcs,
+            app,
+            model_registry.clone().into_iter().collect(),
+        );
+    });
+    let jbuilder_lcs = roundhouse::timings::phase("lower: jbuilder", || {
+        lower_jbuilder_to_library_classes(
+            &app.views,
+            app,
+            model_registry.clone().into_iter().collect(),
+        )
+    });
     let mut controller_extras: Vec<(ClassId, roundhouse::analyze::ClassInfo)> =
         model_registry.clone().into_iter().collect();
     controller_extras.extend(build_class_info_extras(&view_lcs));
-    let controller_lcs = roundhouse::lower::lower_controllers_with_arel_and_views(
-        &app.controllers,
-        controller_extras,
-        Some(&app.schema),
-        &app.views,
-    );
+    let controller_lcs = roundhouse::timings::phase("lower: controllers", || {
+        roundhouse::lower::lower_controllers_with_arel_and_views(
+            &app.controllers,
+            controller_extras,
+            Some(&app.schema),
+            &app.views,
+        )
+    });
 
     // Test modules — same shared-registry pattern. Test bodies dispatch
     // on models (`@article.title`), Comment.where(…), assertions on
     // self (Minitest::Test), so the registry needs all of: models +
     // views + controllers.
-    let fixture_lcs = lower_fixtures_to_library_classes(app);
+    let fixture_lcs = roundhouse::timings::phase("lower: fixtures", || {
+        lower_fixtures_to_library_classes(app)
+    });
 
     let mut test_extras: Vec<(ClassId, roundhouse::analyze::ClassInfo)> =
         model_registry.into_iter().collect();
     test_extras.extend(build_class_info_extras(&view_lcs));
     test_extras.extend(build_class_info_extras(&controller_lcs));
     test_extras.extend(build_class_info_extras(&fixture_lcs));
-    let test_lcs = lower_test_modules_to_library_classes(
-        &app.test_modules,
-        &app.fixtures,
-        &app.models,
-        test_extras,
-        &roundhouse::lower::routes::helper_id_segments(app),
-    );
+    let test_lcs = roundhouse::timings::phase("lower: tests", || {
+        lower_test_modules_to_library_classes(
+            &app.test_modules,
+            &app.fixtures,
+            &app.models,
+            test_extras,
+            &roundhouse::lower::routes::helper_id_segments(app),
+        )
+    });
 
     let mut all = Vec::new();
     all.extend(model_lcs);
@@ -406,9 +432,11 @@ fn lower_all(app: &roundhouse::App) -> Vec<LibraryClass> {
     all.extend(controller_lcs);
     all.extend(fixture_lcs);
     all.extend(test_lcs);
-    for lc in &app.library_classes {
-        all.push(lc.clone());
-    }
+    roundhouse::timings::phase("lower: copy library classes", || {
+        for lc in &app.library_classes {
+            all.push(lc.clone());
+        }
+    });
     all
 }
 

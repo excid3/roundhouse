@@ -133,13 +133,14 @@ fn article_lowers_with_schema_methods() {
     );
 
     // The non-attr scaffold: table_name, schema_columns,
-    // schema_time_columns, instantiate, initialize, attributes, [], []=,
-    // update.
+    // schema_time_columns, schema_date_columns, instantiate, initialize,
+    // attributes, [], []=, update.
     for expected in [
         "table_name",
         "_table_sql",
         "schema_columns",
         "schema_time_columns",
+        "schema_date_columns",
         "instantiate",
         "initialize",
         "attributes",
@@ -161,6 +162,7 @@ fn article_lowers_with_schema_methods() {
         "_table_sql",
         "schema_columns",
         "schema_time_columns",
+        "schema_date_columns",
         "instantiate",
         "from_row",
         "from_stmt",
@@ -168,6 +170,7 @@ fn article_lowers_with_schema_methods() {
         "_adapter_all",
         "_adapter_last",
         "_adapter_count",
+        "_adapter_any?",
         "_adapter_exists_by_id?",
         "_adapter_truncate",
         "delete_all",
@@ -190,6 +193,21 @@ fn article_lowers_with_schema_methods() {
             );
         }
     }
+
+    let any = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_adapter_any?")
+        .expect("_adapter_any? synthesized");
+    let any_body = format!("{:?}", any.body);
+    assert!(
+        any_body.contains("SELECT 1 FROM") && any_body.contains("LIMIT 1"),
+        "_adapter_any? must probe existence, not COUNT(*): {any_body}"
+    );
+    assert!(
+        !any_body.contains("COUNT(*)"),
+        "_adapter_any? must not COUNT: {any_body}"
+    );
 }
 
 #[test]
@@ -433,6 +451,154 @@ fn article_lowers_dependent_destroy_to_before_destroy() {
     };
     assert_eq!(method, "each");
     assert!(block_present, "each call should carry a block");
+}
+
+/// `has_one …, autosave: true` folds `_autosave_<name>` into `after_save`.
+#[test]
+fn has_one_autosave_folds_into_after_save() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "_autosave_profile"),
+        "expected _autosave_profile"
+    );
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "profile="),
+        "expected has_one writer"
+    );
+    let after = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save present for autosave");
+    let dump = format!("{:?}", after.body);
+    assert!(
+        dump.contains("_autosave_profile"),
+        "after_save should call _autosave_profile: {dump}"
+    );
+}
+
+/// Polymorphic `as:` autosave writes the type column in the lowered body.
+#[test]
+fn polymorphic_has_one_autosave_sets_type_column() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "avatars", force: :cascade do |t|
+    t.integer "imageable_id"
+    t.string "imageable_type"
+    t.string "url"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :avatar, as: :imageable, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let autosave = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_autosave_avatar")
+        .expect("_autosave_avatar");
+    let dump = format!("{:?}", autosave.body);
+    assert!(
+        dump.contains("imageable_type=") || dump.contains("\"User\""),
+        "autosave should assign polymorphic type: {dump}"
+    );
+}
+
+/// `has_one …, dependent: :destroy` cascades the single child, not
+/// a collection `each`. Nil child is the else branch so destroy of an
+/// owner with no row does not raise.
+#[test]
+fn has_one_dependent_destroy_lowers_to_before_destroy() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, dependent: :destroy\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let cb = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_destroy")
+        .expect("before_destroy method present (has_one dependent: :destroy)");
+    assert!(matches!(cb.receiver, MethodReceiver::Instance));
+    let first = &body_stmts(cb)[0];
+    match &*first.node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            match &*cond.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "profile");
+                }
+                other => panic!("expected profile reader cond; got {other:?}"),
+            }
+            match &*then_branch.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "destroy");
+                }
+                other => panic!("expected destroy in then; got {other:?}"),
+            }
+        }
+        other => panic!("expected If cascade for has_one destroy; got {other:?}"),
+    }
 }
 
 /// Statements of a method body as a list (single stmt = one element).
@@ -1460,7 +1626,6 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
     for (statement, setter) in [
         ("self.probe_flag = true", "probe_flag="),
         ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
-        ("self.table_name_prefix = \"custom_\"", "table_name_prefix="),
     ] {
         let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
         let model = ingest_model(
@@ -1495,6 +1660,7 @@ fn claimed_model_settings_and_method_body_writes_do_not_warn() {
 
     let source = br#"class Widget < ApplicationRecord
   self.table_name = "custom_widgets"
+  self.table_name_prefix = "custom_"
   self.primary_key = :uuid
   FLAG = true
 

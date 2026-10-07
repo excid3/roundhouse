@@ -20,6 +20,7 @@
 use crate::app::App;
 use crate::expr::{BoolOpKind, BoolOpSurface, Expr, ExprNode, LValue, OpAssignOp};
 
+#[allow(dead_code)]
 pub fn apply_attr_or_assign_lowering(app: &mut App) {
     super::for_each_hook_body(app, &mut rewrite);
 }
@@ -42,8 +43,13 @@ fn one_class(ty: Option<&crate::ty::Ty>) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::OpAssign { target: LValue::Attr { recv, name }, op, value } = &*expr.node else {
         return;
     };

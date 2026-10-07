@@ -98,17 +98,22 @@ fn rejected_recognized_macro_is_strict_error_but_survey_retains_source_body() {
         (PathBuf::from("app/models/leaf.rb"), b"class Leaf < ApplicationRecord\n  include Positionable\n  positioned_within :book, association: :leaves\nend\n".to_vec()),
     ]);
     assert!(!survey::is_active());
-    let error = ingest_app_from_tree(files.clone()).expect_err("missing required filter must refuse strict ingest");
-    assert!(matches!(error, roundhouse::ingest::IngestError::Unsupported { file, message }
-        if file == "app/models/leaf.rb" && message.contains("model macro `positioned_within` not expanded")));
+    let error = ingest_app_from_tree(files.clone())
+        .expect_err("missing required filter must refuse strict ingest");
+    assert!(
+        matches!(error, roundhouse::ingest::IngestError::Unsupported { file, message }
+        if file == "app/models/leaf.rb" && message.contains("model macro `positioned_within` not expanded"))
+    );
     assert!(!survey::is_active());
 
     survey::activate();
     let surveyed = ingest_app_from_tree(files).expect("survey must retain the model");
     let gaps = survey::drain();
     assert_eq!(gaps.len(), 1);
-    assert!(matches!(&gaps[0], roundhouse::ingest::IngestError::Unsupported { file, message }
-        if file == "app/models/leaf.rb" && message.contains("model macro `positioned_within` not expanded")));
+    assert!(
+        matches!(&gaps[0], roundhouse::ingest::IngestError::Unsupported { file, message }
+        if file == "app/models/leaf.rb" && message.contains("model macro `positioned_within` not expanded"))
+    );
     assert_eq!(unexpanded(&surveyed, "positioned_within"), 1);
     assert!(instances(&surveyed, "Leaf").is_empty());
     assert!(!survey::is_active());
@@ -132,8 +137,8 @@ fn binds_keywords_by_name_and_keeps_each_includers_capture_and_privacy() {
     );
     assert_eq!(unexpanded(&app, "positioned_within"), 0);
     for (class, parent, association, filter) in [
-        ("Leaf", ":book", ":leaves", ":active"),
-        ("Book", ":shelf", ":books", ":published"),
+        ("Leaf", "book", "leaves", "active"),
+        ("Book", "shelf", "books", "published"),
     ] {
         let methods = instances(&app, class);
         for name in [
@@ -155,7 +160,10 @@ fn binds_keywords_by_name_and_keeps_each_includers_capture_and_privacy() {
                 .unwrap()
                 .body,
         );
-        assert!(parent_body.contains(parent), "{class}: {parent_body}");
+        assert!(
+            parent_body.contains(parent) && !parent_body.contains("send("),
+            "{class}: {parent_body}"
+        );
         let siblings_body = roundhouse::emit::ruby::emit_expr(
             &methods
                 .iter()
@@ -164,7 +172,9 @@ fn binds_keywords_by_name_and_keeps_each_includers_capture_and_privacy() {
                 .body,
         );
         assert!(
-            siblings_body.contains(association) && siblings_body.contains(filter),
+            siblings_body.contains(association)
+                && siblings_body.contains(filter)
+                && !siblings_body.contains("send("),
             "{class}: {siblings_body}"
         );
     }
@@ -181,14 +191,15 @@ fn binds_keywords_by_name_and_keeps_each_includers_capture_and_privacy() {
 #[test]
 fn optional_keywords_bind_by_source_kind_even_when_ingest_flattened_them() {
     let concern = "module Positionable\n  extend ActiveSupport::Concern\n  class_methods do\n    def install(target: :title)\n      define_method :chosen do\n        send(target)\n      end\n    end\n  end\nend\n";
-    for (call, expected) in [("install", ":title"), ("install target: :id", ":id")] {
+    for (call, expected) in [("install", "title"), ("install target: :id", "id")] {
         let app = app(concern, call, "");
         let methods = instances(&app, "Leaf");
         let generated = methods
             .iter()
             .find(|m| m.name.as_str() == "chosen")
             .expect("expanded optional keyword");
-        assert!(roundhouse::emit::ruby::emit_expr(&generated.body).contains(expected));
+        let body = roundhouse::emit::ruby::emit_expr(&generated.body);
+        assert!(body.contains(expected) && !body.contains("send("), "{body}");
     }
     assert_eq!(unexpanded(&app(concern, "install :id", ""), "install"), 1);
 }
@@ -199,7 +210,6 @@ fn unsupported_captures_and_headers_decline_the_whole_macro() {
         "positioned_within :book, association: :leaves",
         "positioned_within :book, :shelf, association: :leaves, filter: :active",
         "positioned_within :book, association: :leaves, filter: :active, extra: :x",
-        "positioned_within :book, association: 'leaves', filter: :active",
         "positioned_within choose_parent, association: :leaves, filter: :active",
     ] {
         survey::activate();

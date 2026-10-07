@@ -61,6 +61,8 @@ end
     @feed_ids = @by_feed.keys
     @scoped = Article.unread.group(:feed_id).count
     @plain = Article.where(read: false).count
+    @popular = Article.group(:feed_id).having("COUNT(*) > 1").count
+    @distinct_titles = Article.select(:title).distinct.count
   end
 end
 "#,
@@ -148,6 +150,18 @@ fn ungrouped_count_is_still_an_integer() {
 }
 
 #[test]
+fn grouped_count_through_having_is_still_a_hash() {
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "popular"), hash_of_int_keys());
+}
+
+#[test]
+fn select_distinct_count_is_still_an_integer() {
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "distinct_titles"), Ty::Int);
+}
+
+#[test]
 fn keys_on_a_grouped_count_dispatches() {
     let app = analyzed_app();
     assert_eq!(ivar_ty(&app, "feed_ids"), Ty::Array { elem: Box::new(Ty::Int) });
@@ -181,5 +195,5 @@ fn the_typed_terminal_is_the_one_the_lowering_emits() {
             walk(&a.body, &mut found);
         }
     }
-    assert_eq!(found, 2, "both grouped counts should lower to `group_count`");
+    assert_eq!(found, 3, "grouped counts (plain, scoped, having) should lower to `group_count`");
 }

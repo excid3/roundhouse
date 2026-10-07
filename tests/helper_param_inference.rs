@@ -78,6 +78,19 @@ fn view_call_sites_unify_helper_params_and_stamp_signature() {
     assert_eq!(params[0].ty, Ty::Str, "param should unify to Str from the call site");
     // Body is `msg` — the param read — so the return follows the seed.
     assert_eq!(**ret, Ty::Str);
+    // Views are typed once before that harvest; they must be restamped
+    // so the template Send is Str, not leftover gradual untyped.
+    match &*app.views[0].body.node {
+        ExprNode::Send { method, .. } if method.as_str() == "shout" => {
+            assert_eq!(
+                app.views[0].body.ty.as_ref(),
+                Some(&Ty::Str),
+                "view helper call should restamp as the harvested return, got {:?}",
+                app.views[0].body.ty
+            );
+        }
+        other => panic!("expected shout Send, got {other:?}"),
+    }
 }
 
 #[test]

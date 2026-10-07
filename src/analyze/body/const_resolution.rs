@@ -31,7 +31,7 @@ use crate::ty::Ty;
 const CORE_RBS: &str = "\
 class Numeric < Object\nend\n\
 class Integer < Numeric\nend\n\
-class Float < Numeric\nend\n\
+class Float < Numeric\n  INFINITY: Float\n  NAN: Float\n  EPSILON: Float\n  MAX: Float\n  MIN: Float\nend\n\
 class String < Object\nend\n\
 class Array < Object\nend\n\
 class Hash < Object\nend\n\
@@ -49,7 +49,7 @@ const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
 
 pub(super) enum ResolvedConstant {
     Namespace { class: Arc<ClassId>, runtime: bool },
-    Value { declaration: DeclarationId, runtime: Option<Arc<Ty>> },
+    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>> },
 }
 
 /// Rubydex answers for one source file.
@@ -64,6 +64,7 @@ struct FileAnswers {
     constant_classes: IdentityHashMap<DeclarationId, ClassId>,
     namespace_definitions: HashSet<Box<str>>,
     class_definitions: HashSet<Box<str>>,
+    alias_definitions: HashSet<Box<str>>,
     runtime_namespace_aliases: HashMap<Box<str>, Box<str>>,
 }
 
@@ -146,7 +147,10 @@ fn constant_graph(local: LocalGraph, text: &str) -> LocalGraph {
     }
     for reference in constant_references.into_values() {
         let singleton_receiver = matches!(
-            graph.names().get(reference.name_id()).map(|name| name.parent_scope()),
+            graph
+                .names()
+                .get(reference.name_id())
+                .map(|name| name.parent_scope()),
             Some(ParentScope::Attached(_))
         );
         if !singleton_receiver {
@@ -191,7 +195,9 @@ fn index_documents(documents: &[Document<'_>]) -> Graph {
                 .spawn_scoped(scope, move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(document) = documents.get(index) else { break };
+                        let Some(document) = documents.get(index) else {
+                            break;
+                        };
                         if sender.send((index, document.index())).is_err() {
                             break;
                         }
@@ -309,8 +315,31 @@ impl ConstResolver {
         self.files.get(index as usize)?.as_ref()
     }
 
+    /// Every constant (fully qualified) `file` declares: its classes and
+    /// modules, and its assigned constants and aliases.
+    pub(crate) fn namespaces_declared_in(&self, file: FileId) -> impl Iterator<Item = &str> {
+        self.file(file).into_iter().flat_map(|file| file.namespace_definitions.iter().map(|name| name.as_ref()))
+    }
+
+    /// `namespaces_declared_in` less the aliases: `Alias = Bar` names
+    /// `Bar`'s class, not one `file` makes.
+    pub(crate) fn receivers_declared_in(&self, file: FileId) -> impl Iterator<Item = &str> {
+        self.file(file).into_iter().flat_map(|file| {
+            file.namespace_definitions
+                .iter()
+                .filter(|name| !file.alias_definitions.contains(*name))
+                .map(|name| name.as_ref())
+        })
+    }
+
     pub(super) fn has_source_file(&self, file: FileId) -> bool {
         self.file(file).is_some()
+    }
+
+    pub(super) fn has_registered_source(&self, file: FileId) -> bool {
+        file.0
+            .checked_sub(1)
+            .is_some_and(|index| (index as usize) < self.files.len())
     }
 
     /// IR spans cover the entire `A::B::C` path. Rubydex records the
@@ -323,7 +352,10 @@ impl ConstResolver {
     ) -> Option<Option<&ResolvedConstant>> {
         let length = u32::try_from(path.last()?.as_str().len()).ok()?;
         let start = span.end.checked_sub(length)?;
-        self.file(span.file)?.references.get(&start).map(Option::as_ref)
+        self.file(span.file)?
+            .references
+            .get(&start)
+            .map(Option::as_ref)
     }
 
     /// Exact source-resolved namespace, also used by ingest admission gates
@@ -332,6 +364,20 @@ impl ConstResolver {
         match self.reference(span, path)?? {
             ResolvedConstant::Namespace { class, .. } => Some(class),
             ResolvedConstant::Value { .. } => None,
+        }
+    }
+
+    /// The fully qualified declaration a reference resolves to, whether a
+    /// namespace or a value.
+    pub(crate) fn declaration_name(&self, span: Span, path: &[Symbol]) -> Option<&str> {
+        match self.reference(span, path)?? {
+            ResolvedConstant::Namespace { class, .. } => Some(class.0.as_str()),
+            ResolvedConstant::Value { declaration, .. } => self
+                .files
+                .iter()
+                .flatten()
+                .find_map(|file| file.constant_classes.get(declaration))
+                .map(|name| name.0.as_str()),
         }
     }
 
@@ -346,7 +392,9 @@ impl ConstResolver {
             return None;
         }
         let constants = &self.file(value.file)?.constants;
-        let index = constants.partition_point(|(end, ..)| *end <= value.start).checked_sub(1)?;
+        let index = constants
+            .partition_point(|(end, ..)| *end <= value.start)
+            .checked_sub(1)?;
         let (_, defined, id) = &constants[index];
         (defined.as_ref() == name).then_some(*id)
     }
@@ -454,18 +502,25 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
         text: CORE_RBS,
         language: LanguageId::Rbs,
     }];
-    documents.extend(crate::runtime_files::ruby_sources().map(|(path, text)| Document {
-        uri_prefix: RUNTIME_URI_PREFIX,
-        path,
-        text,
-        language: LanguageId::Ruby,
-    }));
-    documents.extend(sources.iter().filter(|source| is_indexed(source)).map(|source| Document {
-        uri_prefix: "",
-        path: &source.path,
-        text: &source.text,
-        language: LanguageId::Ruby,
-    }));
+    documents.extend(
+        crate::runtime_files::ruby_sources().map(|(path, text)| Document {
+            uri_prefix: RUNTIME_URI_PREFIX,
+            path,
+            text,
+            language: LanguageId::Ruby,
+        }),
+    );
+    documents.extend(
+        sources
+            .iter()
+            .filter(|source| is_indexed(source))
+            .map(|source| Document {
+                uri_prefix: "",
+                path: &source.path,
+                text: &source.text,
+                language: LanguageId::Ruby,
+            }),
+    );
     index_documents(&documents)
 }
 
@@ -487,7 +542,9 @@ fn collect_answers(graph: &Graph, sources: &[SourceFile]) -> Vec<Option<FileAnsw
         chunks
             .into_iter()
             .flat_map(|chunk| {
-                chunk.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                chunk
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
             .collect()
     })
@@ -564,7 +621,9 @@ fn answer_file(
         // so it starts at the same offset as the `A` reference. Only a
         // reference whose span is exactly its written name belongs to
         // that offset.
-        let written = source.text.get(offset.start() as usize..offset.end() as usize);
+        let written = source
+            .text
+            .get(offset.start() as usize..offset.end() as usize);
         let name = graph
             .names()
             .get(reference.name_id())
@@ -604,10 +663,29 @@ fn answer_file(
                                 })
                         })
                     });
-                    let runtime = (!app_write && is_runtime_declaration(graph, declaration))
-                        .then(|| runtime_value_types().get(declaration.name()).cloned())
-                        .flatten();
-                    ResolvedConstant::Value { declaration: id, runtime }
+                    let name = declaration.name();
+                    let builtin_float = matches!(
+                        name,
+                        "Float::INFINITY"
+                            | "Float::NAN"
+                            | "Float::EPSILON"
+                            | "Float::MAX"
+                            | "Float::MIN"
+                    ) && declaration.definitions().iter().all(|id| {
+                        graph
+                            .definitions()
+                            .get(id)
+                            .and_then(|definition| graph.documents().get(definition.uri_id()))
+                            .is_some_and(|document| document.uri() == CORE_URI)
+                    });
+                    let runtime = if builtin_float {
+                        Some(Arc::new(Ty::Float))
+                    } else if !app_write && is_runtime_declaration(graph, declaration) {
+                        runtime_value_types().get(declaration.name()).cloned()
+                    } else {
+                        None
+                    };
+                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(name))), runtime }
                 }
             });
         match answers.references.entry(offset.start()) {
@@ -642,6 +720,7 @@ fn answer_file(
                     answers.class_definitions.insert(full.clone().into());
                 }
                 if let Some(Definition::ConstantAlias(alias)) = definition {
+                    answers.alias_definitions.insert(full.clone().into());
                     if let Some(target) = resolved_namespace(graph, *alias.target_name_id())
                         .filter(|target| is_runtime_declaration(graph, target))
                     {
@@ -674,7 +753,10 @@ fn answer_file(
             Some(Definition::ConstantAlias(it)) => (it.name_id(), it.offset()),
             _ => continue,
         };
-        let name = graph.names().get(name_id).and_then(|name| graph.strings().get(name.str()));
+        let name = graph
+            .names()
+            .get(name_id)
+            .and_then(|name| graph.strings().get(name.str()));
         let id = definition.and_then(|definition| graph.definition_to_declaration_id(definition));
         if let (Some(name), Some(id)) = (name, id) {
             answers.constants.push((offset.end(), name.as_str().into(), *id));
@@ -732,5 +814,81 @@ mod tests {
         sources = snapshot;
         sources[0].path = "first.md".into();
         assert!(!prepared.for_sources(&sources).has_source_file(FileId(1)));
+    }
+
+    fn source(path: &str, name: &str) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            text: format!("class {name}; end; {name}"),
+        }
+    }
+    fn resolved_name(
+        resolver: &ConstResolver,
+        sources: &[SourceFile],
+        index: usize,
+        name: &str,
+    ) -> String {
+        let text = &sources[index].text;
+        let start = text.rfind(name).unwrap() as u32;
+        let span = Span {
+            file: FileId(index as u32 + 1),
+            start,
+            end: start + name.len() as u32,
+        };
+        match resolver.reference(span, &[Symbol::from(name)]) {
+            Some(Some(ResolvedConstant::Namespace { class, .. })) => class.0.to_string(),
+            _ => panic!("source reference must be indexed at its original FileId"),
+        }
+    }
+
+    #[test]
+    fn missing_documents_and_missing_source_answers_are_not_generated_ir() {
+        use super::super::{BodyTyper, ClassInfo, Ctx};
+        use crate::{Expr, ExprNode};
+        let sources = vec![source("app/services/first.rb", "First")];
+        let resolver = Arc::new(ConstResolver::from_app_sources(&sources));
+        let classes = HashMap::from([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
+        let typer = BodyTyper::new(&classes).with_const_resolver(resolver);
+        let make = |file| {
+            Expr::new(
+                Span {
+                    file: FileId(file),
+                    start: 0,
+                    end: 6,
+                },
+                ExprNode::Const {
+                    path: vec![Symbol::from("Object")],
+                },
+            )
+        };
+        for file in [1, 99] {
+            let mut expr = make(file);
+            typer.analyze_expr(&mut expr, &Ctx::default());
+            assert!(
+                expr.diagnostic.is_some(),
+                "source FileId({file}) cannot use a generated fallback"
+            );
+        }
+        let mut generated = make(99);
+        generated.decisions |= crate::expr::GENERATED_CONST_REF;
+        typer.analyze_expr(&mut generated, &Ctx::default());
+        assert!(generated.diagnostic.is_none());
+        assert!(matches!(generated.ty, Some(crate::ty::Ty::Class { .. })));
+    }
+
+    #[test]
+    fn prepared_answers_reject_same_count_source_changes_and_reordering() {
+        let mut sources = vec![
+            source("app/services/first.rb", "First"),
+            source("components/payments/lib/second.rb", "Second"),
+        ];
+        let prepared = ConstResolverTask::start(Arc::new(sources.clone())).finish();
+        sources[0] = source("app/services/first.rb", "Third");
+        let changed = prepared.for_sources(&sources);
+        assert_eq!(resolved_name(&changed, &sources, 0, "Third"), "Third");
+        sources.swap(0, 1);
+        let reordered = prepared.for_sources(&sources);
+        assert_eq!(resolved_name(&reordered, &sources, 0, "Second"), "Second");
+        assert_eq!(resolved_name(&reordered, &sources, 1, "Third"), "Third");
     }
 }

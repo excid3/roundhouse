@@ -96,6 +96,13 @@ pub(super) fn relative_path(path: &str) -> String {
     })
 }
 
+/// Guard the positional Rubydex answers in release as well as debug builds.
+/// Length alone does not protect FileIds against replacement or reordering.
+pub(super) fn assert_snapshot_matches(snapshot: &[SourceFile], drained: &[SourceFile]) {
+    assert!(snapshot == drained,
+        "source identities changed after the Rubydex snapshot; snapshot after the complete source walk");
+}
+
 /// Record a source file and return its `FileId` (1-based). Idempotent
 /// by path: a second registration of the same path returns the
 /// existing id and keeps the first text.
@@ -187,6 +194,28 @@ pub(super) fn generated_local_is_reserved(location: &ruby_prism::Location<'_>, n
         .is_some_and(|parsed| parsed.reserved_locals.contains(name)))
         || location.as_slice().split(|b| !b.is_ascii_alphanumeric() && *b != b'_')
             .any(|word| word == name.as_bytes())
+}
+
+/// The text registered for `path` during this ingest, if any.
+pub fn text_of(path: &str) -> Option<String> {
+    SOURCES.with(|s| {
+        let reg = s.borrow();
+        let id = reg.by_path.get(path)?;
+        let i = (id.0 as usize).checked_sub(1)?;
+        reg.files.get(i).map(|f| f.text.clone())
+    })
+}
+
+/// Run `f` on the text registered for `path`, without copying it.
+/// For lookups made per expression, where `text_of`'s clone of the
+/// whole file would make ingest quadratic in file size.
+pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
+    SOURCES.with(|s| {
+        let reg = s.borrow();
+        let id = reg.by_path.get(path)?;
+        let i = (id.0 as usize).checked_sub(1)?;
+        reg.files.get(i).map(|file| f(&file.text))
+    })
 }
 
 /// The registered path for a `FileId`; `None` for the synthetic
@@ -303,6 +332,22 @@ mod tests {
     }
 
     #[test]
+    fn source_readers_follow_fresh_ids_after_drain() {
+        reset();
+        register("a.rb", "1");
+        let first = drain();
+        let late = register("late.rb", "2");
+        assert_eq!(late, FileId(1));
+        assert_eq!(path_of(late).as_deref(), Some("late.rb"));
+        assert_eq!(text_of("late.rb").as_deref(), Some("2"));
+        assert_eq!(with_text("late.rb", str::to_owned).as_deref(), Some("2"));
+        assert_eq!(line_at("late.rb", 0), Some(1));
+        assert_eq!(first[0].path, "a.rb");
+        let current = drain();
+        assert_eq!(current[late.0 as usize - 1].path, "late.rb");
+    }
+
+    #[test]
     fn a_bracketed_label_is_refused_a_real_id() {
         reset();
         assert_eq!(register("<delegate>", "class X\nend\n"), FileId(0));
@@ -339,5 +384,34 @@ mod tests {
         assert_eq!(b, FileId(2));
         let files = drain();
         assert_eq!(files.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod rubydex_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn rubydex_snapshot_rejects_late_real_source_in_release_too() {
+        reset();
+        register("app/services/first.rb", "class First; end");
+        let before = snapshot();
+        register("components/payments/test/test_helper.rb", "class Late; end");
+        let after = drain();
+        assert!(std::panic::catch_unwind(|| assert_snapshot_matches(&before, &after)).is_err());
+        reset();
+    }
+
+    #[test]
+    fn rubydex_snapshot_preserves_ids_through_generated_passes() {
+        reset();
+        let id = register("components/payments/lib/probe.rb", "class Probe; end");
+        let before = snapshot();
+        assert_eq!(register("<delegate>", "class Generated; end"), FileId(0));
+        assert_eq!(register("components/payments/lib/probe.rb", "ignored"), id);
+        let after = drain();
+        assert_snapshot_matches(&before, &after);
+        assert_eq!(after[id.0 as usize - 1].path, before[id.0 as usize - 1].path);
+        reset();
     }
 }

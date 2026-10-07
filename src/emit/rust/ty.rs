@@ -101,3 +101,60 @@ fn option_shape(variants: &[Ty]) -> Option<String> {
         _ => None,
     }
 }
+
+/// True when this IR type is emitted as `serde_json::Value` (or the
+/// `Roundhouse::ParamValue` alias of it). Heterogeneous unions that
+/// are neither stringish nor a 2-variant `T | nil` Option land here,
+/// matching `rust_ty`. Callers that need Value APIs (`is_null`,
+/// `Value::from`, `as_str`) key off this rather than listing
+/// Untyped/Var by hand — RBS `String | Integer | Float | bool | nil`
+/// and `String | Array[untyped]` are Unions, not Untyped.
+pub(crate) fn rust_value_shaped(ty: &Ty) -> bool {
+    match ty {
+        Ty::Untyped | Ty::Var { .. } | Ty::Record { .. } => true,
+        Ty::Union { variants } => !ty.is_stringish() && option_shape(variants).is_none(),
+        Ty::Class { id, .. } => id.0.as_str() == "Roundhouse::ParamValue",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heterogeneous_nilable_union_is_value_shaped() {
+        let ty = Ty::Union {
+            variants: vec![Ty::Str, Ty::Int, Ty::Float, Ty::Bool, Ty::Nil],
+        };
+        assert!(rust_value_shaped(&ty));
+        assert_eq!(rust_ty(&ty), "serde_json::Value");
+    }
+
+    #[test]
+    fn string_or_array_union_is_value_shaped() {
+        let ty = Ty::Union {
+            variants: vec![Ty::Str, Ty::Array { elem: Box::new(Ty::Untyped) }],
+        };
+        assert!(rust_value_shaped(&ty));
+        assert_eq!(rust_ty(&ty), "serde_json::Value");
+    }
+
+    #[test]
+    fn string_symbol_union_is_not_value_shaped() {
+        let ty = Ty::Union {
+            variants: vec![Ty::Str, Ty::Sym],
+        };
+        assert!(!rust_value_shaped(&ty));
+        assert!(ty.is_stringish());
+    }
+
+    #[test]
+    fn option_string_is_not_value_shaped() {
+        let ty = Ty::Union {
+            variants: vec![Ty::Str, Ty::Nil],
+        };
+        assert!(!rust_value_shaped(&ty));
+        assert!(rust_ty(&ty).starts_with("Option<"));
+    }
+}

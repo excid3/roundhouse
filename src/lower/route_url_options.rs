@@ -124,7 +124,7 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
 /// flattened routes share (lobsters' `/s/:id/(:title)` flattens to
 /// `/s/:id/:title` and `/s/:id`) answers its longest list — the helper
 /// the generator builds takes every slot.
-fn helper_path_params(app: &App) -> std::collections::HashMap<String, Vec<String>> {
+pub(crate) fn helper_path_params(app: &App) -> std::collections::HashMap<String, Vec<String>> {
     let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
     for route in super::routes::flatten_routes(app) {
         if !route.named {
@@ -153,6 +153,13 @@ fn position_path_params(
     params: &std::collections::HashMap<String, Vec<String>>,
 ) {
     expr.node.for_each_child_mut(&mut |c| position_path_params(c, params));
+    rewrite_position_node(expr, params);
+}
+
+pub(crate) fn rewrite_position_node(
+    expr: &mut Expr,
+    params: &std::collections::HashMap<String, Vec<String>>,
+) {
     let span = expr.span;
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node else {
         return;
@@ -236,6 +243,10 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
 
 fn rewrite(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
+    rewrite_node(expr, helpers);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
     ground_symbol_query_values(expr, helpers);
     let Some((stem, host, protocol)) = strip_host_options(expr, helpers) else {
         return;

@@ -808,8 +808,13 @@ fn readable_class_methods_store_keywords_blocks_and_filter_options() {
 }
 
 #[test]
-fn finite_configuration_does_not_admit_unrelated_controller_singletons() {
-    assert!(configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").is_err());
+fn configuration_keeps_unrelated_class_methods_out_of_its_macro_carriers() {
+    let mut app = configuration_app(WINDOW_SETTINGS, "def self.unrelated; eval('1'); end").expect("ordinary class methods are retained");
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let diagnostics = roundhouse::analyze::diagnose(&app);
+    assert!(diagnostics.iter().any(|d| d.message.contains("eval")), "{diagnostics:?}");
+    assert!(app.controllers.iter().flat_map(|c| &c.body).any(|item| matches!(item,
+        ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } if method.name.as_str() == "unrelated")));
 }
 
 #[test]
@@ -1200,4 +1205,76 @@ end
             _ => "other",
         }).collect::<Vec<_>>()
     );
+}
+
+/// The `setup_mobile!` filters `call` expands to, as their `only` lists.
+/// `has_mobile_version(*actions)` peels its options with
+/// `extract_options!` and reads `options[:if]`.
+fn mobile_version_filters(call: &str) -> Vec<Vec<String>> {
+    let concern = r#"
+module MobileableConcern
+  extend ActiveSupport::Concern
+
+  module ClassMethods
+    def has_mobile_version(*actions)
+      options = actions.extract_options!
+      before_action(:setup_mobile!, if: options[:if], only: actions)
+    end
+  end
+
+  private
+    def setup_mobile!
+    end
+end
+"#;
+    let controller = format!(
+        "class ThingsController < ApplicationController\n  ACTIONS = %i[index show]\n  {call}\n  def index; end\n  def show; end\nend\n"
+    );
+    let tree = vec![
+        ("app/controllers/concerns/mobileable_concern.rb", concern.to_string()),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include MobileableConcern\nend\n".to_string(),
+        ),
+        ("app/controllers/things_controller.rb", controller),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.into_bytes()))
+    .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    filters(&app)
+        .into_iter()
+        .filter(|(kind, target, ..)| *kind == FilterKind::Before && target == "setup_mobile!")
+        .map(|(_, _, only, _)| only)
+        .collect()
+}
+
+/// The call's symbols are the filter's `only`; an absent `if:` is nil,
+/// no guard.
+#[test]
+fn rest_actions_macro_with_extract_options_expands_to_a_scoped_filter() {
+    let scoped = vec![vec!["index".to_string(), "show".to_string()]];
+    assert_eq!(mobile_version_filters("has_mobile_version :index, :show"), scoped);
+    // A literal array splat spreads its elements.
+    assert_eq!(mobile_version_filters("has_mobile_version *%i[index show]"), scoped);
+    // A repeated key reads its last value, as Ruby does.
+    assert_eq!(mobile_version_filters("has_mobile_version :index, :show, if: :x, if: nil"), scoped);
+}
+
+/// What expansion cannot read stays unexpanded rather than becoming a
+/// broader or unguarded filter.
+#[test]
+fn rest_actions_macro_refuses_what_it_cannot_read() {
+    for call in [
+        // Unknown actions: expanding would drop them from `only`.
+        "has_mobile_version *ACTIONS",
+        "has_mobile_version *[:index, ACTIONS.first]",
+        "has_mobile_version :index, ACTIONS.first",
+        // The last `if:` is a guard this expansion does not carry.
+        "has_mobile_version :index, if: nil, if: :x",
+        // A computed key might be `:if`.
+        "has_mobile_version :index, \"if\".to_sym => :x",
+    ] {
+        assert!(mobile_version_filters(call).is_empty(), "{call} expanded");
+    }
 }

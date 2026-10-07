@@ -20,6 +20,9 @@
 # corpus are second-granularity, and JSON serializes from the raw
 # string (`<col>_raw`), not the parsed Time.
 module ActiveSupport
+  # Date-only parse/format live in `active_support_date_parsing.rb`,
+  # loaded only when `app_uses_date` (matz/spinel#7334).
+
   # Rails zone name → IANA identifier. TWIN of the constant in the
   # CRuby/JRuby overlay's sibling file, which shadows this whole file on
   # those trees — the two must agree, so extend both together. Names not

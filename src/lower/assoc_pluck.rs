@@ -90,7 +90,7 @@ pub fn apply_assoc_pluck_lowering(app: &mut App) {
 /// plain on one model and `:through` on another is EXCLUDED rather than
 /// guessed at — being wrong in the Relation direction costs a
 /// single-column SELECT, and this pass is not worth that.
-fn materialized_assoc_names(app: &App) -> std::collections::HashSet<Symbol> {
+pub(crate) fn materialized_assoc_names(app: &App) -> std::collections::HashSet<Symbol> {
     use crate::lower::model_associations::AssocKind;
     let mut plain = std::collections::HashSet::new();
     let mut relational = std::collections::HashSet::new();
@@ -120,7 +120,10 @@ fn materialized_assoc_names(app: &App) -> std::collections::HashSet<Symbol> {
 
 fn rewrite(expr: &mut Expr, materialized: &std::collections::HashSet<Symbol>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, materialized));
+    rewrite_node(expr, materialized);
+}
 
+pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &std::collections::HashSet<Symbol>) {
     let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else {
         return;
     };

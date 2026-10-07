@@ -18,11 +18,9 @@
 #   the "authenticated encrypted cookie" salt), so a client cannot read
 #   its own session either. Here it can: the session payload is base64
 #   of the url-encoded `k=v` pairs, the flash payload the message text.
-#   The session holds the CSRF token (already in every page it renders)
-#   and app keys such as campfire's `return_to_after_authenticating`;
-#   a flash message is text the next page shows the same user anyway.
-#   Integrity is what the CSRF check and the app need; confidentiality
-#   is the gap.
+#   Integrity is HMAC; confidentiality is a named residual until an
+#   AES-GCM CookieStore lands in this runtime. Dispatch now emits
+#   `Secure` on HTTPS and `SameSite=Lax` on the session/flash cookies.
 # * NOT INTEROPERABLE. The session payload is this runtime's `k=v`
 #   encoding, not Rails' JSON, so a Rails session cookie does not
 #   restore here (it reads as empty) and ours would not restore in

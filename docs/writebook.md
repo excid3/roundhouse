@@ -100,8 +100,12 @@ At pin `f3fadd21907ad9b18cb23800d971c2cc25045e2a`, the installer in
 `lib/rails_ext/action_text_has_markdown.rb` is a direct
 `include ActionText::HasMarkdown` inside `ActiveSupport.on_load :active_record`.
 The survey now reports that dropped installation with its hook and source file.
-This is a reporting milestone, **not Markdown support**: no mixin is installed,
-no string `class_eval` is expanded, and `has_markdown` remains unclaimed.
+This is a reporting milestone, **not Markdown support**: no mixin instance
+methods are installed. Interpolatable `class_eval` heredocs can expand at
+ingest when every leftover statement is ingestible; interpolated association
+or scope names abort the whole expansion (including the rewritten methods).
+`has_markdown` remains unclaimed because of that abort. The inventory records
+it as an ingest gap on `app/models/page.rb`.
 Coverage is bounded to direct receiverless includes in the top-level hooks
 already scanned; conditional/nested includes and other hook execution remain
 unsupported. `tests/on_load_includes.rs` proves unchanged IR/emission and executes

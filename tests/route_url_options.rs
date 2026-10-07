@@ -41,6 +41,23 @@ fn lowered_views(view: &str) -> String {
     app.views.iter().map(|v| format!("{:?}", v.body)).collect::<Vec<_>>().join("\n")
 }
 
+/// Same view after the emit pipeline's fused post-analyze walks.
+fn lowered_views_post_analyze(view: &str) -> String {
+    let files = vec![
+        ("db/schema.rb", SCHEMA),
+        ("app/models/note.rb", "class Note < ApplicationRecord\nend\n"),
+        ("config/routes.rb", ROUTES),
+        ("app/views/notes/index.html.erb", view),
+    ];
+    let tree = files
+        .into_iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app: App = ingest_app_from_tree(tree).expect("ingest tree");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app.views.iter().map(|v| format!("{:?}", v.body)).collect::<Vec<_>>().join("\n")
+}
+
 /// The wall: campfire's `host:`.
 #[test]
 fn a_host_option_is_stripped_from_the_call() {
@@ -190,4 +207,34 @@ fn a_hostless_url_is_untouched() {
     );
     assert!(!out.contains("\"://\""), "no authority is invented:\n{out}");
     assert!(out.contains("Symbol(\"room_id\")"), "the query key stays:\n{out}");
+}
+
+/// A non-literal `format:` wraps the helper as `call + ".ext"`. The fused
+/// mid walk must still run host rewrite on that inner `recv: None` send,
+/// matching the sequential format-then-host walks.
+#[test]
+fn a_dynamic_format_does_not_hide_host_from_the_url_rewrite() {
+    let out = lowered_views_post_analyze(
+        "<%= link_to \"a\", autocompletable_notes_url(host: \"once.campfire.test\", format: @note.body) %>\n",
+    );
+    assert!(
+        out.contains("StringInterp"),
+        "the host rewrite must still rebuild the URL as an interpolation:\n{out}"
+    );
+    assert!(
+        out.contains("once.campfire.test"),
+        "the host survives as authority, not a query key:\n{out}"
+    );
+    assert!(
+        out.contains("autocompletable_notes_path"),
+        "over the generated _path helper:\n{out}"
+    );
+    assert!(
+        !out.contains("Symbol(\"host\")"),
+        "`host:` must not remain a kwargs key after the wrap:\n{out}"
+    );
+    assert!(
+        !out.contains("Symbol(\"format\")"),
+        "`format:` is consumed by the suffix pass:\n{out}"
+    );
 }

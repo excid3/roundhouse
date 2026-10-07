@@ -53,6 +53,7 @@ module ActiveStorage
   end
 
   class DiskController < ActionController::Base
+    @headers: ActionController::HeaderStore
     def process_action: (Symbol action_name) -> nil
     def show: () -> nil
   end

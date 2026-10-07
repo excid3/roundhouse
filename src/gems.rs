@@ -49,6 +49,11 @@ pub struct Lockfile {
     pub specs: Vec<(String, String)>,
     /// The `DEPENDENCIES` section — what the Gemfile names, lock order.
     pub dependencies: Vec<String>,
+    /// The specs resolved from a `PATH` source: gems that live in this
+    /// repository. Their source is part of the tree, so they are
+    /// analyzed like the rest of the app rather than being a boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_repo: Vec<String>,
 }
 
 impl Lockfile {
@@ -83,6 +88,9 @@ impl Lockfile {
                         let (name, rest) = body.split_once(' ').unwrap_or((body, ""));
                         let version = rest.trim().trim_start_matches('(').trim_end_matches(')');
                         lock.specs.push((name.to_string(), version.to_string()));
+                        if section == "PATH" {
+                            lock.in_repo.push(name.to_string());
+                        }
                     }
                 }
                 "DEPENDENCIES" => {
@@ -104,6 +112,11 @@ impl Lockfile {
     /// Is `name` resolved in this lock (directly or transitively)?
     pub fn has(&self, name: &str) -> bool {
         self.specs.iter().any(|(n, _)| n == name)
+    }
+
+    /// Does `name` live in this repository (a `PATH` source)?
+    pub fn is_in_repo(&self, name: &str) -> bool {
+        self.in_repo.iter().any(|n| n == name)
     }
 
     pub fn version_of(&self, name: &str) -> Option<&str> {
@@ -130,6 +143,11 @@ pub enum GemFate {
     /// Not in the table. Anything it adds to the app's classes is
     /// invisible to the analysis — a dispatch on its surface fails.
     Unknown,
+    /// A component of this repository, locked from a `PATH` source. Its
+    /// code is in the tree under analysis, so it is not a gem the
+    /// analyzer has to model: a dispatch that fails on its constants is
+    /// a fact about the analysis of that code, and is reported as such.
+    InRepo,
 }
 
 impl GemFate {
@@ -140,6 +158,7 @@ impl GemFate {
             GemFate::Modeled => "modeled",
             GemFate::Infrastructure => "infrastructure",
             GemFate::Unknown => "unknown",
+            GemFate::InRepo => "in-repo",
         }
     }
 }
@@ -159,6 +178,10 @@ pub struct GemCensus {
     pub gems: Vec<GemEntry>,
     /// Resolved specs beyond the direct ones.
     pub transitive: usize,
+    /// Every resolved spec name, direct or not: which gem owns a
+    /// constant is a question about all of them.
+    #[serde(default)]
+    pub resolved: Vec<String>,
 }
 
 impl GemCensus {
@@ -169,11 +192,11 @@ impl GemCensus {
             .map(|name| GemEntry {
                 name: name.clone(),
                 version: lock.version_of(name).map(|v| v.to_string()),
-                fate: fate_of(name),
+                fate: if lock.is_in_repo(name) { GemFate::InRepo } else { fate_of(name) },
             })
             .collect();
         let transitive = lock.specs.len().saturating_sub(gems.len());
-        GemCensus { gems, transitive }
+        GemCensus { gems, transitive, resolved: lock.specs.iter().map(|(n, _)| n.clone()).collect() }
     }
 
     pub fn count(&self, fate: GemFate) -> usize {
@@ -194,6 +217,7 @@ impl GemCensus {
             GemFate::Stdlib,
             GemFate::Modeled,
             GemFate::Infrastructure,
+            GemFate::InRepo,
         ] {
             let n = self.count(fate);
             if n > 0 {
@@ -282,7 +306,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("faker", GemFate::Modeled),       // catalog/gems: Faker::*
     ("geared_pagination", GemFate::Modeled), // registry/controllers: set_page_and_extract_portion_from
     ("image_processing", GemFate::Modeled), // active_storage variants seam
-    ("kaminari", GemFate::Modeled),    // catalog: page / per / padding / without_count
+    ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
@@ -570,7 +594,16 @@ pub fn gem_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Op
 /// All candidates in the best namespace-matching tier. Full/irregular
 /// names beat dashed-prefix guesses (`Alba`: alba, not alba-inertia).
 pub fn gems_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> Vec<&'a str> {
-    let head = constant_path.split("::").next().unwrap_or(constant_path);
+    gems_owning_constant_with(census, constant_path, &|_, _| None)
+}
+
+pub fn gem_owning_constant_with<'a>(census: &'a GemCensus, constant_path: &str, declares: &dyn Fn(&str, &str) -> Option<bool>) -> Option<&'a str> {
+    let owners = gems_owning_constant_with(census, constant_path, declares);
+    (owners.len() == 1).then(|| owners[0])
+}
+
+pub(crate) fn gems_owning_constant_with<'a>(census: &'a GemCensus, constant_path: &str, declares: &dyn Fn(&str, &str) -> Option<bool>) -> Vec<&'a str> {
+    let head = constant_path.trim_start_matches("::").split("::").next().unwrap_or(constant_path);
     let exact: Vec<_> = census
         .unknown()
         .filter(|g| g.version.is_some() && namespace_of(&g.name) == head)
@@ -579,7 +612,11 @@ pub fn gems_owning_constant<'a>(census: &'a GemCensus, constant_path: &str) -> V
     if !exact.is_empty() {
         return exact;
     }
+    if census.resolved.iter().any(|s| namespace_of(s) == head) {
+        return Vec::new();
+    }
     census.unknown()
+        .filter(|g| declares(&g.name, constant_path) != Some(false))
         .filter(|g| g.version.is_some() && namespace_candidates(&g.name).iter().any(|c| c == head))
         .map(|g| g.name.as_str())
         .collect()

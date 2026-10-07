@@ -1165,8 +1165,37 @@ module ActionText
       @html
     end
 
+    # Empty / whitespace-only markup is blank without scanning. Non-empty
+    # shells (`<div></div>`, `<div><br></div>`) still need to_plain_text —
+    # empty blockquotes become curly quotes and are not blank.
     def blank?
-      to_plain_text == ""
+      html = @html
+      return true if html.nil?
+      n = html.length
+      return true if n == 0
+      i = 0
+      while i < n
+        c = html[i, 1].to_s
+        unless c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\f"
+          # Entity-decoded plain text (`&nbsp;` → " ") is blank when
+          # whitespace-only. Scan here: ActionText::Content must not
+          # resolve `ActiveSupport` through this class (emitted tests
+          # do not load the ActiveSupport module in this namespace).
+          text = to_plain_text
+          j = 0
+          m = text.length
+          while j < m
+            d = text[j, 1].to_s
+            unless d == " " || d == "\t" || d == "\n" || d == "\r" || d == "\f"
+              return false
+            end
+            j = j + 1
+          end
+          return true
+        end
+        i = i + 1
+      end
+      true
     end
 
     def empty?
@@ -1367,8 +1396,22 @@ module ActionText
             i = i + 1
           end
         else
-          out = out + c if skipping == ""
-          i = i + 1
+          # One slice for a run of ordinary text — avoids O(n) 1-char
+          # Strings + concatenations on Writebook Page#plain_text /
+          # Campfire ActionText bodies. Keep [i,1] only to find the
+          # next markup boundary (portable; one-arg index is not).
+          if skipping == ""
+            start = i
+            i = i + 1
+            while i < n
+              nc = @html[i, 1].to_s
+              break if nc == "<" || nc == "&"
+              i = i + 1
+            end
+            out = out + @html[start, i - start].to_s
+          else
+            i = i + 1
+          end
         end
       end
       Content.chomp_newlines(out)

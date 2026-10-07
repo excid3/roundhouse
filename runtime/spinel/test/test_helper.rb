@@ -691,6 +691,23 @@ module ActionDispatch
   end
 end
 
+# rack-test's `Rack::Test::UploadedFile`, in the form that hands it a
+# StringIO — campfire's undecodable-image test builds one from half a
+# WebP. Rack turns it into an `ActionDispatch::Http::UploadedFile` on
+# the way into params, so here it IS one: the controller's
+# `from_params` takes it as the file it would see in production.
+# rack-test requires `original_filename` for a StringIO; the path form
+# (copying a file on disk into a tempfile) is not modeled.
+module Rack
+  module Test
+    class UploadedFile < ActionDispatch::Http::UploadedFile
+      def initialize(io, content_type = "text/plain", binary = false, original_filename:)
+        super(io.read, original_filename, content_type)
+      end
+    end
+  end
+end
+
 # In-process request dispatch — equivalent of Rails's
 # ActionDispatch::IntegrationTest. Test classes that need to exercise
 # controller actions extend this module to get get/post/patch/delete.
@@ -1773,16 +1790,39 @@ module RequestDispatch
     # yielder forwarded through a second yielder types its block value
     # once for every site (matz/spinel#4495), and campfire's web-push
     # handler already wraps with a block of another type.
+    #
+    # A GET/HEAD reads through one snapshot, as the dispatcher serves it,
+    # so the suite exercises the same transaction shape production does.
+    snapshot = method == "GET" || method == "HEAD"
     if Db.in_lease?
-      controller.process_action(matched.action)
+      Db.read_snapshot_begin if snapshot
+      begin
+        controller.process_action(matched.action)
+      ensure
+        Db.read_snapshot_end if snapshot
+      end
     else
-      Db.with_connection { controller.process_action(matched.action) }
+      Db.with_connection do
+        Db.read_snapshot_begin if snapshot
+        begin
+          controller.process_action(matched.action)
+        ensure
+          Db.read_snapshot_end if snapshot
+        end
+      end
     end
     @__flash = controller.flash
     # Fold this response's Set-Cookie writes back into the browser.
     @__cookies = ActionController::CookieJar.new(
       accept_cookies(cookies.to_h, controller.cookies.pending)
     )
+    copied_headers = {}
+    hi = 0
+    hn = controller.headers.size
+    while hi < hn
+      copied_headers[controller.headers.key_at(hi)] = controller.headers.val_at(hi)
+      hi += 1
+    end
     @__response = ActionResponse.new(
       status:   controller.status,
       body:     controller.body,
@@ -1792,7 +1832,7 @@ module RequestDispatch
       content_type: controller.content_type,
       cache_control_max_age: controller.cache_control_max_age,
       cache_control_public: controller.cache_control_public,
-      headers:  controller.headers,
+      headers:  copied_headers,
     )
     # Rails' OWN names, alongside the `__`-prefixed ones the harness
     # methods read. An integration test writes `@response.body` and

@@ -2242,7 +2242,7 @@ fn integer_durations_rewrite_to_duration_calls() {
         "numeric-literal duration rewrites; got:\n{src}",
     );
     assert!(
-        src.contains("ActiveSupport::Duration.days(WINDOW).ago"),
+        src.contains("ActiveSupport::Duration.days(User::WINDOW).ago"),
         "plural duration rewrites even for an (untyped) constant receiver; got:\n{src}",
     );
     assert!(
@@ -2416,6 +2416,35 @@ fn model_method_keeps_keyword_rest_as_a_trailing_hash_param() {
     assert!(
         src.contains("def notification(params = {})"),
         "a model's `**params` must survive as a trailing hash param; got:\n{src}",
+    );
+}
+
+#[test]
+fn model_method_keeps_keyword_rest_beside_keywords() {
+    // Preview Campfire: `def notification(badge: …, **params)`. Flattening
+    // `**params` to a trailing `params = {}` after a keyword does not
+    // parse (optional positionals cannot follow keywords) and Spinel
+    // rejects the `.rbs` too. Keep a real keyword-rest, as library_class
+    // does when the def already carries keywords.
+    let app = ingest_tree(&[
+        (
+            "db/schema.rb",
+            "ActiveRecord::Schema.define(version: 1) do\n  create_table :subscriptions do |t|\n    t.string :endpoint\n  end\nend\n",
+        ),
+        (
+            "app/models/subscription.rb",
+            "class Subscription < ApplicationRecord\n  def notification(badge: 0, **params)\n    [badge, params]\n  end\nend\n",
+        ),
+    ]);
+    let files = ruby::emit_lowered_models(&app);
+    let src = find(&files, "subscription.rb");
+    assert!(
+        src.contains("def notification(badge: 0, **params)"),
+        "keyword + **rest must keep **rest, not flatten after the keyword; got:\n{src}",
+    );
+    assert!(
+        !src.contains("params = {}"),
+        "must not emit illegal `badge: …, params = {{}}`; got:\n{src}",
     );
 }
 

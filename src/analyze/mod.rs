@@ -24,6 +24,7 @@
 //! Each of those comes when a fixture forces it.
 
 mod alba;
+mod enum_raw_input;
 mod body;
 mod class_configuration;
 mod data;
@@ -43,6 +44,7 @@ mod diagnostics;
 pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
+mod harvest_return;
 mod inferred_types;
 pub mod inquiry;
 pub use inferred_types::inferred_types;
@@ -66,8 +68,8 @@ use rubydex::model::ids::DeclarationId;
 use crate::adapter::{DatabaseAdapter, SqliteAdapter};
 use crate::App;
 use crate::dialect::{
-    Action, Controller, ControllerBodyItem, Filter, FilterKind, LayoutDecl, ModelBodyItem,
-    RenderTarget,
+    Action, Controller, ControllerBodyItem, Filter, FilterKind, LayoutDecl, MethodDef, Model,
+    ModelBodyItem, RenderTarget,
 };
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -85,6 +87,11 @@ pub struct Analyzer {
     /// The Symbol key is the method name; the Vec aligns positionally
     /// with `MethodDef.params`.
     inferred_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    /// (class, method) pairs an author wrote a signature for, as opposed
+    /// to a `Fn` the registry stamped from the def itself. Only in the
+    /// first is an `untyped` slot a statement rather than an inference
+    /// gap.
+    declared_signatures: std::collections::HashSet<(ClassId, Symbol)>,
     /// Backend-specific effect classification. The analyzer consults
     /// this when deciding whether a Send on an AR model carries
     /// `DbRead` or `DbWrite`. Defaults to `SqliteAdapter` via
@@ -123,10 +130,34 @@ pub struct Analyzer {
     refined_action_bindings: HashMap<(ClassId, Symbol), HashMap<Symbol, Ty>>,
     /// Resolved once from the source snapshot supplied to `Analyzer::new`.
     const_resolver: std::sync::Arc<body::ConstResolver>,
+    /// Explicit source-free API mode never certifies source indexing.
+    source_indexed: bool,
     /// Inferred values keyed by Rubydex declaration IDs, not by names.
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
     data_factories: HashMap<crate::span::Span, Ty>,
+}
+
+/// Snapshot of the data the fixpoint refines: per-class instance/class
+/// method return types plus `inferred_params`. HashMap equality is
+/// order-independent, so this matches the previous sorted-string
+/// fingerprint without `Debug`-formatting every `Ty` on every round.
+#[derive(Clone)]
+struct InferenceSig {
+    instance: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    class_methods: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+}
+
+/// Which call-site trees `unify_params_from_call_sites` walks.
+/// Production rounds skip views/tests/seeds: those trees are still
+/// ingest-shaped until after the production fixpoint (wave 12).
+/// Test sites are overlaid separately so later test-only rounds can
+/// reuse a production+view param snapshot.
+#[derive(Clone, Copy)]
+enum UnifyScope {
+    Production,
+    WithViews,
 }
 
 impl Analyzer {
@@ -175,7 +206,7 @@ impl Analyzer {
             // those fabricates methods the class does not have, and the
             // fabrication is not inert: an instance receiver resolves
             // `class_methods` BEFORE `instance_methods` (the parent-chain
-            // walk in `body/send.rs`), so `@search.page` reached kaminari's
+            // walk in `body/send.rs`), so `@search.page` reached the
             // class-side `page` builder instead of the `attr_accessor`.
             // That mistyped as `Array[Search]` for as long as chain starts
             // were Array-shaped — wrong, but renderable. Convergence
@@ -276,6 +307,31 @@ impl Analyzer {
             cls.class_methods.insert(Symbol::from("attribute_names"), Ty::Array { elem: Box::new(Ty::Str) });
             cls.class_methods.insert(Symbol::from("column_names"), Ty::Array { elem: Box::new(Ty::Str) });
             cls.class_methods.insert(Symbol::from("columns_hash"), Ty::Untyped);
+            // The rest of the schema-reflection surface every model has:
+            // `columns` is the list of `ActiveRecord::ConnectionAdapters::Column`
+            // objects (not modelled, so their elements stay untyped), the
+            // `sanitize_sql*` family builds a SQL fragment string, and
+            // `base_class` is the STI root, a class.
+            cls.class_methods.insert(Symbol::from("columns"), Ty::Array { elem: Box::new(Ty::Untyped) });
+            for sanitizer in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_conditions", "sanitize_sql_like"] {
+                cls.class_methods.insert(Symbol::from(sanitizer), Ty::Str);
+            }
+            cls.class_methods.insert(Symbol::from("base_class"), Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] });
+            let class_ty = Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] };
+            for family in ["descendants", "subclasses"] {
+                cls.class_methods.insert(Symbol::from(family), Ty::Array { elem: Box::new(class_ty.clone()) });
+            }
+            for text in ["quoted_table_name", "inheritance_column", "sti_name"] {
+                cls.class_methods.insert(Symbol::from(text), Ty::Str);
+            }
+            for flag in ["abstract_class?", "table_exists?"] {
+                cls.class_methods.insert(Symbol::from(flag), Ty::Bool);
+            }
+            // `ActiveModel::Name`, the `Type::Value`s and the enum table are
+            // objects the registry does not model.
+            for opaque in ["model_name", "attribute_types", "type_for_attribute", "defined_enums", "reset_column_information"] {
+                cls.class_methods.insert(Symbol::from(opaque), Ty::Untyped);
+            }
             // The rest of the class-side query surface — everything
             // from here to the `ids` seed below reads or writes the
             // database, so it is gated on `is_ar_model` for the same
@@ -424,6 +480,9 @@ impl Analyzer {
             // `has_json` schema keys — same situation, JSON instead of
             // YAML, plus the one type the declaration erases.
             register_has_json(&model.body, &mut cls.instance_methods);
+            // `serialize :col, coder: …` — the column reads back as the
+            // coder's object, not the storage text.
+            register_serialized_columns(&model.body, &mut cls.instance_methods);
             // `attribute :name, :type` virtual attributes (ActiveModel) —
             // backed by something other than a schema column, so absent
             // from `model.attributes` above.
@@ -563,6 +622,15 @@ impl Analyzer {
             // include chain is resolvable (`lower::attachable`).
             cls.instance_methods
                 .entry(Symbol::from("attachable_sgid"))
+                .or_insert(Ty::Str);
+            // `to_param` — every concrete model gets a synthesized
+            // `id.to_s` (or its own override) at the emit seam
+            // (`lower::model_to_library::markers::push_to_param_method`).
+            // Register here so analyzer dispatch matches that surface
+            // (campfire's `user.to_param` in AvatarsHelper) instead of
+            // the Object-extension refusal for an unmodeled call.
+            cls.instance_methods
+                .entry(Symbol::from("to_param"))
                 .or_insert(Ty::Str);
             // Core AR instance methods every model gets. Sourced
             // from the shared catalog — same mechanism as class
@@ -759,6 +827,17 @@ impl Analyzer {
         // see `registry::library`.
         registry::library::register(&mut classes, app, &route_helper_names);
 
+        // A helper object built from a YAML table
+        // (`WebUrlHelpers = Factory.create(YAML.load_file(…)["paths"])`):
+        // one path/URL String per generated name. See
+        // `ingest::generated_helpers`.
+        for (constant, names) in &app.generated_helper_methods {
+            let cls = classes.entry(constant.clone()).or_default();
+            for name in names {
+                cls.class_methods.entry(name.clone()).or_insert(Ty::Str);
+            }
+        }
+
         // Controllers: register each as a known class so self-method
         // dispatch (a bare `find_story` inside an action) resolves against
         // the controller's own methods and walks the parent chain to the
@@ -783,11 +862,78 @@ impl Analyzer {
             }
         }
 
+        // Classes a locked gem's RBI declares. After everything the app
+        // and the catalog register, so it only ever adds.
+        registry::gem_boundary::register(&mut classes, app);
+
+        // Which registered classes the app itself declares: a bare name
+        // reaches those through Ruby's constant lookup only (see
+        // Rubydex).
+        for id in app
+            .models
+            .iter()
+            .map(|m| &m.name)
+            .chain(app.controllers.iter().map(|c| &c.name))
+            .chain(app.library_classes.iter().map(|lc| &lc.name))
+        {
+            if let Some(info) = classes.get_mut(id) {
+                info.app_declared = true;
+            }
+        }
+
+        for (id, method) in app.models.iter()
+            .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
+            .chain(app.library_classes.iter()
+                .flat_map(|class| class.methods.iter().map(move |method| (&class.name, method))))
+        {
+            if method.receiver == crate::dialect::MethodReceiver::Class
+                && method.name.as_str() == "new"
+            {
+                classes.entry(id.clone()).or_default().declares_constructor = true;
+            }
+        }
+
+        // A class named in a signature means the lexically nearest one
+        // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
+        // which is only knowable once every class is registered.
+        let resolved: Vec<(ClassId, Symbol, Ty, Ty)> = app
+            .rbs_signatures
+            .iter()
+            .flat_map(|(class_id, methods)| {
+                methods.iter().map(|(name, ty)| {
+                    let scoped = ty.map_class_ids(&|id| {
+                        body::lexical_class(id, class_id.0.as_str(), &classes)
+                            .unwrap_or_else(|| id.clone())
+                    });
+                    (class_id.clone(), name.clone(), ty.clone(), scoped)
+                })
+            })
+            .filter(|(_, _, before, after)| before != after)
+            .collect();
+        for (class_id, name, before, after) in resolved {
+            if let Some(slot) = classes
+                .get_mut(&class_id)
+                .and_then(|c| c.instance_methods.get_mut(&name))
+            {
+                if *slot == before {
+                    *slot = after;
+                }
+            }
+        }
         // Test helpers are source methods, not a surface invented by test
         // emission. Register their real identities and declarations before
         // source typing; inferred returns converge in the same registry as
         // ordinary application methods.
         test_module::register(&mut classes, app);
+        for declaration in &app.library_classes {
+            if let Some(info) = classes.get_mut(&declaration.name) { info.is_module = declaration.is_module; }
+        }
+
+
+        assert!(
+            !app.source_index_required || !app.sources.is_empty(),
+            "source_index_missing: ingested source app cannot use IR-only analysis"
+        );
 
         let const_resolver = app.const_resolver.for_sources(&app.sources);
         let data_factories = data::register(app, &const_resolver, &mut classes);
@@ -795,12 +941,18 @@ impl Analyzer {
         Self {
             classes,
             inferred_params: HashMap::new(),
+            declared_signatures: app
+                .rbs_signatures
+                .iter()
+                .flat_map(|(c, ms)| ms.keys().map(move |m| (c.clone(), m.clone())))
+                .collect(),
             adapter,
             concern_folded: HashMap::new(),
             host_folded: HashMap::new(),
             refined_action_bindings: HashMap::new(),
             inquirers: inquiry::inquirer_methods(app),
             const_resolver,
+            source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
             data_factories,
         }
@@ -809,11 +961,11 @@ impl Analyzer {
     /// Build a body-typer borrowing this analyzer's dispatch tables.
     /// Cheap — just a struct with a reference.
     fn body_typer(&self) -> BodyTyper<'_> {
-        BodyTyper::new(&self.classes)
+        let typer = BodyTyper::new(&self.classes)
             .with_inquirers(&self.inquirers)
-            .with_const_resolver(self.const_resolver.clone())
             .with_typed_constants(&self.typed_constants)
-            .with_data_factories(&self.data_factories)
+            .with_data_factories(&self.data_factories);
+        if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
     /// The per-class member registry — schema columns, catalog-sourced
@@ -844,10 +996,95 @@ impl Analyzer {
     /// types from method bodies into the dispatch registry, (b) unifies
     /// parameter types across call sites, and (c) re-runs typing with
     /// the refined registry. Iterates to a fixed point (capped; see
-    /// `FIXPOINT_CAP`) using a signature fingerprint to detect convergence.
+    /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
+        // An unresolvable include is a load-time error, not an open method
+        // surface. Keep it in the class-body ledger even when no method is called.
+        for class in &mut app.library_classes {
+            for included in &class.includes {
+                let known = self.classes.contains_key(included)
+                    || body::lexical_class(included, class.name.0.as_str(), &self.classes).is_some()
+                    || body::RUBY_TOP_LEVEL.contains(&included.0.as_str());
+                if known { continue; }
+                let detail = format!("{} includes unresolved {}", class.name.0, included.0);
+                if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                    Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
+                    if construct.as_str() == "include" && old == &detail)) { continue; }
+                let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
+                    crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
+                refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    target: None, construct: Symbol::from("include"), detail,
+                });
+                class.unknown_calls.push(refusal);
+            }
+        }
+        for model in &mut app.models {
+            for item in &mut model.body {
+                let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                if method.as_str() != "include" { continue; }
+                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "include") {
+                    expr.diagnostic = None;
+                }
+                let missing: Vec<_> = args.iter().filter_map(|arg| {
+                    let ExprNode::Const { path } = &*arg.node else { return None };
+                    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    let id = ClassId(Symbol::from(name.as_str()));
+                    let known = self.classes.contains_key(&id)
+                        || body::lexical_class(&id, model.name.0.as_str(), &self.classes).is_some()
+                        || body::RUBY_TOP_LEVEL.contains(&name.as_str());
+                    (!known).then_some(name)
+                }).collect();
+                if !missing.is_empty() {
+                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None, construct: Symbol::from("include"),
+                        detail: format!("{} includes unresolved {}", model.name.0, missing.join(", ")),
+                    });
+                }
+            }
+        }
         const FIXPOINT_CAP: usize = 12;
-        crate::timings::phase("typing passes (initial)", || self.run_typing_passes(app));
+        // View-name and dynamic-render ivar sets are invariant across
+        // fixpoint rounds — they read source views, not the registry.
+        let mut dynamic_render_ivars: std::collections::HashSet<Symbol> =
+            std::collections::HashSet::new();
+        for view in &app.views {
+            collect_dynamic_render_ivars(&view.body, &mut dynamic_render_ivars);
+        }
+        let existing_view_names: std::collections::HashSet<Symbol> =
+            app.views.iter().map(|v| v.name.clone()).collect();
+        // Module method tables and controller parent links are invariant
+        // across fixpoint rounds — clone once instead of rebuilding them
+        // on every `run_typing_passes` (Campfire: 1 initial + 8 rounds).
+        let module_methods: HashMap<ClassId, Vec<MethodDef>> = app
+            .library_classes
+            .iter()
+            .filter(|lc| lc.is_module)
+            .map(|lc| (lc.name.clone(), lc.methods.clone()))
+            .collect();
+        let module_includes: HashMap<ClassId, Vec<ClassId>> = app
+            .library_classes
+            .iter()
+            .filter(|lc| lc.is_module)
+            .map(|lc| (lc.name.clone(), lc.includes.clone()))
+            .collect();
+        let parent_link_by_name: HashMap<ClassId, Option<ClassId>> = app
+            .controllers
+            .iter()
+            .map(|c| (c.name.clone(), c.parent.clone()))
+            .collect();
+
+        crate::timings::phase("typing passes (initial)", || {
+            self.run_typing_passes(
+                app,
+                &dynamic_render_ivars,
+                &existing_view_names,
+                &module_methods,
+                &module_includes,
+                &parent_link_by_name,
+                false,
+            )
+        });
 
         // Whole-program fixpoint: harvest returns + unify params, re-type,
         // repeat until the registry signature stabilizes. Each round
@@ -861,28 +1098,168 @@ impl Analyzer {
         // `with_pagination_info` → `get` → `paginate` → the
         // `get_from_cache` block → its return → the destructuring, which
         // settles on round 9.
-        let mut prev_sig = self.inference_signature();
+        let mut prev_sig = self.capture_inference_sig();
         for round in 0..FIXPOINT_CAP {
-            crate::timings::phase(format_args!("round {round}: harvest returns"), || self.harvest_returns_to_registry(app));
-            crate::timings::phase(format_args!("round {round}: unify params"), || self.unify_params_from_call_sites(app));
-            let cur_sig = self.inference_signature();
-            if cur_sig == prev_sig {
+            crate::timings::phase(format_args!("round {round}: harvest returns"), || {
+                self.harvest_returns_to_registry(app, false)
+            });
+            crate::timings::phase(format_args!("round {round}: unify params"), || {
+                self.unify_params_from_call_sites(app, UnifyScope::Production)
+            });
+            if self.inference_matches(&prev_sig) {
                 break;
             }
-            prev_sig = cur_sig;
+            prev_sig = self.capture_inference_sig();
             // Re-type the whole app with the refined registry. Idempotent
             // BodyTyper means a second pass simply resolves dispatches
             // and Var bindings the first pass couldn't.
-            crate::timings::phase(format_args!("round {round}: typing passes"), || self.run_typing_passes(app));
+            crate::timings::phase(format_args!("round {round}: typing passes"), || {
+                self.run_typing_passes(
+                    app,
+                    &dynamic_render_ivars,
+                    &existing_view_names,
+                    &module_methods,
+                    &module_includes,
+                    &parent_link_by_name,
+                    false,
+                )
+            });
         }
 
-        // The loop's last act is a typing pass whose results nothing
-        // harvested — either it hit the cap, or it ran on the round
-        // that then converged. Either way `self.classes` is one round
-        // behind the bodies in `app`, and the signature stamping below
-        // reads the registry. Harvesting once more costs no re-typing
-        // and makes the two agree.
-        self.harvest_returns_to_registry(app);
+        // Intermediate rounds skip views/tests: production does not
+        // read test helper returns, and unifying from still-untyped view
+        // trees for seven rounds was wasted work. After production
+        // converges, type views once and then harvest/unify/retype
+        // *tests* until helper chains settle. Later test rounds reuse
+        // the production+view param snapshot instead of re-walking
+        // those trees. If view/test sites moved a production param,
+        // retype production until harvested returns stabilize. Nested
+        // constructors live in serializer bodies (AuthorResource.new
+        // inside ArticleResource.to_h), so each absorb pass must
+        // unify WithViews again — Production unify would drop the
+        // view sites, and skipping unify leaves nested initialize
+        // params as Var. After helper returns absorb those params,
+        // views are typed once more so template calls see the
+        // harvested helper surface rather than leftover untyped.
+        let production_sig = prev_sig.clone();
+        let mut production_view_params = None;
+        for round in 0..FIXPOINT_CAP {
+            crate::timings::phase(
+                if round == 0 {
+                    "typing passes (views after fixpoint)".to_string()
+                } else {
+                    format!("round {round}: tests")
+                },
+                || {
+                    if round == 0 {
+                        self.run_typing_passes(
+                            app,
+                            &dynamic_render_ivars,
+                            &existing_view_names,
+                            &module_methods,
+                            &module_includes,
+                            &parent_link_by_name,
+                            true,
+                        );
+                    } else {
+                        self.type_tests_only(app);
+                    }
+                },
+            );
+            self.harvest_returns_to_registry(app, true);
+            crate::timings::phase(
+                if round == 0 {
+                    "unify params (after views)".to_string()
+                } else {
+                    format!("round {round}: unify params (tests)")
+                },
+                || {
+                    if round == 0 {
+                        self.unify_params_from_call_sites(app, UnifyScope::WithViews);
+                        production_view_params = Some(self.inferred_params.clone());
+                        self.overlay_test_params(app);
+                    } else if let Some(snapshot) = production_view_params.as_ref() {
+                        self.unify_test_params_onto(app, snapshot);
+                    }
+                },
+            );
+            if self.inference_matches(&prev_sig) {
+                break;
+            }
+            prev_sig = self.capture_inference_sig();
+        }
+        if !self.inference_matches(&production_sig) {
+            let mut absorb_sig = self.capture_inference_sig();
+            for round in 0..FIXPOINT_CAP {
+                crate::timings::phase(
+                    if round == 0 {
+                        "typing passes (after view unify)".to_string()
+                    } else {
+                        format!("round {round}: absorb production")
+                    },
+                    || {
+                        self.run_typing_passes(
+                            app,
+                            &dynamic_render_ivars,
+                            &existing_view_names,
+                            &module_methods,
+                            &module_includes,
+                            &parent_link_by_name,
+                            false,
+                        )
+                    },
+                );
+                self.harvest_returns_to_registry(app, true);
+                self.unify_params_from_call_sites(app, UnifyScope::WithViews);
+                if let Some(snapshot) = production_view_params.as_mut() {
+                    snapshot.clone_from(&self.inferred_params);
+                }
+                self.overlay_test_params(app);
+                if self.inference_matches(&absorb_sig) {
+                    break;
+                }
+                absorb_sig = self.capture_inference_sig();
+            }
+        } else {
+            // View unify did not move production signatures, but helper
+            // *bodies* still need a pass against view-inferred params
+            // (`highlight_searched_content`'s `content` is only called
+            // from templates) before views are restamped.
+            crate::timings::phase("typing passes (helpers after view unify)", || {
+                self.run_typing_passes(
+                    app,
+                    &dynamic_render_ivars,
+                    &existing_view_names,
+                    &module_methods,
+                    &module_includes,
+                    &parent_link_by_name,
+                    false,
+                )
+            });
+            self.harvest_returns_to_registry(app, true);
+        }
+        // Wave 12 types views once against production-only helper
+        // returns, then unifies helper params from those sites. Helper
+        // returns therefore settle only after the absorb/harvest above.
+        // Stamp view trees again so template Sends are not leftover
+        // `gradual_untyped` against the pre-unify helper registry
+        // (Writebook `leafables/show` `highlight_searched_content`).
+        crate::timings::phase("typing passes (views after helper harvest)", || {
+            self.run_typing_passes(
+                app,
+                &dynamic_render_ivars,
+                &existing_view_names,
+                &module_methods,
+                &module_includes,
+                &parent_link_by_name,
+                true,
+            )
+        });
+        // Effects are a function of the converged typed trees, not of
+        // the fixpoint. Collecting inside every typing round walked
+        // the same bodies two or three times per round for no harvest
+        // or unify input.
+        self.stamp_body_effects(app);
 
         // Publish the converged param table onto the App for lowerings
         // that build signatures after analysis (the controller lowering
@@ -1093,9 +1470,10 @@ impl Analyzer {
                 self_ty: None,
                 ivar_bindings: HashMap::new(),
                 local_bindings,
+                class_objects: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
-                in_view: false,
+                in_view: false, class_side: false,
             };
             self.body_typer().analyze_expr(&mut helper.body, &ctx);
         }
@@ -1169,6 +1547,14 @@ impl Analyzer {
                     continue;
                 }
 
+                // Class-side `new` answers `Ty::SelfInstance` so inherited
+                // factories stay receiver-dependent in the registry. The
+                // MethodDef signature is what RBS emit reads, and emit
+                // refuses a bare SelfInstance — pin it to the owner the
+                // method is stamped on (same concrete shape
+                // `concern_class_methods` requires).
+                let owner_ty = Ty::Class { id: owner.clone(), args: Vec::new() };
+
                 let params: Vec<crate::ty::Param> = method
                     .params
                     .iter()
@@ -1188,6 +1574,7 @@ impl Analyzer {
                         } else {
                             param_ty_with_default(inferred.and_then(|v| v.get(i)).cloned(), p)
                                 .unwrap_or(Ty::Untyped)
+                                .subst_self(&owner_ty)
                         };
                         // Kind must survive verbatim: the untyped
                         // fallback this replaces is kind-aware, and a
@@ -1200,7 +1587,7 @@ impl Analyzer {
                 method.signature = Some(Ty::Fn {
                     params,
                     block: None,
-                    ret: Box::new(ret.unwrap_or(Ty::Untyped)),
+                    ret: Box::new(ret.unwrap_or(Ty::Untyped).subst_self(&owner_ty)),
                     effects: method.effects.clone(),
                 });
             }
@@ -1293,17 +1680,18 @@ impl Analyzer {
             let shared = body::ConstScope::global(map.clone());
             let typer = BodyTyper::new(&self.classes)
                 .with_inquirers(&self.inquirers)
-                .with_const_resolver(self.const_resolver.clone())
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
+            let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
             for (self_ty, name, id, value, production) in entries.iter_mut() {
                 let ctx = Ctx {
                     self_ty: Some(self_ty.clone()),
                     ivar_bindings: HashMap::new(),
                     local_bindings: HashMap::new(),
+                    class_objects: Default::default(),
                     constants: shared.clone(),
                     annotate_self_dispatch: false,
-                    in_view: false,
+                    in_view: false, class_side: false,
                 };
                 let ty = typer.analyze_expr(value, &ctx);
                 if matches!(ty, Ty::Var { .. }) {
@@ -1333,6 +1721,14 @@ impl Analyzer {
             map = next;
             resolved = next_resolved;
         }
+        // These source-declared constants have modeled factory-generated
+        // object methods even though their initializer is not a retained class.
+        for constant in app.generated_helper_methods.keys() {
+            resolved.insert(
+                rubydex::model::ids::declaration_id_from_lookup_name(constant.0.as_str()),
+                Ty::Class { id: constant.clone(), args: vec![] },
+            );
+        }
         (map, resolved)
     }
 
@@ -1342,13 +1738,38 @@ impl Analyzer {
     /// (controller→view ivar channel, before_action seeding,
     /// per-model two-pass ivar discovery, partial locals threading)
     /// stays internal to this method; the fixpoint just calls it.
-    fn run_typing_passes(&mut self, app: &mut App) {
+    fn run_typing_passes(
+        &mut self,
+        app: &mut App,
+        dynamic_render_ivars: &std::collections::HashSet<Symbol>,
+        existing_view_names: &std::collections::HashSet<Symbol>,
+        module_methods: &HashMap<ClassId, Vec<MethodDef>>,
+        module_includes: &HashMap<ClassId, Vec<ClassId>>,
+        parent_link_by_name: &HashMap<ClassId, Option<ClassId>>,
+        type_views_and_tests: bool,
+    ) {
         // Source-backed constant reads use Rubydex declaration IDs.
         // A bare-name fallback remains for generated expressions without
         // a Ruby source reference.
-        let (fallback, resolved_values) = self.build_constant_registry(app);
+        let (fallback, resolved_values) = crate::timings::phase("typing: constants", || {
+            self.build_constant_registry(app)
+        });
         self.typed_constants = resolved_values;
         let global_constants = body::ConstScope::global(fallback);
+        // Type the actual initializer trees, not only registry clones.
+        // Their lexical class references become load-time dependencies
+        // when a source file's nested declarations emit into separate files.
+        for class in &mut app.library_classes {
+            let ctx = Ctx {
+                self_ty: Some(Ty::Class { id: class.name.clone(), args: vec![] }),
+                constants: global_constants.clone(),
+                class_side: true,
+                ..Ctx::default()
+            };
+            for (_, value) in &mut class.constants {
+                self.body_typer().analyze_expr(value, &ctx);
+            }
+        }
         // Controller→view ivar channel: as each action is analyzed, we harvest
         // the ivars it sets and key them by the view that action renders.
         // When we reach the view pass below, the view's Ctx is seeded from
@@ -1376,15 +1797,8 @@ impl Analyzer {
         // partial view name (`home/_for_domain`) to the union of ivars
         // from every action that names it (`@above = 'for_domain'`).
         // Built during Pass B, consumed when seeding partials below.
-        let dynamic_render_ivars: std::collections::HashSet<Symbol> = {
-            let mut set = std::collections::HashSet::new();
-            for view in &app.views {
-                collect_dynamic_render_ivars(&view.body, &mut set);
-            }
-            set
-        };
-        let existing_view_names: std::collections::HashSet<Symbol> =
-            app.views.iter().map(|v| v.name.clone()).collect();
+        // The two sets are computed once in `analyze` and reused every
+        // round — they do not depend on the refined registry.
         let mut content_partial_ivars: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
 
         // Per-controller metadata captured during Pass A so Pass B
@@ -1426,38 +1840,164 @@ impl Analyzer {
             layout: LayoutDecl,
         }
         let mut meta_by_name: HashMap<ClassId, ControllerMeta> = HashMap::new();
-        // Snapshot parent links separately so Phase B can walk
-        // arbitrary-depth chains without re-borrowing `app.controllers`
-        // (which is mutably borrowed inside the analysis loops).
-        let parent_link_by_name: HashMap<ClassId, Option<ClassId>> = app
-            .controllers
-            .iter()
-            .map(|c| (c.name.clone(), c.parent.clone()))
-            .collect();
-
-        // Concern-module metadata for the mixed-in expansion inside
-        // Phase A: each module's method defs (cloned so their bodies can
-        // be typed against each includer's own self) and its `include`s
-        // (concerns include concerns; the expansion chases the closure).
-        // Filters captured from `included do` blocks ride on
-        // `App::concern_filters`.
-        let module_methods: HashMap<ClassId, Vec<crate::dialect::MethodDef>> = app
-            .library_classes
-            .iter()
-            .filter(|lc| lc.is_module)
-            .map(|lc| (lc.name.clone(), lc.methods.clone()))
-            .collect();
-        let module_includes: HashMap<ClassId, Vec<ClassId>> = app
-            .library_classes
-            .iter()
-            .filter(|lc| lc.is_module)
-            .map(|lc| (lc.name.clone(), lc.includes.clone()))
-            .collect();
+        // Parent links and concern-module tables are cloned once in
+        // `analyze` and reused every round — they do not depend on the
+        // refined registry.
 
         self.analyze_class_configuration(&mut app.controllers);
 
+        // Models do not read `controller_ivar_env`. Type and harvest
+        // each one before controllers so a round carries model returns
+        // into controller bodies. Dispatch reads the registry.
+        let _typing_models = crate::timings::begin("typing: models");
+        for model in &mut app.models {
+            // Seed class ivars for the body-typer. Three shapes in play:
+            // 1. `@attributes` — the legacy Hash-storage access path
+            //    (some transpiled patterns still use it).
+            // 2. Per-schema-column ivars (`@title`, `@body`, ...) — the
+            //    typed-field representation. `attr_accessor :title, ...`
+            //    in a transpiled model generates accessors that read/
+            //    write these ivars, but the generated methods aren't
+            //    `def` nodes so flow-sensitive typing can't discover
+            //    them — seed directly from schema metadata.
+            // 3. Memoization ivars (`@_comments`) — discovered by the
+            //    flow-sensitive pre-pass below.
+            let mut class_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            class_ivars.insert(
+                Symbol::from("attributes"),
+                Ty::Hash {
+                    key: Box::new(Ty::Sym),
+                    value: Box::new(Ty::Var { var: crate::ident::TyVar(0) }),
+                },
+            );
+            for (name, ty) in &model.attributes.fields {
+                // Ivar reads may observe nil before the first write;
+                // union with Nil reflects that. The column's declared
+                // type from schema covers the post-initialization case.
+                // union_of so an already-nilable column type dedups
+                // instead of nesting.
+                class_ivars.insert(
+                    name.clone(),
+                    crate::analyze::body::union_of(ty.clone(), Ty::Nil),
+                );
+            }
+            // `attr_accessor :edit_user_id` virtual attributes: real
+            // ivars, untyped, absent from the schema. Seed as gradual
+            // so a direct `@edit_user_id` read resolves (don't clobber
+            // a schema column of the same name).
+            for name in collect_attr_accessor_names(&model.body) {
+                class_ivars.entry(name).or_insert(Ty::Untyped);
+            }
+
+            // Phase 0: type the model's `Unknown` body items so the
+            // RHS of in-class constant assignments (`FLAGGABLE_DAYS = 7`,
+            // `MIN_KARMA_TO_SUGGEST = 50`, `COMMENT_REASONS = {...}`)
+            // gets `value.ty` populated. Without this, the subsequent
+            // const-table extraction sees `None` and the body-typer
+            // falls through to `Ty::Class { id: ConstName }` for every
+            // read — observable as `incompatible_binop` errors
+            // (`Int > Class { MIN_KARMA }`) and `send_dispatch_failed`
+            // (`days` on `Class { NEW_USER_DAYS }`).
+            let const_ctx = Ctx {
+                self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
+                ivar_bindings: class_ivars.clone(),
+                local_bindings: HashMap::new(),
+                class_objects: Default::default(),
+                constants: global_constants.clone(),
+                annotate_self_dispatch: false, in_view: false, class_side: false,
+            };
+            for item in model.body.iter_mut() {
+                if let ModelBodyItem::Unknown { expr, .. } = item {
+                    self.body_typer().analyze_expr(expr, &const_ctx);
+                }
+            }
+            // Own constants layered over the global registry (own shadows).
+            let class_constants = global_constants.with_own(extract_const_assignments(&model.body));
+
+            let class_ctx = Ctx {
+                self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
+                ivar_bindings: class_ivars.clone(),
+                local_bindings: HashMap::new(),
+                class_objects: Default::default(),
+                constants: class_constants.clone(),
+                annotate_self_dispatch: false, in_view: false, class_side: false,
+            };
+
+            // Pass A: type every method body with only `@attributes`
+            // seeded. Assignments inside bodies (e.g. `@_comments = ...`
+            // in a memoizing getter) populate `value.ty` on those
+            // assignments, which Pass B harvests.
+            for scope in model.scopes_mut() {
+                self.body_typer().analyze_expr(&mut scope.body, &class_ctx);
+            }
+            let model_name = model.name.clone();
+            for method in model.methods_mut() {
+                // A default is part of the parameter's type. Typed before
+                // seeding so `value = nil` is `Nil` when no call site has
+                // said otherwise, and a later site can union with it.
+                for param in &mut method.params {
+                    if let Some(default) = &mut param.default {
+                        self.body_typer().analyze_expr(default, &class_ctx);
+                    }
+                }
+                let mctx = self.seed_method_params(&class_ctx, &model_name, method);
+                self.body_typer().analyze_expr(&mut method.body, &mctx);
+            }
+
+            // Pass B: gather every ivar assignment across the model's
+            // methods. Each discovered `@x = value` seeds the ivar's
+            // type for the second typing pass, so reads that occur
+            // *before* the assignment lexically (e.g. the left side of
+            // `@x ||= ...` lowered to `@x || (@x = ...)`) still resolve
+            // cleanly.
+            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
+            for method in model.methods() {
+                extract_ivar_assignments(&method.body, &mut flow_ivars);
+            }
+            for scope in model.scopes() {
+                extract_ivar_assignments(&scope.body, &mut flow_ivars);
+            }
+
+            if !flow_ivars.is_empty() {
+                // Re-seed ctx with discovered ivars alongside @attributes.
+                // Memoizing ivars become `Union<T, Nil>` to reflect that
+                // the read can be nil before the first assignment.
+                let mut reseeded = class_ivars;
+                let initialized = ivars_initialized_by(model.methods());
+                for (name, ty) in flow_ivars {
+                    // `initialize` sets its own ivars before any other method
+                    // runs (see the library-class pass).
+                    let union_ty = if initialized.contains(&name) && !ty.is_open() {
+                        ty
+                    } else {
+                        crate::analyze::body::union_of(ty, Ty::Nil)
+                    };
+                    reseeded.insert(name, union_ty);
+                }
+                let reseeded_ctx = Ctx {
+                    self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
+                    ivar_bindings: reseeded,
+                    local_bindings: HashMap::new(),
+                    class_objects: Default::default(),
+                    constants: class_constants.clone(),
+                    annotate_self_dispatch: false, in_view: false, class_side: false,
+                };
+
+                for scope in model.scopes_mut() {
+                    self.body_typer().analyze_expr(&mut scope.body, &reseeded_ctx);
+                }
+                for method in model.methods_mut() {
+                    let mctx = self.seed_method_params(&reseeded_ctx, &model_name, method);
+                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                }
+            }
+            self.harvest_one_model(model);
+        }
+        drop(_typing_models);
+
         // ── Phase A: type Unknown body items + every action body
         // ── once per controller, with no parent inheritance.
+        let _typing_controllers_a = crate::timings::begin("typing: controllers A");
         for controller in &mut app.controllers {
             // Phase 0: type the controller's `Unknown` body items so
             // in-class constants (`COMMENTS_PER_PAGE = 20`,
@@ -1478,8 +2018,9 @@ impl Analyzer {
                 self_ty: Some(self_ty.clone()),
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
+                class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false,
             };
             for item in controller.body.iter_mut() {
                 if let ControllerBodyItem::Unknown { expr, .. } = item {
@@ -1495,8 +2036,9 @@ impl Analyzer {
                 self_ty: Some(self_ty.clone()),
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
+                class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false,
+                annotate_self_dispatch: false, in_view: false, class_side: false,
             };
 
             // Snapshot this controller's own segment of the filter chain
@@ -1537,7 +2079,23 @@ impl Analyzer {
                     action.block_param.as_ref(),
                 );
                 self.body_typer().analyze_expr(&mut action.body, &mctx);
-                action.effects = self.collect_effects(&mut action.body, &mctx);
+            }
+
+            // The class-side methods (`def self.x`, `class << self`),
+            // typed with `self` the class itself. Nothing reads their
+            // ivars into a view; typing them is what resolves their own
+            // bodies and their harvested return types.
+            for method in controller.body.iter_mut().filter_map(|item| match item {
+                ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } => Some(method),
+                _ => None,
+            }) {
+                for p in &mut method.params {
+                    if let Some(default) = &mut p.default {
+                        self.body_typer().analyze_expr(default, &ctx);
+                    }
+                }
+                let mctx = self.seed_method_params(&ctx, &ctrl_id, method);
+                self.body_typer().analyze_expr(&mut method.body, &mctx);
             }
 
             // Snapshot each action's ivar bindings (this controller's
@@ -1613,7 +2171,6 @@ impl Analyzer {
                     }
                 }
             }
-            let mut concern_effects: HashMap<Symbol, EffectSet> = HashMap::new();
             for module_id in &mixed_in {
                 let Some(methods) = module_methods.get(module_id) else { continue };
                 for method in methods {
@@ -1633,20 +2190,13 @@ impl Analyzer {
                     // as a resolution target for
                     // `collect_transitive_filter_ivars`.
                     action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
-                    let effects = self.collect_effects(&mut body, &ctx);
-                    if !effects.is_pure() {
-                        concern_effects.entry(method.name.clone()).or_insert(effects);
-                    }
                 }
             }
 
-            // Per-method effect snapshot for the persisted chain: own
-            // methods (typed by Pass A) overwrite concern methods —
-            // a shadowed module method never runs.
-            let mut action_effects = concern_effects;
-            for action in controller.actions() {
-                action_effects.insert(action.name.clone(), action.effects.clone());
-            }
+            // Effect sets for the persisted chain are stamped once after
+            // the typing fixpoint (`stamp_body_effects`); this snapshot
+            // is empty here and patched from the converged trees.
+            let action_effects: HashMap<Symbol, EffectSet> = HashMap::new();
 
             let layout = controller.layout.clone();
             meta_by_name.insert(
@@ -1662,6 +2212,7 @@ impl Analyzer {
                 },
             );
         }
+        drop(_typing_controllers_a);
 
         // Controller→layout-view ivar channel: every action that
         // renders also flows its ivars into whatever layout wraps it
@@ -1702,6 +2253,7 @@ impl Analyzer {
         // Action bindings are merged with NEAREST parent first so the
         // closest definition wins on name conflicts (mirrors Ruby
         // method-resolution order).
+        let _typing_controllers_b = crate::timings::begin("typing: controllers B");
         for controller in &mut app.controllers {
             let ctrl_name = controller.name.clone();
             let Some(meta) = meta_by_name.get(&ctrl_name) else { continue };
@@ -1822,15 +2374,16 @@ impl Analyzer {
             // Phase-B refinement layer — it exists only to give
             // `collect_transitive_filter_ivars` a body to resolve a
             // filter target's own receiverless calls into, immediately
-            // below.
-            let mut chained_bodies: HashMap<Symbol, Expr> = HashMap::new();
+            // below. Borrowed from `action_bodies` so we do not clone
+            // every ancestor filter-target tree per controller per round.
+            let mut chained_bodies: HashMap<Symbol, &Expr> = HashMap::new();
             for (_, ancestor) in ancestors.iter().rev() {
                 for (name, body) in &ancestor.action_bodies {
-                    chained_bodies.insert(name.clone(), body.clone());
+                    chained_bodies.insert(name.clone(), body);
                 }
             }
             for (name, body) in &meta.action_bodies {
-                chained_bodies.insert(name.clone(), body.clone());
+                chained_bodies.insert(name.clone(), body);
             }
 
             // Transitive filter-target ivar writes: a Before/Around
@@ -1955,8 +2508,9 @@ impl Analyzer {
                             self_ty: Some(meta.self_ty.clone()),
                             ivar_bindings: seed,
                             local_bindings: HashMap::new(),
+                            class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
-                            annotate_self_dispatch: false, in_view: false,
+                            annotate_self_dispatch: false, in_view: false, class_side: false,
                         };
                         // Seed helper-method params from the inferred-params
                         // table too, so `period(query)`'s body resolves on
@@ -1975,7 +2529,6 @@ impl Analyzer {
                             action.block_param.as_ref(),
                         );
                         self.body_typer().analyze_expr(&mut action.body, &inner_ctx);
-                        action.effects = self.collect_effects(&mut action.body, &inner_ctx);
                     }
                 }
 
@@ -2370,6 +2923,7 @@ impl Analyzer {
             }
 
         }
+        drop(_typing_controllers_b);
         // Flush Phase B's refinements. Later rounds of the whole-program
         // fixpoint read them back through `layer` above, which is what
         // carries a parent's refined binding down to a subclass.
@@ -2403,6 +2957,7 @@ impl Analyzer {
         // the controller's own binding still wins wherever it has one, and
         // only names the includer lacks are filled from the concern.
         if !app.concern_spliced_actions.is_empty() {
+            let _typing_concerns = crate::timings::begin("typing: concern splice");
             let concern_env =
                 concern_ivar_env_of(app, &controller_ivar_env, &module_includes);
             let origins = app.concern_spliced_actions.clone();
@@ -2440,9 +2995,10 @@ impl Analyzer {
                         self_ty: Some(self_ty.clone()),
                         ivar_bindings: seed,
                         local_bindings: HashMap::new(),
+                        class_objects: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false,
+                        in_view: false, class_side: false,
                     };
                     let origin = app
                         .concern_spliced_actions
@@ -2458,149 +3014,9 @@ impl Analyzer {
                         action.block_param.as_ref(),
                     );
                     self.body_typer().analyze_expr(&mut action.body, &inner_ctx);
-                    action.effects = self.collect_effects(&mut action.body, &inner_ctx);
                 }
             }
         }
-        for model in &mut app.models {
-            // Seed class ivars for the body-typer. Three shapes in play:
-            // 1. `@attributes` — the legacy Hash-storage access path
-            //    (some transpiled patterns still use it).
-            // 2. Per-schema-column ivars (`@title`, `@body`, ...) — the
-            //    typed-field representation. `attr_accessor :title, ...`
-            //    in a transpiled model generates accessors that read/
-            //    write these ivars, but the generated methods aren't
-            //    `def` nodes so flow-sensitive typing can't discover
-            //    them — seed directly from schema metadata.
-            // 3. Memoization ivars (`@_comments`) — discovered by the
-            //    flow-sensitive pre-pass below.
-            let mut class_ivars: HashMap<Symbol, Ty> = HashMap::new();
-            class_ivars.insert(
-                Symbol::from("attributes"),
-                Ty::Hash {
-                    key: Box::new(Ty::Sym),
-                    value: Box::new(Ty::Var { var: crate::ident::TyVar(0) }),
-                },
-            );
-            for (name, ty) in &model.attributes.fields {
-                // Ivar reads may observe nil before the first write;
-                // union with Nil reflects that. The column's declared
-                // type from schema covers the post-initialization case.
-                // union_of so an already-nilable column type dedups
-                // instead of nesting.
-                class_ivars.insert(
-                    name.clone(),
-                    crate::analyze::body::union_of(ty.clone(), Ty::Nil),
-                );
-            }
-            // `attr_accessor :edit_user_id` virtual attributes: real
-            // ivars, untyped, absent from the schema. Seed as gradual
-            // so a direct `@edit_user_id` read resolves (don't clobber
-            // a schema column of the same name).
-            for name in collect_attr_accessor_names(&model.body) {
-                class_ivars.entry(name).or_insert(Ty::Untyped);
-            }
-
-            // Phase 0: type the model's `Unknown` body items so the
-            // RHS of in-class constant assignments (`FLAGGABLE_DAYS = 7`,
-            // `MIN_KARMA_TO_SUGGEST = 50`, `COMMENT_REASONS = {...}`)
-            // gets `value.ty` populated. Without this, the subsequent
-            // const-table extraction sees `None` and the body-typer
-            // falls through to `Ty::Class { id: ConstName }` for every
-            // read — observable as `incompatible_binop` errors
-            // (`Int > Class { MIN_KARMA }`) and `send_dispatch_failed`
-            // (`days` on `Class { NEW_USER_DAYS }`).
-            let const_ctx = Ctx {
-                self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
-                ivar_bindings: class_ivars.clone(),
-                local_bindings: HashMap::new(),
-                constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false,
-            };
-            for item in model.body.iter_mut() {
-                if let ModelBodyItem::Unknown { expr, .. } = item {
-                    self.body_typer().analyze_expr(expr, &const_ctx);
-                }
-            }
-            // Own constants layered over the global registry (own shadows).
-            let class_constants = global_constants.with_own(extract_const_assignments(&model.body));
-
-            let class_ctx = Ctx {
-                self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
-                ivar_bindings: class_ivars.clone(),
-                local_bindings: HashMap::new(),
-                constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false,
-            };
-
-            // Pass A: type every method body with only `@attributes`
-            // seeded. Assignments inside bodies (e.g. `@_comments = ...`
-            // in a memoizing getter) populate `value.ty` on those
-            // assignments, which Pass B harvests.
-            for scope in model.scopes_mut() {
-                self.body_typer().analyze_expr(&mut scope.body, &class_ctx);
-            }
-            let model_name = model.name.clone();
-            for method in model.methods_mut() {
-                // A default is part of the parameter's type. Typed before
-                // seeding so `value = nil` is `Nil` when no call site has
-                // said otherwise, and a later site can union with it.
-                for param in &mut method.params {
-                    if let Some(default) = &mut param.default {
-                        self.body_typer().analyze_expr(default, &class_ctx);
-                    }
-                }
-                let mctx = self.seed_method_params(&class_ctx, &model_name, method);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
-            }
-
-            // Pass B: gather every ivar assignment across the model's
-            // methods. Each discovered `@x = value` seeds the ivar's
-            // type for the second typing pass, so reads that occur
-            // *before* the assignment lexically (e.g. the left side of
-            // `@x ||= ...` lowered to `@x || (@x = ...)`) still resolve
-            // cleanly.
-            let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
-            for method in model.methods() {
-                extract_ivar_assignments(&method.body, &mut flow_ivars);
-            }
-            for scope in model.scopes() {
-                extract_ivar_assignments(&scope.body, &mut flow_ivars);
-            }
-
-            if !flow_ivars.is_empty() {
-                // Re-seed ctx with discovered ivars alongside @attributes.
-                // Memoizing ivars become `Union<T, Nil>` to reflect that
-                // the read can be nil before the first assignment.
-                let mut reseeded = class_ivars;
-                for (name, ty) in flow_ivars {
-                    let union_ty = crate::analyze::body::union_of(ty, Ty::Nil);
-                    reseeded.insert(name, union_ty);
-                }
-                let reseeded_ctx = Ctx {
-                    self_ty: Some(Ty::Class { id: model.name.clone(), args: vec![] }),
-                    ivar_bindings: reseeded,
-                    local_bindings: HashMap::new(),
-                    constants: class_constants.clone(),
-                    annotate_self_dispatch: false, in_view: false,
-                };
-
-                for scope in model.scopes_mut() {
-                    self.body_typer().analyze_expr(&mut scope.body, &reseeded_ctx);
-                }
-                for method in model.methods_mut() {
-                    let mctx = self.seed_method_params(&reseeded_ctx, &model_name, method);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
-                    method.effects = self.collect_effects(&mut method.body, &mctx);
-                }
-            } else {
-                for method in model.methods_mut() {
-                    let mctx = self.seed_method_params(&class_ctx, &model_name, method);
-                    method.effects = self.collect_effects(&mut method.body, &mctx);
-                }
-            }
-        }
-
         // Library classes (non-model classes under app/models/): mirror
         // the per-model body typing pass on a smaller surface — no
         // schema attributes, no associations, just methods. Two-pass
@@ -2703,6 +3119,7 @@ impl Analyzer {
         let mailer_with_params = harvest_mailer_with_params(app, &mailer_names);
         let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::new();
 
+        let _typing_library = crate::timings::begin("typing: library");
         for lc in &mut app.library_classes {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 self.classes
@@ -2720,7 +3137,8 @@ impl Analyzer {
                 self_ty: Some(Ty::Class { id: self_id, args: vec![] }),
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
-                constants: Default::default(), annotate_self_dispatch: false, in_view: false,
+                class_objects: Default::default(),
+                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
             };
 
             for initializer in &mut lc.class_ivar_initializers {
@@ -2829,6 +3247,7 @@ impl Analyzer {
                 }
             }
 
+            let initialized = ivars_initialized_by(lc.methods.iter());
             if !flow_ivars.is_empty() {
                 let mut reseeded: HashMap<Symbol, Ty> = HashMap::new();
                 for (name, ty) in flow_ivars {
@@ -2841,7 +3260,12 @@ impl Analyzer {
                     // Union { User, Nil }` on the very next hop — the
                     // same reasoning the controller-wide seed's
                     // `strip_nil` already carries.
-                    let seeded = if is_current_attributes {
+                    // Nor for an ivar `initialize` assigns as one of its own
+                    // statements: it is set before any other method can run,
+                    // so `@total = T.let(attrs[:total], Money)` reads as a
+                    // `Money` everywhere, not `Money?`. The union with the
+                    // other writes already keeps a `nil` some method writes.
+                    let seeded = if is_current_attributes || (initialized.contains(&name) && !ty.is_open()) {
                         ty
                     } else {
                         crate::analyze::body::union_of(ty, Ty::Nil)
@@ -2852,19 +3276,19 @@ impl Analyzer {
                     self_ty: class_ctx.self_ty.clone(),
                     ivar_bindings: reseeded,
                     local_bindings: HashMap::new(),
-                    constants: Default::default(), annotate_self_dispatch: false, in_view: false,
+                    class_objects: Default::default(),
+                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method);
                     self.body_typer().analyze_expr(&mut method.body, &mctx);
-                    method.effects = self.collect_effects(&mut method.body, &mctx);
-                }
-            } else {
-                for method in &mut lc.methods {
-                    let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
-                    method.effects = self.collect_effects(&mut method.body, &mctx);
                 }
             }
+        }
+        drop(_typing_library);
+
+        if !type_views_and_tests {
+            return;
         }
 
         // Partial-locals channel: we need action/top-level views analyzed first
@@ -2894,6 +3318,7 @@ impl Analyzer {
         // Phase 3a: non-partial views (action views + layouts). Analyze with
         // the controller→view ivar seed, then walk the body to record every
         // `render` call's effect on partial_locals_by_name.
+        let _typing_views = crate::timings::begin("typing: views");
         for view in &mut app.views {
             if is_partial_view_name(&view.name) {
                 continue;
@@ -3130,10 +3555,13 @@ impl Analyzer {
             .iter()
             .map(|(view, locals)| (view.clone(), locals.clone()))
             .collect();
+        drop(_typing_views);
 
         // Type the ORIGINAL test scopes, before source contracts inspect
         // them. Emission later clones/rewrites these bodies; it is too late
         // for that typing to establish a source admission fact.
+
+        let _typing_tests = crate::timings::begin("typing: tests");
         self.type_test_modules(app, &global_constants);
 
         // Seeds body (db/seeds.rb). Top-level Ruby: no `self`, no
@@ -3141,13 +3569,14 @@ impl Analyzer {
         // that references model classes. Types so that Send effects
         // flow (DbWrite on `Article.create!`, DbRead on
         // `Article.count`), which the emitter uses for await
-        // placement under async adapters.
+        // placement under async adapters. Effects themselves are
+        // stamped once after the typing fixpoint.
         if let Some(expr) = app.seeds.as_mut() {
             let mut ctx = Ctx::default();
             ctx.constants = global_constants.clone();
             self.body_typer().analyze_expr(expr, &ctx);
-            let _ = self.collect_effects(expr, &ctx);
         }
+        drop(_typing_tests);
     }
 
 
@@ -3165,6 +3594,15 @@ impl Analyzer {
     /// its parameters and so does the `MethodDef`, and for keyword
     /// arguments the two orders can differ.
     ///
+    /// `positional` is the parameter's index among the method's
+    /// POSITIONAL parameters, or `None` for a keyword or rest one. The
+    /// position fallback counts only the declared positional parameters:
+    /// the table is keyed by name alone, so a signature may belong to a
+    /// different arity (a concern's instance method and the class method
+    /// it contributes share a name), and reading a declared KEYWORD
+    /// parameter as the def's first positional one typed `variants` as
+    /// `bool`.
+    ///
     /// Used only where inference has nothing better — see the call
     /// sites. A declaration is worth reading where inference runs out,
     /// which for a parameter is the common case: its type is a fact
@@ -3174,7 +3612,7 @@ impl Analyzer {
         &self,
         class_id: &ClassId,
         method: &Symbol,
-        index: usize,
+        positional: Option<usize>,
         name: &Symbol,
     ) -> Option<Ty> {
         let cls = self.classes.get(class_id)?;
@@ -3183,8 +3621,49 @@ impl Analyzer {
             .get(method)
             .or_else(|| cls.class_methods.get(method))?;
         let Ty::Fn { params, .. } = ty else { return None };
-        let found = params.iter().find(|p| p.name == *name).or_else(|| params.get(index))?;
+        let found = params.iter().find(|p| p.name == *name).or_else(|| {
+            let n = positional?;
+            params
+                .iter()
+                .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional))
+                .nth(n)
+        })?;
         (!matches!(found.ty, Ty::Var { .. } | Ty::Untyped)).then(|| found.ty.clone())
+    }
+
+    /// Whether a signature says this parameter is `untyped`, in as many
+    /// words. That is a statement, unlike an unannotated parameter (whose
+    /// slot is an inference gap): the author opted the parameter out of
+    /// typing, and what the call sites happen to pass says nothing about
+    /// what the body must accept. `#: (untyped, untyped) -> bool` on a
+    /// comparator that is handed Money, Integers and Strings is the shape.
+    fn declared_untyped_param(
+        &self,
+        class_id: &ClassId,
+        method: &Symbol,
+        positional: Option<usize>,
+        name: &Symbol,
+    ) -> bool {
+        if !self.declared_signatures.contains(&(class_id.clone(), method.clone())) {
+            return false;
+        }
+        let Some(cls) = self.classes.get(class_id) else { return false };
+        let Some(Ty::Fn { params, .. }) =
+            cls.instance_methods.get(method).or_else(|| cls.class_methods.get(method))
+        else {
+            return false;
+        };
+        params
+            .iter()
+            .find(|p| p.name == *name)
+            .or_else(|| {
+                let n = positional?;
+                params
+                    .iter()
+                    .filter(|p| matches!(p.kind, crate::ty::ParamKind::Required | crate::ty::ParamKind::Optional))
+                    .nth(n)
+            })
+            .is_some_and(|p| matches!(p.ty, Ty::Untyped))
     }
 
     fn seed_method_params(
@@ -3196,21 +3675,33 @@ impl Analyzer {
         let key = (class_id.clone(), method.name.clone());
         let observed = self.inferred_params.get(&key);
         let mut ctx = base.clone();
+        ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
+        let mut positional_seen = 0usize;
         for (i, param) in method.params.iter().enumerate() {
+            let is_positional = !param.keyword && !param.rest && !param.from_keyword;
+            let positional = is_positional.then_some(positional_seen);
+            positional_seen += usize::from(is_positional);
+            if self.declared_untyped_param(class_id, &method.name, positional, &param.name) {
+                ctx.local_bindings.insert(param.name.clone(), Ty::Untyped);
+                continue;
+            }
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
-            // A declared type fills in where the call sites said
-            // nothing. Strictly additive: an observed type that IS
-            // something keeps winning, so nothing that resolves today
-            // resolves differently.
-            let ty = match &seeded {
-                Some(t) if !matches!(t, Ty::Var { .. }) => seeded.clone(),
-                _ => self
-                    .declared_param_ty(class_id, &method.name, i, &param.name)
-                    .or_else(|| seeded.clone()),
-            };
+            let ty = prefer_declared(
+                self.declared_param_ty(class_id, &method.name, positional, &param.name),
+                seeded,
+            );
             if let Some(ty) = ty {
                 ctx.local_bindings.insert(param.name.clone(), ty);
+            }
+        }
+        // An indexed module's Ruby callback gets its host as a Module object,
+        // even when the hook is dormant and no explicit call site supplies types.
+        if ctx.class_side && self.classes.get(class_id).is_some_and(|c| c.is_module)
+            && matches!(method.name.as_str(), "included" | "prepended" | "append_features" | "prepend_features")
+        {
+            if let Some(param) = method.params.first().filter(|p| !p.keyword && !p.rest) {
+                ctx.class_objects.insert(param.name.clone());
             }
         }
         if let Some(bp) = &method.block_param {
@@ -3242,14 +3733,20 @@ impl Analyzer {
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
         let mut ctx = base.clone();
         for (i, name) in params.fields.keys().enumerate() {
+            if self.declared_untyped_param(class_id, action_name, Some(i), name) {
+                ctx.local_bindings.insert(name.clone(), Ty::Untyped);
+                continue;
+            }
             let observed = [own, from_origin]
                 .into_iter()
                 .flatten()
                 .filter_map(|v| v.get(i).cloned())
                 .filter(|t| !matches!(t, Ty::Var { .. }))
                 .reduce(unify_param_ty);
-            let ty = observed
-                .or_else(|| self.declared_param_ty(class_id, action_name, i, name));
+            let ty = prefer_declared(
+                self.declared_param_ty(class_id, action_name, Some(i), name),
+                observed,
+            );
             if let Some(ty) = ty {
                 ctx.local_bindings.insert(name.clone(), ty);
             }
@@ -3259,12 +3756,12 @@ impl Analyzer {
         // index to read an observation from. The declaration is the
         // only source, which is the case the signature readers exist
         // for.
-        for (i, (name, _)) in kw_params.iter().enumerate() {
+        for (name, _) in kw_params.iter() {
             if ctx.local_bindings.contains_key(name) {
                 continue;
             }
             if let Some(ty) =
-                self.declared_param_ty(class_id, action_name, params.fields.len() + i, name)
+                self.declared_param_ty(class_id, action_name, None, name)
             {
                 ctx.local_bindings.insert(name.clone(), ty);
             }
@@ -3275,36 +3772,35 @@ impl Analyzer {
         ctx
     }
 
-    /// Fingerprint of the data the fixpoint refines: per-class
-    /// instance/class method return types in `self.classes` plus the
-    /// parameter-type table in `self.inferred_params`. The fixpoint
-    /// loop in `analyze` compares fingerprints between iterations and
-    /// stops when they match. Order-independent so HashMap iteration
-    /// order doesn't perturb results: keys are sorted before
-    /// stringification.
-    fn inference_signature(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut class_keys: Vec<&ClassId> = self.classes.keys().collect();
-        class_keys.sort_by_key(|k| k.0.as_str().to_string());
-        for cid in class_keys {
-            let cls = &self.classes[cid];
-            let mut method_keys: Vec<&Symbol> = cls.instance_methods.keys().collect();
-            method_keys.sort_by_key(|k| k.as_str().to_string());
-            for m in method_keys {
-                parts.push(format!("{}#{}={:?}", cid.0.as_str(), m.as_str(), cls.instance_methods[m]));
+    fn capture_inference_sig(&self) -> InferenceSig {
+        let mut instance = HashMap::with_capacity(self.classes.len());
+        let mut class_methods = HashMap::with_capacity(self.classes.len());
+        for (id, cls) in &self.classes {
+            instance.insert(id.clone(), cls.instance_methods.clone());
+            class_methods.insert(id.clone(), cls.class_methods.clone());
+        }
+        InferenceSig {
+            instance,
+            class_methods,
+            params: self.inferred_params.clone(),
+        }
+    }
+
+    fn inference_matches(&self, prev: &InferenceSig) -> bool {
+        if self.classes.len() != prev.instance.len() || self.inferred_params != prev.params {
+            return false;
+        }
+        for (id, cls) in &self.classes {
+            match prev.instance.get(id) {
+                Some(methods) if methods == &cls.instance_methods => {}
+                _ => return false,
             }
-            let mut cmethod_keys: Vec<&Symbol> = cls.class_methods.keys().collect();
-            cmethod_keys.sort_by_key(|k| k.as_str().to_string());
-            for m in cmethod_keys {
-                parts.push(format!("{}.{}={:?}", cid.0.as_str(), m.as_str(), cls.class_methods[m]));
+            match prev.class_methods.get(id) {
+                Some(methods) if methods == &cls.class_methods => {}
+                _ => return false,
             }
         }
-        let mut param_keys: Vec<&(ClassId, Symbol)> = self.inferred_params.keys().collect();
-        param_keys.sort_by_key(|(c, m)| (c.0.as_str().to_string(), m.as_str().to_string()));
-        for k in param_keys {
-            parts.push(format!("{}#{}~{:?}", k.0.0.as_str(), k.1.as_str(), self.inferred_params[k]));
-        }
-        parts.join("|")
+        true
     }
 
     /// Walk every model + library_class method body and write its
@@ -3315,8 +3811,8 @@ impl Analyzer {
     /// RBS-derived `Ty::Fn` is preserved — its return is already what
     /// dispatch resolves to via `unwrap_fn_ret`). Skip methods whose
     /// body is `Ty::Var` (no information gained).
-    fn harvest_returns_to_registry(&mut self, app: &App) {
-        self.harvest_method_returns(app);
+    fn harvest_returns_to_registry(&mut self, app: &App, harvest_tests: bool) {
+        self.harvest_method_returns(app, harvest_tests);
         // Rails' `helper_method :name` makes a controller (or concern)
         // method callable from templates. The names were ingested from
         // both spellings (`App::view_visible_controller_methods`); the
@@ -3339,36 +3835,59 @@ impl Analyzer {
         }
     }
 
-    fn harvest_method_returns(&mut self, app: &App) {
-        for model in &app.models {
-            let class_id = &model.name;
-            let scope_names: std::collections::HashSet<Symbol> =
-                model.scopes().map(|s| s.name.clone()).collect();
-            for method in model.methods() {
-                let ret = self.method_return_ty(class_id, method);
-                let target = match method.receiver {
-                    crate::dialect::MethodReceiver::Instance => {
-                        &mut self.classes.entry(class_id.clone()).or_default().instance_methods
-                    }
-                    crate::dialect::MethodReceiver::Class => {
-                        &mut self.classes.entry(class_id.clone()).or_default().class_methods
-                    }
-                };
-                // A class method whose body tail is a query-builder
-                // chain declares `Relation { of: Self }` to callers —
-                // the same relation type a scope seeds — overriding
-                // the body's `Array<Self>` typing (inside the body the
-                // chain keeps the inline-chain Array representation;
-                // the relation type is introduced at the boundary).
-                // This is what lets `Story.recent.for_user(u)`
-                // delegate `for_user` on the relation receiver.
-                if method.receiver == crate::dialect::MethodReceiver::Class
-                    && body_tail_yields_relation(&method.body, class_id, &scope_names)
+    fn harvest_one_model(&mut self, model: &Model) {
+        let class_id = &model.name;
+        let scope_names: std::collections::HashSet<Symbol> =
+            model.scopes().map(|s| s.name.clone()).collect();
+        for method in model.methods() {
+            let ret = self.method_return_ty(class_id, method);
+            let target = match method.receiver {
+                crate::dialect::MethodReceiver::Instance => {
+                    &mut self.classes.entry(class_id.clone()).or_default().instance_methods
+                }
+                crate::dialect::MethodReceiver::Class => {
+                    &mut self.classes.entry(class_id.clone()).or_default().class_methods
+                }
+            };
+            // A class method whose body tail is a query-builder
+            // chain declares `Relation { of: Self }` to callers —
+            // the same relation type a scope seeds — overriding
+            // the body's `Array<Self>` typing (inside the body the
+            // chain keeps the inline-chain Array representation;
+            // the relation type is introduced at the boundary).
+            // This is what lets `Story.recent.for_user(u)`
+            // delegate `for_user` on the relation receiver.
+            if method.receiver == crate::dialect::MethodReceiver::Class
+                && body_tail_yields_relation(&method.body, class_id, &scope_names)
+            {
+                Self::insert_inferred_return(
+                    target,
+                    &method.name,
+                    Ty::Relation { of: class_id.clone() },
+                );
+                self.classes
+                    .entry(class_id.clone())
+                    .or_default()
+                    .relation_derived
+                    .insert(method.name.clone());
+                continue;
+            }
+            // …and the half that TERMINATES the chain rather than
+            // extending it: `def self.original; order(:created_at)
+            // .first; end` returns a record, not a relation, but it
+            // is just as much a query over this model and Rails
+            // delegates it on a relation receiver the same way.
+            // Marked `relation_derived` so that delegation can tell
+            // it apart from a class method that merely happens to
+            // return a record.
+            if method.receiver == crate::dialect::MethodReceiver::Class {
+                if let Some(kind) =
+                    body_tail_terminal_kind(&method.body, class_id, &scope_names)
                 {
                     Self::insert_inferred_return(
                         target,
                         &method.name,
-                        Ty::Relation { of: class_id.clone() },
+                        instantiate_return_kind(kind, class_id),
                     );
                     self.classes
                         .entry(class_id.clone())
@@ -3377,33 +3896,14 @@ impl Analyzer {
                         .insert(method.name.clone());
                     continue;
                 }
-                // …and the half that TERMINATES the chain rather than
-                // extending it: `def self.original; order(:created_at)
-                // .first; end` returns a record, not a relation, but it
-                // is just as much a query over this model and Rails
-                // delegates it on a relation receiver the same way.
-                // Marked `relation_derived` so that delegation can tell
-                // it apart from a class method that merely happens to
-                // return a record.
-                if method.receiver == crate::dialect::MethodReceiver::Class {
-                    if let Some(kind) =
-                        body_tail_terminal_kind(&method.body, class_id, &scope_names)
-                    {
-                        Self::insert_inferred_return(
-                            target,
-                            &method.name,
-                            instantiate_return_kind(kind, class_id),
-                        );
-                        self.classes
-                            .entry(class_id.clone())
-                            .or_default()
-                            .relation_derived
-                            .insert(method.name.clone());
-                        continue;
-                    }
-                }
-                Self::register_method_return(target, &method.name, ret.as_ref());
             }
+            Self::register_method_return(target, &method.name, ret.as_ref());
+        }
+    }
+
+    fn harvest_method_returns(&mut self, app: &App, harvest_tests: bool) {
+        for model in &app.models {
+            self.harvest_one_model(model);
         }
         for lc in &app.library_classes {
             let class_id = &lc.name;
@@ -3426,15 +3926,17 @@ impl Analyzer {
                 Self::register_method_return(target, &method.name, ret.as_ref());
             }
         }
-        for module in &app.test_modules {
-            for method in &module.helpers {
-                let ret = self.method_return_ty(&module.name, method);
-                let class = self.classes.entry(module.name.clone()).or_default();
-                let table = match method.receiver {
-                    crate::dialect::MethodReceiver::Instance => &mut class.instance_methods,
-                    crate::dialect::MethodReceiver::Class => &mut class.class_methods,
-                };
-                Self::register_method_return(table, &method.name, ret.as_ref());
+        if harvest_tests {
+            for module in &app.test_modules {
+                for method in &module.helpers {
+                    let ret = self.method_return_ty(&module.name, method);
+                    let class = self.classes.entry(module.name.clone()).or_default();
+                    let table = match method.receiver {
+                        crate::dialect::MethodReceiver::Instance => &mut class.instance_methods,
+                        crate::dialect::MethodReceiver::Class => &mut class.class_methods,
+                    };
+                    Self::register_method_return(table, &method.name, ret.as_ref());
+                }
             }
         }
         // Controllers: harvest each action/helper method's return type so a
@@ -3445,6 +3947,10 @@ impl Analyzer {
         // no class-receiver variant).
         for controller in &app.controllers {
             let class_id = &controller.name;
+            // Class-side methods register like a library class's: the
+            // method exists whether or not its body can be typed, so a
+            // call to it resolves to the inferred return or to Untyped
+            // rather than "no known method".
             for method in controller.class_methods() {
                 let ret = self.method_return_ty(class_id, method);
                 let target = &mut self.classes.entry(class_id.clone()).or_default().class_methods;
@@ -3468,6 +3974,7 @@ impl Analyzer {
         self.harvest_block_value_methods(app);
         self.fold_concern_surfaces(app);
         self.fold_host_surfaces(app);
+        self.fold_extended_modules(app);
         self.fold_current_attribute_forwarders(app);
     }
 
@@ -3568,6 +4075,97 @@ impl Analyzer {
     /// (rather than chasing includes at dispatch time) means every
     /// consumer — dispatch, `ide::members_of`, completion — sees the
     /// mixed-in surface identically.
+
+    /// `extend Mod` in a class body: Mod's INSTANCE methods become the
+    /// class's singleton methods (`extend TrackCurrent` gives `User.current`,
+    /// `User.with_current`). Folded the way an `include`d module's surface
+    /// is, onto the class-side table, with the class's own methods winning.
+    /// `extend self` is the module-function idiom, handled at ingest.
+    fn fold_extended_modules(&mut self, app: &App) {
+        let mut wanted: Vec<(ClassId, Vec<ClassId>)> = Vec::new();
+        let extends_of = |exprs: &mut dyn Iterator<Item = &Expr>, owner: &ClassId| {
+            let mut out: Vec<ClassId> = Vec::new();
+            for expr in exprs {
+                let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+                if method.as_str() != "extend" {
+                    continue;
+                }
+                for arg in args {
+                    let ExprNode::Const { path } = &*arg.node else { continue };
+                    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    // Lexical resolution: the enclosing scopes outward.
+                    let mut scope: Vec<&str> = owner.0.as_str().split("::").collect();
+                    let mut resolved = None;
+                    loop {
+                        let candidate = if scope.is_empty() {
+                            written.clone()
+                        } else {
+                            format!("{}::{written}", scope.join("::"))
+                        };
+                        if self.classes.contains_key(&ClassId(Symbol::from(candidate.as_str()))) {
+                            resolved = Some(ClassId(Symbol::from(candidate.as_str())));
+                            break;
+                        }
+                        if scope.is_empty() {
+                            break;
+                        }
+                        scope.pop();
+                    }
+                    if let Some(id) = resolved {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        };
+        for model in &app.models {
+            let mut items = model.body.iter().filter_map(|item| match item {
+                ModelBodyItem::Unknown { expr, .. } => Some(expr),
+                _ => None,
+            });
+            let ext = extends_of(&mut items, &model.name);
+            if !ext.is_empty() {
+                wanted.push((model.name.clone(), ext));
+            }
+        }
+        for lc in &app.library_classes {
+            let ext = extends_of(&mut lc.unknown_calls.iter(), &lc.name);
+            if !ext.is_empty() {
+                wanted.push((lc.name.clone(), ext));
+            }
+        }
+        let module_ids: std::collections::HashSet<&ClassId> =
+            app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
+        for (id, modules) in wanted {
+            let mut queue = modules;
+            let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
+            let mut qi = 0;
+            while qi < queue.len() {
+                let m = queue[qi].clone();
+                qi += 1;
+                if !module_ids.contains(&m) {
+                    continue;
+                }
+                let Some(module) = self.classes.get(&m) else { continue };
+                let inst = module.instance_methods.clone();
+                for n in module.includes.clone() {
+                    if seen.insert(n.clone()) {
+                        queue.push(n);
+                    }
+                }
+                let folded = self.concern_folded.entry(id.clone()).or_default();
+                let cls = self.classes.entry(id.clone()).or_default();
+                for (name, ty) in inst {
+                    if cls.class_methods.contains_key(&name) && !folded.1.contains(&name) {
+                        continue;
+                    }
+                    cls.class_methods.insert(name.clone(), ty);
+                    folded.1.insert(name);
+                }
+            }
+        }
+    }
+
     fn fold_concern_surfaces(&mut self, app: &App) {
         type Surface = (HashMap<Symbol, Ty>, HashMap<Symbol, Ty>, Vec<ClassId>);
         let module_surfaces: HashMap<ClassId, Surface> = app
@@ -3886,12 +4484,7 @@ impl Analyzer {
         method: &Symbol,
         ty: Ty,
     ) {
-        match table.get(method) {
-            Some(Ty::Fn { .. }) => return,
-            Some(existing) if !matches!(existing, Ty::Var { .. }) && existing == &ty => return,
-            _ => {}
-        }
-        table.insert(method.clone(), ty);
+        harvest_return::insert_inferred_return(table, method, ty);
     }
 
     /// Walk every Send across the app, look up each call's target
@@ -3901,7 +4494,7 @@ impl Analyzer {
     /// at a higher level — we work with structured `Ty` values rather
     /// than string fingerprints, so unification is direct: same type →
     /// keep; nil + T → T?; otherwise → union widen.
-    fn unify_params_from_call_sites(&mut self, app: &App) {
+    fn unify_params_from_call_sites(&mut self, app: &App, scope: UnifyScope) {
         // Rebuilt from scratch every fixpoint round. The table is pure
         // derived state — a function of the types the last typing pass
         // wrote onto the call-site argument expressions — and carrying
@@ -3930,8 +4523,8 @@ impl Analyzer {
             for method in model.methods() {
                 self.collect_send_sites(&method.body, Some(&model.name), helpers, &mut sites);
             }
-            for scope in model.scopes() {
-                self.collect_send_sites(&scope.body, Some(&model.name), helpers, &mut sites);
+            for scope_item in model.scopes() {
+                self.collect_send_sites(&scope_item.body, Some(&model.name), helpers, &mut sites);
             }
         }
         for lc in &app.library_classes {
@@ -3939,6 +4532,55 @@ impl Analyzer {
                 self.collect_send_sites(&method.body, Some(&lc.name), helpers, &mut sites);
             }
         }
+        for controller in &app.controllers {
+            for action in controller.actions() {
+                self.collect_send_sites(&action.body, Some(&controller.name), helpers, &mut sites);
+            }
+            for method in controller.class_methods() {
+                self.collect_send_sites(&method.body, Some(&controller.name), helpers, &mut sites);
+            }
+        }
+        if matches!(scope, UnifyScope::WithViews) {
+            for view in &app.views {
+                self.collect_send_sites(&view.body, None, helpers, &mut sites);
+            }
+            if let Some(seeds) = &app.seeds {
+                self.collect_send_sites(seeds, None, helpers, &mut sites);
+            }
+        }
+
+        self.apply_param_sites(sites, &params_by_method, &defined);
+        // Production signatures keep their production callers' shape.
+        // Fold before adding test-owned observations: a same-named test
+        // helper must not feed an included production concern either.
+        self.fold_concern_param_sites(app);
+    }
+
+    /// Replay production+view param observations, then overlay typed
+    /// test call sites. Test-only retype rounds do not walk view trees
+    /// again — those bodies did not change.
+    fn unify_test_params_onto(
+        &mut self,
+        app: &App,
+        snapshot: &HashMap<(ClassId, Symbol), Vec<Ty>>,
+    ) {
+        self.inferred_params.clone_from(snapshot);
+        self.overlay_test_params(app);
+    }
+
+    fn overlay_test_params(&mut self, app: &App) {
+        let helpers = &app.helper_method_index;
+        let params_by_method = Self::param_shapes(app);
+        let defined = Self::defined_methods(app);
+        let test_sites = self.collect_test_param_sites(app, helpers);
+        self.apply_param_sites(test_sites, &params_by_method, &defined);
+    }
+
+    fn collect_test_param_sites(
+        &self,
+        app: &App,
+        helpers: &HashMap<Symbol, ClassId>,
+    ) -> Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)> {
         let mut test_sites = Vec::new();
         for module in &app.test_modules {
             if let Some(setup) = &module.setup {
@@ -3952,57 +4594,35 @@ impl Analyzer {
                 self.collect_send_sites(body, Some(&module.name), helpers, &mut test_sites);
             }
         }
-        let test_sites = test_sites.into_iter().filter_map(|(class, method, args, kwargs)| {
+        test_sites.into_iter().filter_map(|(class, method, args, kwargs)| {
             self.test_helper_owner(app, &class, &method)
                 .map(|owner| (owner, method, args, kwargs))
-        }).collect();
-        for controller in &app.controllers {
-            for action in controller.actions() {
-                self.collect_send_sites(&action.body, Some(&controller.name), helpers, &mut sites);
-            }
-            for method in controller.class_methods() {
-                self.collect_send_sites(&method.body, Some(&controller.name), helpers, &mut sites);
-            }
-        }
-        for view in &app.views {
-            self.collect_send_sites(&view.body, None, helpers, &mut sites);
-        }
-        if let Some(seeds) = &app.seeds {
-            self.collect_send_sites(seeds, None, helpers, &mut sites);
-        }
+        }).collect()
+    }
 
-        for (phase, sites) in [sites, test_sites].into_iter().enumerate() {
-            if phase == 1 {
-                // Production signatures keep their production callers' shape.
-                // Fold before adding test-owned observations: a same-named test
-                // helper must not feed an included production concern either.
-                self.fold_concern_param_sites(app);
+    fn apply_param_sites(
+        &mut self,
+        sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)>,
+        params_by_method: &HashMap<(ClassId, Symbol), ParamShape>,
+        defined: &BTreeSet<(ClassId, Symbol)>,
+    ) {
+        for (class_id, method, arg_tys, kw_tys) in sites {
+            let class_id = self.inherited_param_owner(defined, class_id, &method);
+            let arg_tys = Self::place_keyword_args(
+                params_by_method.get(&(class_id.clone(), method.clone())),
+                arg_tys,
+                kw_tys,
+            );
+            let arity = arg_tys.len();
+            let entry = self
+                .inferred_params
+                .entry((class_id.clone(), method.clone()))
+                .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
+            if entry.len() < arity {
+                entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
             }
-            for (class_id, method, arg_tys, kw_tys) in sites {
-                // Before the keywords are placed: the callee's shape is
-                // keyed to the class that defines it.
-                let class_id = self.inherited_param_owner(&defined, class_id, &method);
-                let arg_tys = Self::place_keyword_args(
-                    params_by_method.get(&(class_id.clone(), method.clone())),
-                    arg_tys,
-                    kw_tys,
-                );
-                // Cross-reference against MethodDef.params to know the
-                // arity. If the called method's params can't be located,
-                // still accumulate up to arg count under the same key —
-                // RBS-only methods don't have a MethodDef but do have an
-                // Fn signature, and inferred_params can extend either way.
-                let arity = arg_tys.len();
-                let entry = self
-                    .inferred_params
-                    .entry((class_id.clone(), method.clone()))
-                    .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
-                if entry.len() < arity {
-                    entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
-                }
-                for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                    *slot = unify_param_ty(slot.clone(), observed);
-                }
+            for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
+                *slot = unify_param_ty(slot.clone(), observed);
             }
         }
     }
@@ -5085,7 +5705,7 @@ const MAX_FILTER_CALL_DEPTH: usize = 4;
 /// the backstop for a long-but-non-cyclic chain.
 fn collect_transitive_filter_ivars(
     expr: &Expr,
-    bodies: &HashMap<Symbol, Expr>,
+    bodies: &HashMap<Symbol, &Expr>,
     depth: usize,
     visited: &mut BTreeSet<Symbol>,
     own: bool,
@@ -5583,7 +6203,6 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     crate::analyze::body::union_of(stored, observed)
 }
 
-
 /// Convert a controller class name into the view-path prefix.
 /// `ArticlesController` → `articles`; namespaced controllers map each
 /// module segment to a path segment (`Admin::UsersController` →
@@ -5827,6 +6446,30 @@ fn captured_block_ty() -> Ty {
     }
 }
 
+/// What a parameter is typed as inside its method, given what its
+/// signature declares and what the call sites were seen to pass.
+///
+/// A declaration that is fully spelled out IS the parameter's type: the
+/// method body is written against it, and a call site that disagrees
+/// (a `nil` the analysis inferred because the only value it saw assigned
+/// was `nil`, an empty `[]` literal) is a fact about the caller, not
+/// about the parameter. Before this, the observation won whenever there
+/// was one, so `#: (FatalError error) -> void` above a helper that one
+/// caller passed a nil-typed attribute to typed `error` as `nil`, and
+/// `error.message` failed to dispatch on it.
+///
+/// A declaration that leaves something `untyped` (`Hash[Symbol,
+/// untyped]`, a bare `Array`) is a hint the observation may sharpen, so
+/// there the observation still wins when it is something, and the
+/// declaration fills in where the call sites said nothing.
+fn prefer_declared(declared: Option<Ty>, observed: Option<Ty>) -> Option<Ty> {
+    match (declared, observed) {
+        (Some(d), _) if !d.mentions_unknown() => Some(d),
+        (_, Some(o)) if !matches!(o, Ty::Var { .. }) => Some(o),
+        (d, o) => d.or(o),
+    }
+}
+
 fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param) -> Option<Ty> {
     let observed = observed.filter(|t| !matches!(t, Ty::Var { .. }));
     let default = param
@@ -5920,6 +6563,26 @@ pub(crate) fn is_setter_name(name: &Symbol) -> bool {
         && n.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
 }
 
+/// A body that is nothing but `raise NotImplementedError` — the abstract
+/// hook a concern or base class declares for its includer or subclass
+/// to implement (`def set_class; raise NotImplementedError, "..."; end`).
+fn is_abstract_body(body: &Expr) -> bool {
+    match &*body.node {
+        ExprNode::Seq { exprs } => exprs.len() == 1 && is_abstract_body(&exprs[0]),
+        ExprNode::Send { recv: None, method, args, .. } if matches!(method.as_str(), "raise" | "fail") => {
+            let names_it = |e: &Expr| match &*e.node {
+                ExprNode::Const { path } => path.last().is_some_and(|s| s.as_str() == "NotImplementedError"),
+                ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "new" => {
+                    matches!(&*r.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "NotImplementedError"))
+                }
+                _ => false,
+            };
+            args.first().is_some_and(names_it)
+        }
+        _ => false,
+    }
+}
+
 fn effective_return_ty(body: &Expr) -> Option<Ty> {
     let mut tys: Vec<Ty> = Vec::new();
     let mut saw_return = false;
@@ -5943,6 +6606,12 @@ fn effective_return_ty(body: &Expr) -> Option<Ty> {
         // which is what "it returns something we can't name" means.
         if saw_return && matches!(body.ty, Some(Ty::Bottom)) {
             return Some(crate::analyze::body::unknown());
+        }
+        // An abstract hook returns whatever its implementation does, not
+        // `Bottom`: harvesting that made every call on the result (`set_class.new`)
+        // a dispatch failure on an unreachable type.
+        if !saw_return && is_abstract_body(body) {
+            return Some(Ty::Untyped);
         }
         // Nothing usable collected — preserve prior behavior so the
         // `Var`/`Bottom`/`None` fallbacks downstream are unchanged.
@@ -6118,7 +6787,48 @@ fn is_clean_binding(ty: &Ty) -> bool {
     }
 }
 
-pub(crate) fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
+/// The ivars `initialize` assigns as statements of its own, across `methods`.
+fn ivars_initialized_by<'a>(
+    methods: impl Iterator<Item = &'a crate::dialect::MethodDef>,
+) -> std::collections::HashSet<Symbol> {
+    methods
+        .filter(|m| {
+            m.name.as_str() == "initialize"
+                && m.receiver == crate::dialect::MethodReceiver::Instance
+        })
+        .flat_map(|m| ivars_assigned_by_statement(&m.body))
+        .collect()
+}
+
+/// The ivars a method body assigns as statements of its own -- not inside
+/// a branch, loop or block, where the write may never run. After the method
+/// returns, each of these is set.
+fn ivars_assigned_by_statement(body: &Expr) -> Vec<Symbol> {
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    let mut out = Vec::new();
+    for stmt in statements {
+        match &*stmt.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, .. } => out.push(name.clone()),
+            ExprNode::MultiAssign { targets, .. } => {
+                for t in targets {
+                    if let LValue::Ivar { name } = t {
+                        out.push(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Harvest `@ivar = expr` / OpAssign / MultiAssign writes from a typed
+/// body, union-merging repeated assignments. Used by the analyzer's
+/// two-pass library typing and by the Spinel AR RBS probe.
+pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
     match &*expr.node {
         ExprNode::Assign { target: LValue::Ivar { name }, value } => {
             if let Some(ty) = value.ty.clone() {
@@ -6679,6 +7389,29 @@ fn register_has_json(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) 
             methods
                 .entry(Symbol::from(format!("{}=", flat.as_str())))
                 .or_insert(ty);
+        }
+    }
+}
+
+/// `serialize :settings, coder: JSON` (Rails' attribute serialization)
+/// keeps the column's storage type in the schema (`text`/`string`) but
+/// the attribute reads back as whatever the coder loads: a Hash, an
+/// Array, a value object. Typing the reader and writer as the storage
+/// `String` makes every use of the deserialized value (`line_items.map`,
+/// `settings.fetch`) a dispatch failure on `String?`. The coder is an
+/// arbitrary object (`JSON`, `VersionedSerializer.column(…)`, a custom
+/// class), so the honest type is the gradual one. `insert`, not
+/// `or_insert`: this deliberately overrides the schema-derived type.
+fn register_serialized_columns(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) {
+    for item in body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if method.as_str() != "serialize" {
+            continue;
+        }
+        for name in args.iter().map_while(symbol_arg) {
+            methods.insert(name.clone(), Ty::Untyped);
+            methods.insert(Symbol::from(format!("{}=", name.as_str())), Ty::Untyped);
         }
     }
 }

@@ -32,7 +32,11 @@ pub(super) fn try_recv_typed_method(
             // Ruby-semantics view) match the same branches as the
             // plain receiver case. Emit chose panic-on-miss for `[]`,
             // so the runtime value really is T.
-            let recv_ty = r.ty.as_ref().map(peel_nil);
+            let ivar_fallback = match &*r.node {
+                ExprNode::Ivar { name } => ivar_field_ty(name.as_str()),
+                _ => None,
+            };
+            let recv_ty = ivar_fallback.as_ref().or(r.ty.as_ref()).map(peel_nil);
             let arg_ty = args[0].ty.as_ref().map(peel_nil);
             // Range index on Str/Vec receiver — `pp[1..]`. The Range
             // node emits its endpoints unmodified (`1_i64..`), but
@@ -109,24 +113,14 @@ pub(super) fn try_recv_typed_method(
             // is already the right type).
             if let Some(crate::ty::Ty::Array { elem }) = recv_ty {
                 if matches!(arg_ty, Some(crate::ty::Ty::Int)) {
-                    // `Vec<T>::Index` returns `&T`; passing the result
-                    // to a function taking `T` by value (the typical
-                    // Ruby-emit consuming-arg shape) requires
-                    // materializing an owned T. Append `.clone()` for
-                    // non-Copy element types — mirrors the negative-
-                    // index branch's clone (the same E0507 motivates
-                    // both). Copy elems (i64, f64, bool) need no
-                    // suffix.
                     let suffix = if is_copy_ty(elem) { "" } else { ".clone()" };
-                    // The receiver is borrowed by the index, so it emits
-                    // without the multi-read `.clone()` a bare Var read
-                    // takes: `v.clone()[i]` copied the whole Vec to read
-                    // one element, which made an index loop over it
-                    // quadratic (the `includes` distribute walks its
-                    // loaded rows this way).
+                    let recv_s = if matches!(&*r.node, ExprNode::Const { .. }) {
+                        format!("{}.lock().unwrap()", super::super::emit_send_recv(r))
+                    } else {
+                        super::super::emit_send_recv(r)
+                    };
                     return Some(format!(
-                        "{}[({}) as usize]{}",
-                        super::super::emit_send_recv(r),
+                        "{recv_s}[({}) as usize]{}",
                         emit_expr(&args[0]),
                         suffix
                     ));
@@ -168,6 +162,13 @@ pub(super) fn try_recv_typed_method(
                     "{}.get({}).cloned().unwrap_or(serde_json::Value::Null)",
                     emit_expr(r),
                     emit_expr(&args[0])
+                ));
+            }
+            if matches!(&*r.node, ExprNode::Const { .. }) {
+                return Some(format!(
+                    "{}.lock().unwrap()[({}) as usize]",
+                    super::super::emit_send_recv(r),
+                    emit_expr(&args[0]),
                 ));
             }
             return Some(format!("{}[{}]", emit_expr(r), emit_expr(&args[0])));
@@ -287,6 +288,20 @@ pub(super) fn try_recv_typed_method(
                         emit_expr(&args[1]),
                     ));
                 }
+                let leaf = cls.rsplit("::").next().unwrap_or(cls);
+                if leaf == "HeaderStore" {
+                    // RBS `[]=: (String, String?)` — rust emits
+                    // `set_index(&str, Option<String>)`, not Value.
+                    let opt_str = crate::ty::Ty::Union {
+                        variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil],
+                    };
+                    let wrapped = super::coerce::coerce_arg_for_param_ty(&args[1], &opt_str);
+                    return Some(format!(
+                        "{}.set_index({}, {wrapped})",
+                        emit_expr(r),
+                        emit_expr(&args[0]),
+                    ));
+                }
                 // Non-builtin Ty::Class — route through `set_index`
                 // (the `[]=` operator-method rewrite). Wrap value RHS
                 // with Value::from when its Ty isn't already
@@ -364,6 +379,27 @@ pub(super) fn try_recv_typed_method(
                 let recv_s = emit_expr(r);
                 let place = recv_s.strip_suffix(".clone()").unwrap_or(&recv_s);
                 return Some(format!("{{ {place}.insert({kk}, {vv}); }}"));
+            }
+            // Vec index-assign, including Const arrays (`FORGERY_SLOT[0]
+            // =`) and HeaderStore `@vals[i] =`. Same usize cast as `[]`.
+            let ivar_ty = match &*r.node {
+                ExprNode::Ivar { name } => ivar_field_ty(name.as_str()),
+                _ => None,
+            };
+            let recv_ty = ivar_ty.as_ref().or(r.ty.as_ref()).map(peel_nil);
+            if matches!(recv_ty, Some(crate::ty::Ty::Array { .. }))
+                || matches!(&*r.node, ExprNode::Const { .. })
+            {
+                let recv_s = if matches!(&*r.node, ExprNode::Const { .. }) {
+                    format!("{}.lock().unwrap()", super::super::emit_send_recv(r))
+                } else {
+                    super::super::emit_send_recv(r)
+                };
+                return Some(format!(
+                    "{recv_s}[({}) as usize] = {}",
+                    emit_expr(&args[0]),
+                    emit_expr(&args[1]),
+                ));
             }
             return Some(format!("{}[{}] = {}", emit_expr(r), emit_expr(&args[0]), emit_expr(&args[1])));
         }
@@ -604,22 +640,20 @@ pub(super) fn try_recv_typed_method(
                     }} }}"
             ));
         }
-        // `value.nil?` on a `Ty::Untyped` or unresolved-Var receiver —
-        // `serde_json::Value` exposes `.is_null()` (not `.is_none`,
-        // which is the Option method the generic `nil?` bridge below
-        // produces). The Var-typed case covers receivers the body-
-        // typer didn't fully resolve (e.g. `value = @model[field]`
-        // where `@model[field]` is typed Untyped per Base's RBS but
-        // the local-let propagation leaves `value`'s recv ty
-        // unresolved at the emit-walk's view of the Var-read site).
-        // The generic bridge stays in place for true Option-typed
-        // receivers (typical Ruby `attr_reader` getters typed `T?`).
+        // `value.nil?` on a receiver that rust emits as
+        // `serde_json::Value` — `.is_null()` (not `.is_none`, which
+        // is the Option method the generic `nil?` bridge below
+        // produces). Untyped/Var are the gradual-escape cases; RBS
+        // heterogeneous unions (`String | Integer | Float | bool |
+        // nil` on `optional_value_attr`) also render as Value, and
+        // must take the same predicate or rustc E0599s. The generic
+        // bridge stays in place for true Option-typed receivers
+        // (typical Ruby `attr_reader` getters typed `T?`).
         if method == "nil?"
             && args.is_empty()
-            && matches!(
-                r.ty.as_ref(),
-                Some(crate::ty::Ty::Untyped) | Some(crate::ty::Ty::Var { .. })
-            )
+            && r.ty
+                .as_ref()
+                .is_some_and(super::super::super::ty::rust_value_shaped)
         {
             return Some(format!("{}.is_null()", emit_expr(r)));
         }

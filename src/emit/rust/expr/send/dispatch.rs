@@ -26,6 +26,9 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         key: Box::new(Ty::Str),
         value: Box::new(Ty::Untyped),
     };
+    let str_opt = || Ty::Union {
+        variants: vec![Ty::Str, Ty::Nil],
+    };
     match (class, method) {
         ("Db", "prepare") => Some(vec![Ty::Str]),
         ("Db", "exec") => Some(vec![Ty::Str]),
@@ -68,6 +71,17 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         // these declared types.
         ("ViewHelpers", "broadcast_render") => Some(vec![Ty::Str, Ty::Str]),
         ("ViewHelpers", "begin_broadcast_render") => Some(vec![]),
+        // Runtime files emit under an empty EmitCtx (see rust.rs
+        // rust_units), so Const-recv ActionController helpers are
+        // invisible to the global registry. Pin RBS param Tys here
+        // so Family 4/6 fire for HeaderStore/Base call sites.
+        ("ActionController", "header_key_ok?") => Some(vec![str_opt()]),
+        ("ActionController", "header_value_ok?") => Some(vec![str_opt()]),
+        ("ActionController", "header_control?") => Some(vec![Ty::Str]),
+        ("ActionController", "sanitize_location") => Some(vec![Ty::Str]),
+        ("ActionController", "location_host") => Some(vec![Ty::Str]),
+        ("ActionController", "find_substr") => Some(vec![Ty::Str, Ty::Str]),
+        ("ActionController", "find_last") => Some(vec![Ty::Str, Ty::Str]),
         _ => None,
     }
 }
@@ -118,6 +132,74 @@ pub(super) fn controller_shim_arity(method: &str) -> Option<usize> {
         "redirect_to" => Some(2),
         "head" => Some(2),
         _ => None,
+    }
+}
+
+/// `to_s` on a Value-shaped recv. Hash/Session `#get` rust-emits
+/// `Option<T>` even when IR types the result as Untyped/Union — use
+/// `unwrap_or_default` (Ruby `nil.to_s` is `""`). Union params and
+/// Hash `[]`/`fetch` that rust-emit as `serde_json::Value` use UFCS
+/// so files without `use RubyToS` compile. Untyped/Record and other
+/// Sends keep method-style `.ruby_to_s()`.
+fn ruby_to_s_emit(recv: &Expr, recv_s: &str, ufcs: bool) -> String {
+    use crate::ty::Ty;
+    use super::super::util::is_option_ty;
+    match &*recv.node {
+        ExprNode::Send { method: m, .. } if m.as_str() == "get" => {
+            format!("{recv_s}.clone().unwrap_or_default()")
+        }
+        ExprNode::Send {
+            method: m,
+            recv: inner,
+            ..
+        } if m.as_str() == "[]" => {
+            let ivar_ty = match inner.as_ref().map(|e| &*e.node) {
+                Some(ExprNode::Ivar { name }) => super::super::ivar_field_ty(name.as_str()),
+                _ => None,
+            };
+            // Prefer the struct-field table: HeaderStore `@vals` is
+            // Array[Option<String>] there, while the body-typer still
+            // reports Array[Untyped] from `@vals = []`.
+            let recv_ty = ivar_ty
+                .as_ref()
+                .or_else(|| inner.as_ref().and_then(|e| e.ty.as_ref()))
+                .map(peel_nil);
+            match recv_ty {
+                Some(Ty::Class { id, .. })
+                    if {
+                        let s = id.0.as_str();
+                        let leaf = s.rsplit("::").next().unwrap_or(s);
+                        matches!(leaf, "Session" | "Flash")
+                    } =>
+                {
+                    format!("{recv_s}.clone().unwrap_or_default()")
+                }
+                Some(Ty::Array { elem }) if is_option_ty(elem) => {
+                    format!("{recv_s}.clone().unwrap_or_default()")
+                }
+                Some(Ty::Array { .. }) => format!("{recv_s}.to_string()"),
+                Some(ty) if ufcs && (super::super::super::ty::rust_value_shaped(ty)
+                    || matches!(ty, Ty::Hash { .. })) =>
+                {
+                    format!(
+                        "<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({recv_s}))"
+                    )
+                }
+                _ if ufcs => format!(
+                    "<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({recv_s}))"
+                ),
+                _ => format!("{recv_s}.ruby_to_s()"),
+            }
+        }
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } if ufcs => {
+            format!("<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({recv_s}))")
+        }
+        ExprNode::Send { method: m, .. }
+            if ufcs && matches!(m.as_str(), "fetch") =>
+        {
+            format!("<serde_json::Value as crate::http::RubyToS>::ruby_to_s(&({recv_s}))")
+        }
+        _ => format!("{recv_s}.ruby_to_s()"),
     }
 }
 
@@ -305,14 +387,12 @@ pub(super) fn dispatch_method_by_recv_ty(
         // else JSON-encode. Rust's `serde_json::Value::to_string()`
         // unconditionally JSON-encodes, which breaks attribute
         // emission (`data-turbo-track="reload"` becomes
-        // `data-turbo-track="\"reload\""`). Route through the
-        // `RubyToS` trait (defined in `runtime/rust/http.rs`):
-        // compile-time dispatch picks the right impl for `str` /
-        // `String` / `serde_json::Value`, so the same emit shape
-        // works whether the recv ends up being a closure param
-        // typed `&String` (Map iter keys) or a genuine
-        // `&serde_json::Value` (Map iter values). Avoids the
-        // false-positive E0599 from a Var-only narrowing rule.
+        // `data-turbo-track="\"reload\""`, and form `value=` quotes
+        // a title). Route through the `RubyToS` trait (defined in
+        // `runtime/rust/http.rs`): compile-time dispatch picks the
+        // right impl for `str` / `String` / `serde_json::Value`.
+        // Files that import the trait (json_builder, view_helpers)
+        // can use method-style `.ruby_to_s()`.
         // `Integer#to_i` is the identity. Its common receiver is an
         // index read (`arr[i].to_i`), which types `Integer | nil` but
         // renders as the `i64` itself (see the nil peel above).
@@ -321,14 +401,16 @@ pub(super) fn dispatch_method_by_recv_ty(
             _ => None,
         },
         Some(Ty::Untyped) | Some(Ty::Record { .. }) => match method {
-            "to_s" if args.is_empty() => {
-                // `recv_s` is already wrap-aware via `emit_send_recv`
-                // at the top of this function: non-primary recvs
-                // (e.g. `x.len() as i64`) get the bit-driven wrap,
-                // primary recvs (method chains, var reads) stay bare.
-                // `.ruby_to_s()` itself is a method call — primary.
-                Some(format!("{recv_s}.ruby_to_s()"))
-            }
+            "to_s" if args.is_empty() => Some(ruby_to_s_emit(recv, &recv_s, false)),
+            _ => None,
+        },
+        // Heterogeneous unions / ParamValue / Var that rust-emit as
+        // Value (e.g. `optional_value_attr`'s column union). Fully-
+        // qualified so files that don't `use RubyToS` still compile
+        // — a blanket `.ruby_to_s()` here broke ActionController on
+        // compare rust.
+        Some(ty) if super::super::super::ty::rust_value_shaped(ty) => match method {
+            "to_s" if args.is_empty() => Some(ruby_to_s_emit(recv, &recv_s, true)),
             _ => None,
         },
         Some(Ty::Hash { .. }) => match method {

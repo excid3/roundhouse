@@ -63,13 +63,28 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
     // positions). Pre-Stage-6 unwrapped args hit this same path via
     // Family 2 below — peek-through here keeps the emit identical.
     if let ExprNode::Cast { value, target_ty } = &*arg.node {
-        if target_ty.is_scalar()
-            && value.ty.as_ref().map(ty_contains_untyped).unwrap_or(false)
-        {
+        let inner_untyped = value.ty.as_ref().map(ty_contains_untyped).unwrap_or(false);
+        if target_ty.is_scalar() && inner_untyped {
+            if target_ty.is_stringish() {
+                if json_value_arg_for_string_param(value) {
+                    let inner_raw = emit_expr(value);
+                    return json_value_as_str(inner_raw, value);
+                }
+                // Class-method Sends can be IR-Untyped while rust emits
+                // `String`. Borrow rather than calling Value::as_str.
+                return format!("&({})", emit_expr(value));
+            }
             if let Some(coerce) = super::super::util::value_narrowing_coercion(target_ty) {
                 let inner_raw = emit_expr(value);
                 return format!("({inner_raw}).{coerce}");
             }
+        }
+        // Stringish unions (`String | Symbol`) are not `is_scalar` but
+        // rust emits them as `&str` params. Only Hash/Value bags
+        // narrow with `as_str()`; see `json_value_arg_for_string_param`.
+        if target_ty.is_stringish() && json_value_arg_for_string_param(value) {
+            let inner_raw = emit_expr(value);
+            return json_value_as_str(inner_raw, value);
         }
     }
     let raw = emit_expr(arg);
@@ -168,6 +183,31 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
                 return format!("Some({payload})");
             }
         }
+        // Class-method / Const-recv sites the lowerer registry can
+        // miss (`ActionController.header_key_ok?(key)` with String
+        // vs `String?`). Rust-only; do not lift Option wrapping into
+        // the shared lowerer.
+        if !matches!(&*arg.node, ExprNode::Cast { .. })
+            && !arg.ty.as_ref().is_some_and(is_option_ty)
+        {
+            let inner = peel_nil(param_ty);
+            if inner.is_stringish() {
+                let needs_to_string = matches!(
+                    &*arg.node,
+                    ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } }
+                ) && !super::super::has_str_coercion(arg);
+                let payload = if needs_to_string {
+                    format!("{raw}.to_string()")
+                } else if matches!(arg_ty_peeled, Some(Ty::Str | Ty::Sym))
+                    || matches!(&*arg.node, ExprNode::Var { .. } | ExprNode::Send { .. })
+                {
+                    format!("({raw}).to_string()")
+                } else {
+                    raw.clone()
+                };
+                return format!("Some({payload})");
+            }
+        }
     }
 
     // Family 1 — Hash widening to `HashMap<String, serde_json::Value>`.
@@ -242,12 +282,15 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
     // Ivar args with non-Copy fields need `.clone()` first because
     // `Value::from` takes by value and would move out of `&self`
     // (E0507). Integer/Float/Bool fields are Copy so skip the clone.
+    // `Untyped` / Record stay Value. Heterogeneous unions such as
+    // `turbo_stream_from`'s `String | Array[untyped]` also render as
+    // `serde_json::Value` — wrap scalar args here, rust-only. Do not
+    // lift that to the shared lowerer: other targets do not box those
+    // unions as Value, and treating them as value-shaped Casts broke
+    // ActionController emit (crystal Int32/Int64, go/kotlin/csharp
+    // index types, python `.tr` on str).
     let value_target = |ty: &Ty| -> bool {
-        matches!(ty, Ty::Untyped | Ty::Record { .. })
-            || matches!(
-                ty,
-                Ty::Class { id, .. } if id.0.as_str() == "Roundhouse::ParamValue"
-            )
+        super::super::super::ty::rust_value_shaped(ty)
     };
     if let ExprNode::Cast { value, target_ty } = &*arg.node {
         if value_target(target_ty) {
@@ -292,6 +335,15 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
         if matches!(
             arg_ty_peeled,
             Some(Ty::Str | Ty::Sym | Ty::Int | Ty::Float | Ty::Bool)
+        ) || matches!(
+            &*arg.node,
+            ExprNode::Lit {
+                value: Literal::Str { .. }
+                    | Literal::Sym { .. }
+                    | Literal::Int { .. }
+                    | Literal::Float { .. }
+                    | Literal::Bool { .. }
+            } | ExprNode::StringInterp { .. }
         ) {
             let needs_clone = matches!(&*arg.node, ExprNode::Ivar { .. })
                 && !matches!(arg_ty_peeled, Some(Ty::Int | Ty::Float | Ty::Bool));
@@ -394,6 +446,16 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
     }
 
     if param_ty.is_stringish() && !super::super::has_str_coercion(arg) {
+        // Value-shaped arg → `&str` param. Hash#fetch / Hash#[] on an
+        // untyped bag (the `form_with` → `method_override_input`
+        // path) and Value-typed locals/ivars need `.as_str()`. Do
+        // not key off Untyped Sends in general: a Const-recv helper
+        // like `Views::Articles::article(...)` can be typed Untyped
+        // in IR while rust emits `String`/`&str`, and wrapping that
+        // in `.as_str().unwrap()` is E0599.
+        if json_value_arg_for_string_param(arg) {
+            return json_value_as_str(raw, arg);
+        }
         // Peek through `Cast` wrappers — the model lowerer wraps row
         // accessors in `Cast { Send(row.col), col_ty }` to bridge
         // Crystal's nilable row holder, but rust's row class is
@@ -618,6 +680,76 @@ pub(crate) fn coerce_arg_for_field_ty(arg: &Expr, field_ty: &crate::ty::Ty) -> S
         }
     }
     raw
+}
+
+/// True when `arg` rust-emits as `serde_json::Value` and is being
+/// passed to a stringish (`&str`) param. Hash#[] / Hash#fetch on an
+/// untyped bag, plus Value-typed locals/ivars. Class-method Sends are
+/// excluded even when IR types them Untyped — their rust emit is the
+/// callee's concrete return (`String`, a model, …).
+fn json_value_arg_for_string_param(arg: &Expr) -> bool {
+    let inner = if let ExprNode::Cast { value, .. } = &*arg.node {
+        value
+    } else {
+        arg
+    };
+    let value_shaped = |t: &crate::ty::Ty| {
+        let peeled = peel_nil(t);
+        super::super::super::ty::rust_value_shaped(t)
+            || super::super::super::ty::rust_value_shaped(peeled)
+            || ty_contains_untyped(t)
+    };
+    match &*inner.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } => {
+            // `Union<Untyped, Nil>` rust-emits `Option<Value>`. Peel
+            // would call that a Value and emit `.as_str()` on Option.
+            inner.ty.as_ref().is_some_and(|t| !is_option_ty(t) && value_shaped(t))
+        }
+        ExprNode::Send { method, recv, .. } => {
+            if !matches!(method.as_str(), "[]" | "fetch" | "get") {
+                return false;
+            }
+            if matches!(
+                recv.as_ref().map(|r| &*r.node),
+                Some(ExprNode::Const { .. })
+            ) {
+                return false;
+            }
+            // Hash#[] on an untyped bag is often typed `Untyped | Nil`
+            // (Ruby nil-on-miss) while the rust peephole emits a
+            // `Value` (`get().cloned().unwrap_or(Null)`), not Option.
+            inner.ty.as_ref().is_some_and(value_shaped)
+        }
+        _ => false,
+    }
+}
+
+/// `.as_str()` needs an owned `Value`. HashMap#get rust-emits
+/// `Option<&Value>`; Hash#fetch(k, nil) peepholes to the same
+/// `get().cloned()` Option. Materialize Null-on-miss first.
+fn json_value_as_str(raw: String, arg: &Expr) -> String {
+    let inner = if let ExprNode::Cast { value, .. } = &*arg.node {
+        value
+    } else {
+        arg
+    };
+    let owned = if let ExprNode::Send { method, recv, args, .. } = &*inner.node {
+        let hash_recv = matches!(
+            recv.as_ref().and_then(|r| r.ty.as_ref()).map(peel_nil),
+            Some(crate::ty::Ty::Hash { .. })
+        );
+        let fetch_nil = method.as_str() == "fetch"
+            && args.len() == 2
+            && matches!(&*args[1].node, ExprNode::Lit { value: Literal::Nil });
+        if hash_recv && (method.as_str() == "get" || fetch_nil) {
+            format!("{raw}.cloned().unwrap_or(serde_json::Value::Null)")
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+    format!("({owned}).as_str().unwrap()")
 }
 
 /// serde_json accessor that yields `Option<T>` directly — the nullable

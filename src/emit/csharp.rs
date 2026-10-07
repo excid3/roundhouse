@@ -64,12 +64,8 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // Preliminary view pass: seeds the model lowerer's association element
     // types, and gives the view-module method names for the Phase-2 stubs.
     let vctx = crate::lower::ViewLowerCtx::new(app);
-    let preliminary_views: Vec<crate::dialect::LibraryClass> = app
-        .views
-        .iter()
-        .map(|v| vctx.lower(v))
-        .collect();
-    let view_extras = crate::lower::extras_from_lcs(&preliminary_views);
+    let mut view_lcs = crate::lower::preliminary_view_classes(&app.views, &vctx);
+    let view_extras = crate::lower::extras_from_lcs(&view_lcs);
 
     // Permitted-params specs → each model gains a typed `from_params`.
     let params_specs =
@@ -91,7 +87,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // function signatures.
     let mut view_lower_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
         model_registry.into_iter().collect();
-    view_lower_extras.extend(crate::lower::extras_from_lcs(&preliminary_views));
+    view_lower_extras.extend(crate::lower::extras_from_lcs(&view_lcs));
 
     // Route helpers (`RouteHelpers.article_path(id)`) → a `static class`.
     let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
@@ -112,8 +108,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // methods on the same module. C# static classes can't be reopened, so the
     // per-template LibraryClasses merge into one `static class <Plural>` per
     // module, emitted to app/views/.
-    let view_lcs =
-        crate::lower::lower_views_to_library_classes(&app.views, app, view_lower_extras.clone());
+    crate::lower::type_view_library_classes(&mut view_lcs, app, view_lower_extras.clone());
     let jbuilder_lcs =
         crate::lower::lower_jbuilder_to_library_classes(&app.views, app, view_lower_extras.clone());
     let mut all_view_lcs = view_lcs.clone();

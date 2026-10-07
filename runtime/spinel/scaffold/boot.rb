@@ -97,6 +97,9 @@ ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(
   Rails.application.config_time_zone, Rails.application.config_time_zone
 )
 require_relative "runtime/active_record"
+# Default as_json → _as_json_only. Date-column rewrite is injected only
+# when app_uses_date (see project::spinel_files); Campfire omits Date.
+require_relative "runtime/active_record_serialization"
 # Record equality (same class + same persisted id) — a reopen of
 # ActiveRecord::Base; the CRuby overlay's twin is active_record_bang.rb.
 require_relative "runtime/active_record_equality_spinel"

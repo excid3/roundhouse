@@ -753,7 +753,14 @@ module ActiveStorage
       "\"" + ActionController::MessageVerifier.iso8601_ms(Time.now + 300) + "\""
     end
 
+    # Only `inline` or `attachment` is ever signed — Rails'
+    # `content_disposition_with` (`presence_in(%w[attachment inline]) ||
+    # "inline"`). The blob redirect route takes the disposition from a
+    # query param, and what is signed here comes back out as the disk
+    # route's Content-Disposition header: anything else signed as asked
+    # was a header line of the requester's choosing.
     def self.encode(key, disposition)
+      disposition = "inline" unless disposition == "attachment"
       ActionController::MessageVerifier.data_envelope(
         Rails.application.secret_key_base, "ActiveStorage",
         ActionController::MessageVerifier.json_string(key + "|" + disposition),

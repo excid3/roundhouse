@@ -1,6 +1,6 @@
 //! ActionView view-context surface: the `FormBuilder`, the mime-responds
 //! `Collector`, the `ActionView::Base` flat-helper accumulator (links, tags,
-//! flash accessors, jbuilder `json`, route helpers, kaminari, simple_form,
+//! flash accessors, jbuilder `json`, route helpers, paginate, simple_form,
 //! and the app/helpers fold), and the `ActionDispatch::Flash::FlashHash`
 //! class. Extracted verbatim from `Analyzer::with_adapter`.
 
@@ -202,7 +202,7 @@ pub(in crate::analyze) fn register(
             .entry(Symbol::from(name.as_str()))
             .or_insert(Ty::Str);
     }
-    // Kaminari's view-side paginator renders to a SafeBuffer string,
+    // View-side paginator helper renders to a SafeBuffer string,
     // like the tag helpers above.
     action_view
         .instance_methods

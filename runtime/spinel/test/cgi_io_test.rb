@@ -46,6 +46,31 @@ class CgiIoTest < Minitest::Test
 
   # ── write_response: set_cookies ──────────────────────────────────
 
+  # ── write_response: header injection ─────────────────────────────
+
+  # Every header the app hands over can carry request data — the
+  # Location of `redirect_to params[:back]`, a Content-Disposition, the
+  # blob's own Content-Type — and a CR or LF in it would end the header
+  # and write the rest as one the app never set. Puma's rule, as the
+  # spinel servers apply it (Tep.header_lines): a header that cannot be
+  # one line is dropped, and the response still goes out.
+  def test_write_response_drops_a_header_carrying_a_control_character
+    io = StringIO.new
+    CgiIo.write_response(io, 302, "<p>",
+      location: "/next\r\nSet-Cookie: pwned=1",
+      content_type: "text/html\r\nX-Type-Injected: 1",
+      extra_headers: { "Content-Disposition" => "inline\nX-Injected: 1",
+                       "X-Bad\r\nX-Key-Injected" => "v",
+                       "X-Ok" => "fine\tstill fine" })
+    head = io.string.split("\r\n\r\n", 2).first
+    lines = head.split("\r\n")
+    assert lines.none? { |l| l.include?("\n") }, head.inspect
+    assert lines.none? { |l| l.start_with?("Set-Cookie: pwned", "X-Injected", "X-Key-Injected", "X-Type-Injected") }, head.inspect
+    assert lines.none? { |l| l.start_with?("Location:", "Content-Disposition:", "Content-Type:") }, head.inspect
+    assert_includes lines, "X-Ok: fine\tstill fine"
+    assert_includes lines, "Status: 302 Found"
+  end
+
   def test_write_response_no_cookies_emits_no_set_cookie_header
     io = StringIO.new
     CgiIo.write_response(io, 200, "<p>")

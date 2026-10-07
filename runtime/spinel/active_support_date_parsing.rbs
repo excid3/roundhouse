@@ -1,0 +1,10 @@
+# Date-only temporal intrinsics. Emitted with the Date package only.
+module ActiveSupport
+  def self.parse_db_date: (String? value) -> Date?
+  def self.format_db_date: (Date | String | nil value) -> String?
+  def self.current_date: () -> Date
+  def self.date_beginning_of_month: (Date date) -> Date
+  def self.date_end_of_month: (Date date) -> Date
+  def self.date_beginning_of_day: (Date date) -> Time
+  def self.date_end_of_day: (Date date) -> Time
+end

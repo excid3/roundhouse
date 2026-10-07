@@ -35,8 +35,8 @@
 //! rather than onto the new record, which is a different rewrite with an
 //! assignment in it; it lands when a fixture demands it, the way HABTM
 //! does in `associations`. `reload_<assoc>` is likewise absent — the
-//! reader re-queries on every call here, so a reload has nothing to
-//! invalidate, and inventing it would imply a cache that does not exist.
+//! reader has a load-once cache for writer/preload, but no reload
+//! helper clears it yet; inventing one without a fixture is premature.
 
 use crate::app::App;
 use crate::dialect::Association;
@@ -46,8 +46,8 @@ use crate::span::Span;
 use crate::ty::Ty;
 use std::collections::HashMap;
 
-/// `has_one` declarations by owner: assoc name → (target, foreign key).
-type Builders = HashMap<ClassId, HashMap<Symbol, (ClassId, Symbol)>>;
+/// `has_one` declarations by owner: assoc name → (target, foreign key, as:).
+type Builders = HashMap<ClassId, HashMap<Symbol, (ClassId, Symbol, Option<Symbol>)>>;
 
 pub fn apply_has_one_builder_lowering(app: &mut App) {
     let mut table: Builders = HashMap::new();
@@ -56,13 +56,16 @@ pub fn apply_has_one_builder_lowering(app: &mut App) {
             // Polymorphic `has_one ..., as:` needs the interface TYPE
             // column set too. Left out rather than half-done: writing
             // only the id column would build a row no reader can find.
-            if let Association::HasOne { name, target, foreign_key, as_interface: None, .. } =
+            if let Association::HasOne { name, target, foreign_key, as_interface, .. } =
                 assoc
             {
                 table
                     .entry(model.name.clone())
                     .or_default()
-                    .insert(name.clone(), (target.clone(), foreign_key.clone()));
+                    .insert(
+                        name.clone(),
+                        (target.clone(), foreign_key.clone(), as_interface.clone()),
+                    );
             }
         }
     }
@@ -157,7 +160,7 @@ fn rewrite(expr: &mut Expr, table: &Builders, self_owner: Option<&ClassId>) {
     } else {
         return;
     };
-    let Some((target, foreign_key)) = by_name.get(&Symbol::from(assoc)) else { return };
+    let Some((target, foreign_key, as_interface)) = by_name.get(&Symbol::from(assoc)) else { return };
 
     // Rails allows the no-argument form (`user.create_webhook!`); the
     // foreign key alone is still a complete row to attempt.
@@ -165,6 +168,12 @@ fn rewrite(expr: &mut Expr, table: &Builders, self_owner: Option<&ClassId>) {
         crate::lower::typing::lit_sym(foreign_key.clone()),
         owner_id(recv.as_ref()),
     )];
+    if let Some(intf) = as_interface {
+        entries.push((
+            crate::lower::typing::lit_sym(Symbol::from(format!("{}_type", intf.as_str()))),
+            crate::lower::typing::lit_str(owner.0.as_str().to_string()),
+        ));
+    }
     match args.len() {
         0 => {}
         1 => {

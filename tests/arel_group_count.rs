@@ -102,6 +102,10 @@ end
   def self.scope_rooted
     Comment.newest.group(:article_id).count
   end
+
+  def self.with_having
+    Comment.group(:article_id).having("COUNT(*) > 1").count
+  end
 end
 "#,
         ),
@@ -262,6 +266,21 @@ fn an_unfoldable_grouped_count_reaches_the_ruby_runtime_method() {
     assert!(
         body.contains("group(:article_id).group_count"),
         "the grouped terminal keeps its own name on the runtime path:\n{body}"
+    );
+}
+
+#[test]
+fn a_grouped_count_with_having_stays_on_the_relation() {
+    // Rails still answers a Hash; the Arel fold has no HAVING, so the
+    // chain must not compile to COUNT(*)-per-group SQL that ignores it.
+    let body = method_body(&comment_model(), "with_having");
+    assert!(
+        body.contains("having") && body.contains("group_count"),
+        "HAVING must reach Relation#group_count:\n{body}"
+    );
+    assert!(
+        !body.contains("GROUP BY"),
+        "no Arel SQL for a grouped count that carries HAVING:\n{body}"
     );
 }
 

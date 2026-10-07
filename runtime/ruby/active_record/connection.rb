@@ -129,6 +129,25 @@ module ActiveRecord
   # walked only into the ruby-family trees, and active_record.rb
   # requires it AFTER base.rb so the reopen sees the real class.
   class Base
+    # Deferred `includes`/`preload` (ActiveRecord::PendingPreload): the
+    # Relation that loaded this record hands it the group's pending
+    # preload, and the first association read on any record of the group
+    # runs it. Every emitted association reader (and `<assoc>_loaded?`)
+    # starts with `_await_preload` (lower::deferred_preload); on a record
+    # with nothing pending it is one nil check.
+    def _pend_preload(pending)
+      @__pending_preload = pending
+      nil
+    end
+
+    def _await_preload
+      pending = @__pending_preload
+      return nil if pending.nil?
+      @__pending_preload = nil
+      pending.run
+      nil
+    end
+
     # Stateless facade — every member delegates straight to `Db`, so a
     # fresh instance per call is cheap and dodges class-ivar state.
     def self.connection
@@ -161,20 +180,52 @@ module ActiveRecord
     # drops a trailing empty field, so `"… where rowid = ?"` splits to
     # one part, and appending a bind after each part while binds remain
     # reconstructs it exactly. A `?` with no bind left is dropped, which
-    # is the same shape `substitute_binds` leaves it in.
+    # is the same shape `substitute_binds` leaves it in. Question marks
+    # inside single- or double-quoted SQL literals are not placeholders.
+    # SQLite does not treat `\` as a string escape — a backslash is
+    # literal, so `'\''` ends the quote at the second apostrophe.
     def self.sanitize_sql(statement)
-      parts = statement[0].to_s.split("?")
+      sql = statement[0].to_s
       out = ""
+      bind = 1
       i = 0
-      while i < parts.length
-        out = out + parts[i].to_s
-        bind = i + 1
-        if bind < statement.length
-          out = out + ActiveRecord.adapter.escape_value(statement[bind])
+      n = sql.length
+      quote = nil
+      while i < n
+        c = sql[i, 1].to_s
+        if !quote.nil?
+          out = out + c
+          quote = nil if c == quote
+          i = i + 1
+          next
         end
-        i += 1
+        if c == "'" || c == "\""
+          quote = c
+          out = out + c
+          i = i + 1
+          next
+        end
+        if c == "?"
+          if bind < statement.length
+            out = out + ActiveRecord.adapter.escape_value(statement[bind])
+            bind = bind + 1
+          end
+          i = i + 1
+          next
+        end
+        out = out + c
+        i = i + 1
       end
       out
+    end
+
+    # Rails' array-form entry point (`sanitize_sql_array([...])`). Same
+    # positional `?` interleave as `sanitize_sql` — apps that name the
+    # `_array` form (raw upserts, hand-built fragments) must resolve
+    # here (#400). Named Hash / `%s` binds are not modeled yet (would
+    # raise the Bar B untyped residual via Hash[untyped] walks).
+    def self.sanitize_sql_array(statement)
+      sanitize_sql(statement)
     end
 
     # `Model.transaction { ... }` — the block inside BEGIN/COMMIT, with
@@ -370,11 +421,15 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).none
     end
 
-    # Kaminari's class-side entry point, `Model.page(n)`: the same page
-    # of a fresh Relation (Relation#page). Ruby-family-only for the
-    # reason `where` above is.
+    # Class-side `Model.page(n)` / `Model.paginate(...)`: the same
+    # page of a fresh Relation (`Relation#page` / `#paginate`).
+    # Ruby-family-only for the reason `where` above is.
     def self.page(num = nil)
       ActiveRecord::Relation.new(self).page(num)
+    end
+
+    def self.paginate(num = nil, page: nil, per_page: nil)
+      ActiveRecord::Relation.new(self).paginate(num, page: page, per_page: per_page)
     end
 
     # Rails-shape `first` fallback, same story as `where`/`all` above:

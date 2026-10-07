@@ -89,6 +89,12 @@ pub struct App {
     /// replaces Action Text's `rich_text_area`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gem_lock: Option<crate::gems::Lockfile>,
+    /// The classes and method headers the locked gems' Tapioca RBIs
+    /// declare ([`crate::gem_boundary`]). Declarations only, read at
+    /// ingest when the tree (or the real location of its lockfile) has
+    /// `sorbet/rbi/gems/`; empty otherwise.
+    #[serde(default, skip_serializing_if = "crate::gem_boundary::GemBoundary::is_empty")]
+    pub gem_boundary: crate::gem_boundary::GemBoundary,
     /// Attributes the app (and its gems) add to Action Text's sanitizer
     /// allow-list at boot — `ActionText::ContentHelper.allowed_attributes`
     /// as the initializers leave it, minus the framework defaults the
@@ -143,6 +149,15 @@ pub struct App {
     /// that live on the CONTROLLER.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub view_visible_controller_methods: BTreeSet<Symbol>,
+    /// Methods of a helper object the app builds at load time from a
+    /// YAML table (`WebUrlHelpers = WebUrlHelpersFactory.create(
+    /// YAML.load_file(…)["paths"])`), keyed by the constant. The names
+    /// come from the table's keys and the factory's `define_method`
+    /// suffixes — see [`crate::ingest::generated_helpers`]. A registry
+    /// fact for the analyzer only: the constant's initializer still
+    /// builds the object at runtime, so nothing is emitted for it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated_helper_methods: BTreeMap<ClassId, BTreeSet<Symbol>>,
     /// Model class names a `GlobalID::Locator.locate(gid, only: K)`
     /// call site names, collected by [`crate::lower::global_id_locate`]
     /// as it rewrites each site to a per-model `locate_<model>`.
@@ -168,6 +183,12 @@ pub struct App {
     /// as it is in stock Rails.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachable_unsigned_models: Vec<Symbol>,
+    /// Modules `include`d inside `ActiveSupport.on_load(:active_record)`
+    /// that provide class-method macros. Mixin instance methods are not
+    /// installed. Expansion treats these as an explicit provider origin
+    /// (not a seeded `include` set on every model).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hook_class_macros: Vec<ClassId>,
     /// Partial → local name → type, harvested by the analyzer from the
     /// RENDER SITES that pass each local (`render partial: "form",
     /// locals: { new_message: @new_message }` with `@new_message` typed
@@ -381,6 +402,10 @@ pub struct App {
     /// The analyzer resolves the sources itself when this is absent.
     #[serde(skip)]
     pub const_resolver: crate::analyze::PreparedConstResolver,
+    /// Ingested source apps cannot enter the standalone IR-only analyzer mode
+    /// if a caller drops their source table. Persisted across serialization.
+    #[serde(default)]
+    pub source_index_required: bool,
     /// Per-controller resolved request machinery, computed once by
     /// analyze's parent-chain walk and persisted (the self-describing-IR
     /// move: `run_typing_passes` already built these to seed ivars, and
@@ -674,12 +699,15 @@ impl App {
             rbs_signatures: HashMap::new(),
             rbs_includes: HashMap::new(),
             gem_lock: None,
+            gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),
             view_visible_controller_methods: BTreeSet::new(),
+            generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
+            load_hook_class_macros: Vec::new(),
             partial_local_types: HashMap::new(),
             view_ivar_types: HashMap::new(),
             html_safe_methods: BTreeSet::new(),
@@ -700,6 +728,7 @@ impl App {
             controller_resolutions: HashMap::new(),
             sources: Vec::new(),
             const_resolver: Default::default(),
+            source_index_required: false,
             root: String::new(),
             app_roots: Vec::new(),
         }

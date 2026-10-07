@@ -49,7 +49,10 @@ pub fn apply_random_formatter_grounding(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
 
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(recv), method, .. } = &mut *expr.node else { return };
     if !FORMATTER_ONLY.contains(&method.as_str()) {
         return;

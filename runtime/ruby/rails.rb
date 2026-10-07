@@ -498,11 +498,11 @@ module Rails
       []
     end
 
-    # `config.default_per_page = N` inside `Kaminari.configure` in an
-    # initializer: the page size `Relation#page` applies. Lifted at
-    # ingest onto the reopen like the settings above; Kaminari's own
-    # default when the app configures none.
-    def kaminari_default_per_page
+    # Default page size for `Relation#page`. Ingest lifts a literal
+    # `config.default_per_page = N` from a `Kaminari.configure` block
+    # (one input spelling) onto this reopen; 25 when the app configures
+    # none.
+    def default_per_page
       25
     end
   end

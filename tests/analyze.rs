@@ -124,22 +124,20 @@ fn params_resolves_via_implicit_self_in_action_body() {
     assert_eq!(method.as_str(), "[]");
     let params_recv = recv.as_ref().expect("bracket has a receiver");
 
-    // `params` (implicit self Send) — now resolved via ctx.self_ty to Hash<Sym, Str>.
+    // `params` (implicit self Send) — now resolved via ctx.self_ty to ActionController::Parameters.
     match params_recv.ty.as_ref().expect("params ty populated") {
-        Ty::Hash { key, value } => {
-            assert!(matches!(**key, Ty::Sym));
-            assert!(matches!(**value, Ty::Str));
-        }
-        other => panic!("expected Hash<Sym, Str>, got {other:?}"),
+        Ty::Class { id, .. } => assert_eq!(id.0.as_str(), "ActionController::Parameters"),
+        other => panic!("expected ActionController::Parameters, got {other:?}"),
     }
 
-    // `params[:id]` resolves to Union<Str, Nil>.
+    // `params[:id]` resolves to the element union: a String among
+    // Array / Parameters arms, or nil.
     match bracket_send.ty.as_ref().expect("bracket ty populated") {
         Ty::Union { variants } => {
             assert!(variants.iter().any(|v| matches!(v, Ty::Str)));
             assert!(variants.iter().any(|v| matches!(v, Ty::Nil)));
         }
-        other => panic!("expected Union<Str, Nil>, got {other:?}"),
+        other => panic!("expected the params element union, got {other:?}"),
     }
 }
 
@@ -1589,8 +1587,8 @@ fn index_ivar_ty(app: &roundhouse::App, name: &str) -> Ty {
 ///
 /// lobsters' `Search` is the shape: a PORO with `attr_accessor :page`,
 /// living in `app/models`. Because an instance receiver resolves
-/// `class_methods` before `instance_methods`, seeding kaminari's
-/// class-side `page` builder onto it made `@search.page` — an Integer
+/// `class_methods` before `instance_methods`, seeding the class-side
+/// `page` builder onto it made `@search.page` — an Integer
 /// the object assigns itself in `initialize` — resolve to a relation
 /// over `Search`. That mistyping was invisible while chain starts were
 /// `Array`-shaped and became a hard `relation_type` emit error the day
@@ -1649,7 +1647,7 @@ end
         index_ivar_ty(&app, "search"),
     );
 
-    // The attr_accessor answers, NOT kaminari's class-side `page`.
+    // The attr_accessor answers, NOT the class-side `page` builder.
     let page = index_ivar_ty(&app, "page");
     assert!(
         !matches!(page, Ty::Relation { .. } | Ty::Array { .. }),
@@ -3710,6 +3708,64 @@ end
 
     // Convention default layout, resolved through the chain.
     assert_eq!(res.layout.as_ref().map(|s| s.as_str()), Some("layouts/application"));
+}
+
+#[test]
+fn subclass_filter_reads_parent_target_effects() {
+    // `before_action :load_room` declared on the subclass, method body
+    // on the parent. Lookup by included_via/defined_in both names the
+    // subclass, which never stamped the method.
+    let app = app_from_files(&[
+        (
+            "app/controllers/application_controller.rb",
+            r#"class ApplicationController < ActionController::Base
+  private
+
+  def load_room
+    @room = Room.find(1)
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/rooms_controller.rb",
+            r#"class RoomsController < ApplicationController
+  before_action :load_room
+
+  def show
+  end
+end
+"#,
+        ),
+        ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+        ("app/views/rooms/show.html.erb", "<p><%= @room %></p>\n"),
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "rooms", force: :cascade do |t|
+    t.string "name"
+  end
+end
+"#,
+        ),
+    ]);
+
+    let res = app
+        .controller_resolutions
+        .get(&ClassId(Symbol::from("RoomsController")))
+        .expect("RoomsController resolution");
+    let load = res
+        .filter_chain
+        .iter()
+        .find(|rf| rf.filter.target.as_str() == "load_room")
+        .expect("load_room filter");
+    assert_eq!(load.defined_in.0.as_str(), "RoomsController");
+    assert_eq!(load.included_via.0.as_str(), "RoomsController");
+    assert!(
+        load.effects.effects.iter().any(|e| matches!(e, Effect::DbRead { .. })),
+        "parent load_room DbRead must reach the subclass filter hop; got {:?}",
+        load.effects
+    );
 }
 
 #[test]

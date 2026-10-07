@@ -45,6 +45,10 @@ const UNMODELED_OPTIONS: &[&str] = &["filename", "status", "url_based_filename",
 
 fn rewrite_send_file(e: &mut Expr) {
     e.node.for_each_child_mut(&mut rewrite_send_file);
+    rewrite_node(e);
+}
+
+pub(crate) fn rewrite_node(e: &mut Expr) {
     let span = e.span;
     let ExprNode::Send { recv, method, args, block, .. } = &*e.node else { return };
     if method.as_str() != "send_file" || args.is_empty() || args.len() > 2 || block.is_some() {

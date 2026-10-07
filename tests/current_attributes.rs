@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
 
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
 fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     files
         .iter()
@@ -113,4 +116,42 @@ fn class_level_forwarders_exist_for_every_instance_method() {
     ] {
         assert!(c.contains(m), "missing {m:?}:\n{c}");
     }
+}
+
+/// `attribute :session, :user` on CurrentAttributes is the class-body
+/// form apps actually call (`Current.session =`, `Current.user`). The
+/// app-written writer still reaches storage through rewritten `super`.
+#[test]
+fn emitted_current_attributes_session_and_user_run() {
+    emit_and_run::real_blog()
+        .write(
+            "app/models/current.rb",
+            r#"class Current < ActiveSupport::CurrentAttributes
+  attribute :session, :user
+
+  def session=(value)
+    super(value)
+
+    if value.present?
+      self.user = session.user
+    end
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+session = Object.new
+def session.user
+  "ada"
+end
+Current.session = session
+raise "user from session writer" unless Current.user == "ada"
+raise "session stored" unless Current.session.equal?(session)
+Current.reset
+raise "reset user" unless Current.user.nil?
+puts "current attributes passed"
+"#,
+        )
+        .assert_passes();
 }

@@ -39,6 +39,10 @@ pub fn apply_save_without_validation_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &mut *expr.node else {
         return;
     };

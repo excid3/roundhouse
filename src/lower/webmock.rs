@@ -128,6 +128,10 @@ fn http_stub_call(span: crate::span::Span, method: &str, args: Vec<Expr>) -> Exp
 /// outermost send and `stub_request` its receiver.
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     if let Some(r) = replacement_for(expr) {
         *expr = r;
     }

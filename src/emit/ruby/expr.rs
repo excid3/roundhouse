@@ -34,6 +34,8 @@ pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Emit Ruby-family syntax while retaining diagnostics and typed primitive
+/// semantics, including the no-block form of String#bytes with literal &nil.
 pub fn emit_expr(e: &Expr) -> String {
     // A site a lowering replaced with a stub — `lower::object_extend`,
     // the arel `ColumnSpec::Named` placeholder — renders as the raise
@@ -47,6 +49,14 @@ pub fn emit_expr(e: &Expr) -> String {
         let stub = crate::emit::diagnostics::StubStyle::Raise
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
         return format!("({stub})");
+    }
+    if crate::emit::shared::string_bytes::materializes_array(e) {
+        if let ExprNode::Send { recv, method, args, parenthesized, .. } = &*e.node {
+            // Literal &nil supplies no block. Canonicalize it here so Spinel
+            // takes the array-returning native bytes path too; arbitrary block
+            // expressions retain their effects through the ordinary emitter.
+            return emit_send_base(recv.as_ref(), method, args, *parenthesized);
+        }
     }
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));
@@ -238,13 +248,29 @@ fn emit_node(n: &ExprNode) -> String {
                     if e.leading_blank_line {
                         out.push('\n');
                     }
+                    // Not before the first: a value-site Seq renders as
+                    // `(a\nb)`, and the marker must start its line. The
+                    // enclosing statement's or def's marker covers it.
+                    if let Some(m) = super::source_markers::marker_for(&e.span) {
+                        out.push_str(&m);
+                        out.push('\n');
+                    }
                 }
                 out.push_str(&emit_expr(e));
             }
             out
         }
         ExprNode::Assign { target, value } => {
-            format!("{} = {}", emit_lvalue(target), emit_expr(value))
+            // Multi-stmt Seq as RHS (mattr/cattr block defaults) must
+            // group so the assign value is the last expression — bare
+            // newlines end the statement after the first line.
+            let rhs = emit_expr(value);
+            let rhs = if is_multi_seq(value) {
+                format!("({rhs})")
+            } else {
+                rhs
+            };
+            format!("{} = {}", emit_lvalue(target), rhs)
         }
         // Native Ruby compound assignment — `target ||= value`,
         // `target += value`, etc. Preserves source short-circuit

@@ -2,15 +2,15 @@
 module ActionView
   module ViewHelpers
     def self.content_security_policy_nonce: () -> String
-    def self.class_names: (*untyped args) -> String
+    def self.class_names: (*(String | Symbol | Integer | bool | Hash[String | Symbol, untyped] | Array[untyped] | nil) args) -> String
     def self.number_with_delimiter: (Integer value) -> String
     def self.sanitize_to_id: (String name) -> String
     def self.capture: () { () -> untyped } -> String
     def self.concat: (String string) -> String
     def self.polymorphic_url: (untyped record, ?only_path: bool) -> String
-    def self.hidden_field_tag: (untyped name, ?untyped value, ?Hash[Symbol, untyped] opts) -> String
+    def self.hidden_field_tag: (String | Symbol name, ?(String | Integer | Float | bool | nil) value, ?Hash[Symbol, untyped] opts) -> String
     def self.text_area_tag: (String | Symbol name, ?String? content, ?Hash[Symbol, untyped] opts) -> String
-    def self.number_with_precision: (untyped value, ?precision: Integer) -> String
+    def self.number_with_precision: (Integer | Float value, ?precision: Integer) -> String
     def self.number_to_human: (Integer value, ?format: String) -> String
     # `::Time`, not `Time` — these sigs sit inside `module ActionView`,
     # where a bare `Time` resolves to `ActionView::Time` and types the
@@ -34,6 +34,14 @@ module ActionView
     def self.sanitize_void_elements: () -> Array[String]
     def self.sanitize_rawtext_elements: () -> Array[String]
     def self.sanitize_unservable_tags: () -> Array[String]
+    self.@sanitize_default_tags: Array[String]?
+    self.@sanitize_default_attributes: Array[String]?
+    self.@sanitize_uri_attributes: Array[String]?
+    self.@sanitize_allowed_protocols: Array[String]?
+    self.@sanitize_data_mediatypes: Array[String]?
+    self.@sanitize_void_elements: Array[String]?
+    self.@sanitize_rawtext_elements: Array[String]?
+    self.@sanitize_unservable_tags: Array[String]?
     def self.sanitize_space?: (String c) -> bool
     def self.sanitize_tag_name: (String raw) -> String
     def self.sanitize_foreign_end: (String s, Integer from, String name) -> Integer

@@ -21,6 +21,7 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 
+#[allow(dead_code)]
 pub fn apply_test_cookie_jar_lowering(app: &mut App) {
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
@@ -37,6 +38,10 @@ pub fn apply_test_cookie_jar_lowering(app: &mut App) {
 
 fn rewrite(e: &mut Expr) {
     e.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(e);
+}
+
+pub(crate) fn rewrite_node(e: &mut Expr) {
     if is_default_test_request_jar(e) {
         let jar = Expr::new(
             e.span,

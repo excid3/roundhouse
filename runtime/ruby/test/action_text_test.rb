@@ -256,8 +256,13 @@ class ActionTextContentTest < Minitest::Test
 
   def test_blank_tracks_plain_text_not_markup
     assert ActionText::Content.new("").blank?
+    assert ActionText::Content.new("   \n\t").blank?
     assert ActionText::Content.new("<div></div>").blank?
     assert ActionText::Content.new("<div><br></div>").blank?
+    # Entity-decoded whitespace (`&nbsp;` → " ") is blank, matching
+    # ActiveSupport — not only an empty plain-text string.
+    assert ActionText::Content.new("&nbsp;").blank?
+    assert ActionText::Content.new("<div>&nbsp;</div>").blank?
     refute ActionText::Content.new("<div>x</div>").blank?
     assert ActionText::Content.new("<div>x</div>").present?
   end

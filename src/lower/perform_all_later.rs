@@ -24,12 +24,18 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::Symbol;
 
+#[allow(dead_code)]
 pub fn apply_perform_all_later_lowering(app: &mut App) {
     super::for_each_hook_body(app, &mut rewrite);
 }
 
+#[allow(dead_code)]
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     // Inline form: `ActiveJob.perform_all_later(xs.map { … })`.
     if let Some(arg) = perform_all_later_arg(expr) {
         if let Some(each) = map_to_each(arg) {

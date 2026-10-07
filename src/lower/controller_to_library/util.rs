@@ -386,3 +386,22 @@ where
         decisions: expr.decisions,
     }
 }
+
+/// In-place twin of [`map_expr`]. Returns whether any node was replaced,
+/// so callers can skip a follow-up typing pass when nothing changed.
+pub fn map_expr_mut<F>(expr: &mut Expr, f: &F) -> bool
+where
+    F: Fn(&Expr) -> Option<Expr>,
+{
+    if let Some(replacement) = f(expr) {
+        *expr = replacement;
+        return true;
+    }
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if map_expr_mut(c, f) {
+            changed = true;
+        }
+    });
+    changed
+}

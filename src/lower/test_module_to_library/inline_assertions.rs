@@ -36,7 +36,7 @@
 //! their helper bodies in `runtime/spinel/test/test_helper.rb` raise
 //! directly rather than delegating to a vacuous `assert`.
 
-use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal, RescueClause};
+use crate::expr::{Expr, ExprNode, LValue, Literal, RescueClause};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 
@@ -44,146 +44,57 @@ use crate::span::Span;
 /// assertion Sends to inline raise statements. Unrecognized Sends
 /// pass through unchanged.
 pub fn inline_assertions(body: &Expr) -> Expr {
-    map_expr(body)
+    let mut clone = body.clone();
+    inline_assertions_in_place(&mut clone);
+    clone
 }
 
-fn map_expr(e: &Expr) -> Expr {
-    // Recurse first (bottom-up). After children are rewritten, give
-    // the current node a chance to rewrite at this level. For Seq
-    // nodes, flatten any inlined Seq replacements so downstream
-    // emitters see a single flat statement list.
-    let inner = match &*e.node {
-        ExprNode::Seq { exprs } => {
-            let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
-            for child in exprs {
-                let mapped = map_expr(child);
-                if let ExprNode::Seq { exprs: nested } = &*mapped.node {
-                    // Splice — a per-statement assertion rewrite that
-                    // produces multiple statements (e.g. assert_difference)
-                    // returns a Seq; flatten into the surrounding Seq so
-                    // emit produces a clean statement list rather than a
-                    // nested begin block.
-                    out.extend(nested.iter().cloned());
-                } else {
-                    out.push(mapped);
+/// In-place twin. Returns whether any assertion was rewritten (or a
+/// nested Seq flattened as a rewrite's result) so the test lowerer
+/// can skip a follow-up typing pass.
+pub fn inline_assertions_in_place(body: &mut Expr) -> bool {
+    walk_inline(body)
+}
+
+fn walk_inline(e: &mut Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Seq { .. }) {
+        let exprs = match &mut *e.node {
+            ExprNode::Seq { exprs } => std::mem::take(exprs),
+            _ => unreachable!(),
+        };
+        let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
+        let mut changed = false;
+        for mut child in exprs {
+            if walk_inline(&mut child) {
+                changed = true;
+            }
+            let node = std::mem::replace(&mut *child.node, ExprNode::SelfRef);
+            match node {
+                ExprNode::Seq { exprs: nested } => {
+                    changed = true;
+                    out.extend(nested);
+                }
+                other => {
+                    *child.node = other;
+                    out.push(child);
                 }
             }
-            return Expr::new(e.span, ExprNode::Seq { exprs: out });
         }
-        ExprNode::If { cond, then_branch, else_branch } => ExprNode::If {
-            cond: map_expr(cond),
-            then_branch: map_expr(then_branch),
-            else_branch: map_expr(else_branch),
-        },
-        ExprNode::Case { scrutinee, arms } => ExprNode::Case {
-            scrutinee: map_expr(scrutinee),
-            arms: arms
-                .iter()
-                .map(|a| crate::expr::Arm {
-                    pattern: a.pattern.clone(),
-                    guard: a.guard.as_ref().map(map_expr),
-                    body: map_expr(&a.body),
-                })
-                .collect(),
-        },
-        ExprNode::Send { recv, method, args, block, parenthesized } => ExprNode::Send {
-            recv: recv.as_ref().map(map_expr),
-            method: method.clone(),
-            args: args.iter().map(map_expr).collect(),
-            block: block.as_ref().map(map_expr),
-            parenthesized: *parenthesized,
-        },
-        ExprNode::Apply { fun, args, block } => ExprNode::Apply {
-            fun: map_expr(fun),
-            args: args.iter().map(map_expr).collect(),
-            block: block.as_ref().map(map_expr),
-        },
-        ExprNode::Lambda { rest_param, params, block_param, body, block_style } => ExprNode::Lambda { rest_param: rest_param.clone(),
-            params: params.clone(),
-            block_param: block_param.clone(),
-            body: map_expr(body),
-            block_style: *block_style,
-        },
-        ExprNode::Assign { target, value } => ExprNode::Assign {
-            target: match target {
-                LValue::Attr { recv, name } => LValue::Attr {
-                    recv: map_expr(recv),
-                    name: name.clone(),
-                },
-                LValue::Index { recv, index } => LValue::Index {
-                    recv: map_expr(recv),
-                    index: map_expr(index),
-                },
-                other => other.clone(),
-            },
-            value: map_expr(value),
-        },
-        ExprNode::Let { id, name, value, body } => ExprNode::Let {
-            id: *id,
-            name: name.clone(),
-            value: map_expr(value),
-            body: map_expr(body),
-        },
-        ExprNode::BoolOp { op, surface, left, right } => ExprNode::BoolOp {
-            op: *op,
-            surface: *surface,
-            left: map_expr(left),
-            right: map_expr(right),
-        },
-        ExprNode::Return { value } => ExprNode::Return { value: map_expr(value) },
-        ExprNode::Raise { value } => ExprNode::Raise { value: map_expr(value) },
-        ExprNode::Yield { args } => ExprNode::Yield {
-            args: args.iter().map(map_expr).collect(),
-        },
-        ExprNode::BeginRescue { body, rescues, else_branch, ensure, implicit } => {
-            ExprNode::BeginRescue {
-                body: map_expr(body),
-                rescues: rescues
-                    .iter()
-                    .map(|rc| RescueClause {
-                        classes: rc.classes.iter().map(map_expr).collect(),
-                        binding: rc.binding.clone(),
-                        body: map_expr(&rc.body),
-                    })
-                    .collect(),
-                else_branch: else_branch.as_ref().map(map_expr),
-                ensure: ensure.as_ref().map(map_expr),
-                implicit: *implicit,
-            }
+        let ExprNode::Seq { exprs } = &mut *e.node else { unreachable!() };
+        *exprs = out;
+        return changed;
+    }
+    let mut changed = false;
+    e.node.for_each_child_mut(&mut |c| {
+        if walk_inline(c) {
+            changed = true;
         }
-        ExprNode::Hash { entries, kwargs } => ExprNode::Hash {
-            entries: entries
-                .iter()
-                .map(|(k, v)| (map_expr(k), map_expr(v)))
-                .collect(),
-            kwargs: *kwargs,
-        },
-        ExprNode::Array { elements, style } => ExprNode::Array {
-            elements: elements.iter().map(map_expr).collect(),
-            style: *style,
-        },
-        ExprNode::StringInterp { parts } => ExprNode::StringInterp {
-            parts: parts
-                .iter()
-                .map(|p| match p {
-                    InterpPart::Text { value } => InterpPart::Text { value: value.clone() },
-                    InterpPart::Expr { expr } => InterpPart::Expr { expr: map_expr(expr) },
-                })
-                .collect(),
-        },
-        _ => return rewrite_send(e).unwrap_or_else(|| e.clone()),
-    };
-    let new_e = Expr {
-        span: e.span,
-        node: Box::new(inner),
-        ty: e.ty.clone(),
-        effects: e.effects.clone(),
-        leading_blank_line: e.leading_blank_line,
-        diagnostic: e.diagnostic.clone(),
-        hint: e.hint,
-        decisions: e.decisions,
-    };
-    rewrite_send(&new_e).unwrap_or(new_e)
+    });
+    if let Some(replacement) = rewrite_send(e) {
+        *e = replacement;
+        return true;
+    }
+    changed
 }
 
 /// Rewrite a bare-receiver `assert_*`/`refute_*` Send into an inline

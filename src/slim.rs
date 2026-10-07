@@ -142,10 +142,18 @@ fn line_to_ruby(
         }
         b if b.is_ascii_alphabetic() => {
             if let Some(rest) = content.strip_prefix("doctype") {
-                if rest.trim() != "html" {
-                    gap(format!("slim doctype not supported: {}", rest.trim()));
+                let xhtml = |kind: &str, dtd: &str| {
+                    format!("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 {kind}//EN\" \"http://www.w3.org/TR/xhtml1/DTD/{dtd}.dtd\">\n")
+                };
+                match rest.trim() {
+                    "html" | "5" => c.text("<!DOCTYPE html>\n"),
+                    "transitional" => c.text(&xhtml("Transitional", "xhtml1-transitional")),
+                    "strict" => c.text(&xhtml("Strict", "xhtml1-strict")),
+                    other => {
+                        gap(format!("slim doctype not supported: {other}"));
+                        c.text("<!DOCTYPE html>\n");
+                    }
                 }
-                c.text("<!DOCTYPE html>\n");
             } else if let Some(name) = embedded_engine(content) {
                 if name == "ruby" {
                     skip_frame(c, indent, Capture::RawRuby);
@@ -431,7 +439,9 @@ fn element(
         c.out.push_str(&ruby_string_literal(rest));
         c.seg(c_start, off, off + rest.len());
         c.out.push('\n');
-        c.text(&format!("</{tag}>"));
+        // Deeper lines continue the inline text; the frame closes the tag.
+        c.stack.push(Frame { indent, close: Close::Tag(tag), capture: Capture::None, ruby_block: false });
+        *text_block = Some(indent);
     }
 }
 
@@ -508,9 +518,18 @@ mod tests {
     }
 
     #[test]
+    fn inline_text_continues_on_deeper_lines() {
+        let r = ruby("p one\n  two\n  three\nspan x\n");
+        assert!(r.contains("\"two\\n\"") && r.contains("\"three\\n\""), "got:\n{r}");
+        assert!(r.find("</p>").unwrap() > r.find("three").unwrap(), "got:\n{r}");
+        assert!(r.find("</p>").unwrap() < r.find("<span>").unwrap(), "got:\n{r}");
+    }
+
+    #[test]
     fn doctype_and_ruby_engine() {
         let r = ruby("doctype html\nruby:\n  x = 1\n");
         assert!(r.contains("<!DOCTYPE html>"), "got:\n{r}");
+        assert!(ruby("doctype transitional\n").contains("XHTML 1.0 Transitional"));
         assert!(r.contains("x = 1\n") && !r.contains("\"x = 1"), "got:\n{r}");
     }
 

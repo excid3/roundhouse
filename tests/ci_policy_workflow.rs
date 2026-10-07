@@ -9,10 +9,10 @@ fn unit_batches_all_targets_without_reducing_coverage() {
     assert!(unit.get("continue-on-error").is_none());
     assert_eq!(unit["runs-on"].as_str(), Some("ubuntu-latest"));
     assert_eq!(unit["strategy"]["fail-fast"].as_bool(), Some(false));
-    assert_eq!(unit["strategy"]["max-parallel"].as_u64(), Some(3));
+    assert_eq!(unit["strategy"]["max-parallel"].as_u64(), Some(4));
     assert_eq!(
         unit["strategy"]["matrix"]["shard"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[0, 1, 2]").unwrap()
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[0, 1, 2, 3]").unwrap()
     );
     assert!(
         unit.get("outputs").is_none(),
@@ -37,9 +37,11 @@ fn unit_batches_all_targets_without_reducing_coverage() {
         .expect("install sqlite3, bcrypt and ruby-vips before the unit batches");
     let install = steps[gems]["run"].as_str().unwrap();
     assert!(
-        install.contains("gem install sqlite3")
+        install.contains("sqlite3")
             && install.contains("bcrypt")
-            && install.contains("ruby-vips"),
+            && install.contains("ruby-vips")
+            && install.contains("rails-html-sanitizer")
+            && install.contains("activerecord"),
         "{install}"
     );
     let vips = steps
@@ -48,6 +50,11 @@ fn unit_batches_all_targets_without_reducing_coverage() {
             step["name"].as_str() == Some("System libvips for the emitted ruby-vips processor")
         })
         .expect("install libvips42 before ruby-vips");
+    let vips_run = steps[vips]["run"].as_str().unwrap();
+    assert!(
+        vips_run.contains("ci-apt-install") && vips_run.contains("libvips42"),
+        "{vips_run}"
+    );
     assert!(
         vips < gems,
         "ruby-vips binds the system libvips; the package must be on the box first"
@@ -95,7 +102,11 @@ fn unit_batches_all_targets_without_reducing_coverage() {
     let body = bench["run"].as_str().unwrap();
     assert!(body.contains("bash -euo pipefail -c"));
     assert!(body.contains("typescript crystal rust python elixir go kotlin swift csharp"));
-    assert!(body.contains("cargo run --quiet --bin emit_preview -- --target"));
+    assert!(body.contains("target/debug/emit_preview --target"));
+    assert!(
+        !body.contains("cargo run"),
+        "shard 0 already built bins; do not pay cargo startup per lane"
+    );
     let resources = steps
         .iter()
         .find(|step| step["with"]["name"].as_str() == Some("unit-resources-${{ matrix.shard }}"))
@@ -113,6 +124,9 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     assert_eq!(jobs["unit"]["needs"].as_str(), Some("generate-fixture"));
+    assert_eq!(jobs["generate-fixture"]["needs"].as_str(), Some("plan"));
+    assert!(jobs["generate-fixture"].get("if").is_none());
+    assert!(jobs["unit"].get("if").is_none());
     for name in [
         "build-roundhouse",
         "build-wasm",
@@ -169,7 +183,13 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
                 "{name}: {required}"
             );
         }
-        assert_eq!(jobs[name]["if"].as_str(), Some("always()"));
+        // cancelled() overrides GitHub's implicit success(): expected skips
+        // and failed/cancelled jobs must reach the gate, while cancellation
+        // of the entire workflow must not schedule more work.
+        assert_eq!(
+            jobs[name]["if"].as_str(),
+            Some("${{ !cancelled() && needs.plan.result == 'success' }}")
+        );
     }
 }
 
@@ -363,6 +383,7 @@ fn resource_and_harness_helpers_preserve_failures_and_contracts() {
     for test in [
         "tests/ci_resources_test.py",
         "tests/ci_unit_tests_test.py",
+        "tests/ci_apt_install_test.py",
         "tests/ci_campfire_optimization_test.py",
         "tests/ci_smoke_test.py",
     ] {
@@ -457,9 +478,6 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         ci["on"]["workflow_call"]["outputs"]["complete"]["value"].as_str(),
         Some("${{ jobs.ci-summary.outputs.complete }}")
     );
-    for name in ["compact-required", "ci-summary"] {
-        assert_eq!(jobs[name]["if"].as_str(), Some("always()"));
-    }
     let gate = jobs["ci-summary"]["needs"].as_sequence().unwrap();
     for name in jobs.as_mapping().unwrap().keys().filter_map(|v| v.as_str()) {
         if name != "ci-summary" {

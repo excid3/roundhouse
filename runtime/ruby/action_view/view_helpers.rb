@@ -206,10 +206,10 @@ module ActionView
       "<" => "%3C", "=" => "%3D", ">" => "%3E", "?" => "%3F",
       "@" => "%40", "[" => "%5B", "\\" => "%5C", "]" => "%5D",
       "^" => "%5E", "`" => "%60", "{" => "%7B", "|" => "%7C",
-      "}" => "%7D",
+      "}" => "%7D", "\r" => "%0D", "\n" => "%0A", "\0" => "%00",
     }.freeze
 
-    URL_ESCAPE_PATTERN = /[ !"\#$%&'()*+,\/:;<=>?@\[\\\]^`{|}]/.freeze
+    URL_ESCAPE_PATTERN = /[\x00\r\n !"\#$%&'()*+,\/:;<=>?@\[\\\]^`{|}]/.freeze
 
     # Same include? probe as html_escape (no portable match? emit).
     def self.url_encode(s)
@@ -277,7 +277,7 @@ module ActionView
       "<" => "%3C", "=" => "%3D", ">" => "%3E", "?" => "%3F",
       "@" => "%40", "[" => "%5B", "\\" => "%5C", "]" => "%5D",
       "^" => "%5E", "`" => "%60", "{" => "%7B", "|" => "%7C",
-      "}" => "%7D",
+      "}" => "%7D", "\r" => "%0D", "\n" => "%0A", "\0" => "%00",
     }.freeze
 
     # `URL_ESCAPE_PATTERN` minus the `@`, for `mail_to`'s address.
@@ -308,7 +308,7 @@ module ActionView
         s.include?("<") || s.include?("=") || s.include?(">") || s.include?("?") ||
         s.include?("@") || s.include?("[") || s.include?("\\") || s.include?("]") ||
         s.include?("^") || s.include?("`") || s.include?("{") || s.include?("|") ||
-        s.include?("}")
+        s.include?("}") || s.include?("\r") || s.include?("\n") || s.include?("\0")
     end
 
     # Like `needs_url_escape?` but without `@` — `MAILTO_ESCAPE_PATTERN`.
@@ -571,20 +571,16 @@ module ActionView
     # `authenticity_token` value is the form-field name; the token value
     # is empty here because spinel-blog doesn't sign sessions.
     def self.csrf_meta_tags
-      %(<meta name="csrf-param" content="authenticity_token" />\n<meta name="csrf-token" content="#{form_authenticity_token}" />)
+      %(<meta name="csrf-param" content="authenticity_token" />\n<meta name="csrf-token" content="#{html_escape(form_authenticity_token)}" />)
     end
 
     # The per-request CSRF token every csrf-emitting helper
     # (csrf_meta_tags / csrf_token_hidden_input / button_to) reads.
-    # Empty in the shared runtime — targets without session-backed
-    # token generation render the same empty value they always have,
-    # and the compare harness blanks the attribute either way. The
-    # CRuby overlay overrides this with a session-backed lazy
-    # generator (runtime/action_controller_session.rb), which is how
-    # real tokens reach lobsters' login form without the shared
-    # runtime needing SecureRandom or a session on every target.
+    # Session-backed and lazy: a page with no form does not grow a
+    # session. Empty when no controller is parked (unit helpers, or a
+    # target whose dispatcher does not assign Current.controller).
     def self.form_authenticity_token
-      ""
+      ActionController.masked_authenticity_token
     end
   
     # Empty in dev mode without a CSP nonce configured, mirroring Rails'
@@ -853,7 +849,7 @@ module ActionView
       # on that lane). The explicit comparison is false for every
       # target's unset shape and for `false` alike.
       return "" if @broadcast_rendering == true
-      %(<input type="hidden" name="authenticity_token" value="#{form_authenticity_token}">)
+      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
     end
 
     # Bracket a broadcast partial render (the lowered
@@ -974,8 +970,12 @@ module ActionView
       attrs.delete(:builder)
       url = opts.fetch(:url, nil)
       action = url.nil? ? "" : %( action="#{html_escape(url.to_s)}")
+      # Stringify at this boundary: `opts.fetch` is Hash[Symbol, untyped]
+      # and a gradual Value must not cross into `method_override_input`'s
+      # `String | Symbol` param (rust `&str`). Same shape as `mail_to`.
+      method = opts.fetch(:method, :post)
       %(<form#{render_attrs(attrs)}#{action} accept-charset="UTF-8" method="post">) +
-        method_override_input(opts.fetch(:method, :post)) +
+        method_override_input(method.to_s) +
         csrf_token_hidden_input +
         "</form>"
     end
@@ -1034,7 +1034,9 @@ module ActionView
     # a `next unless` — the same kotlin gap sits latent there.)
     def self.render_attrs(attrs)
       return "" if attrs.empty?
-      pairs = []
+      # Concat, not `<<`: `out << s` lowers as `.add` / write-into-`&str`
+      # on Kotlin/C#/Rust/Python/Elixir. Same shape as `sanitize_to_id`.
+      out = ""
       attrs.each do |k, v|
         # The name bindings sit ABOVE the nil guards on purpose: the
         # TypeScript emitter declares a local where it is FIRST
@@ -1053,7 +1055,7 @@ module ActionView
                 # `(String) -> String` and the untyped values flowing
                 # through Hash[String, untyped] need explicit
                 # stringification.
-                pairs << " #{name}-#{inner_name}=\"#{html_escape(inner_v.to_s)}\""
+                out = out + " #{name}-#{inner_name}=\"#{html_escape(inner_v.to_s)}\""
               end
             end
           elsif boolean_attr?(name)
@@ -1071,13 +1073,13 @@ module ActionView
             # Rails (truthy) and is omitted here — no corpus site
             # writes one, and literal sites lower through the
             # compile-time loops, not this method.
-            pairs << " #{name}=\"#{name}\"" unless v.to_s == "false"
+            out = out + " #{name}=\"#{name}\"" unless v.to_s == "false"
           else
-            pairs << " #{name}=\"#{html_escape(attr_value_text(name, v))}\""
+            out = out + " #{name}=\"#{html_escape(attr_value_text(name, v))}\""
           end
         end
       end
-      pairs.join
+      out
     end
 
     # The TEXT of one attribute value, before escaping: `to_s` here,

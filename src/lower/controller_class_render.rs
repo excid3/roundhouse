@@ -43,12 +43,17 @@ use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
-pub fn apply_controller_class_render(app: &mut App) {
-    let contracts = crate::lower::view_to_library::partial_call_contracts(
+pub(crate) fn call_contracts(app: &App) -> Contracts {
+    crate::lower::view_to_library::partial_call_contracts(
         &app.views,
         &app.controllers,
         &app.library_classes,
-    );
+    )
+}
+
+#[allow(dead_code)]
+pub fn apply_controller_class_render(app: &mut App) {
+    let contracts = call_contracts(app);
     if contracts.is_empty() {
         return;
     }
@@ -81,7 +86,7 @@ pub fn apply_controller_class_render(app: &mut App) {
 /// `attachments_for` answers `[attribute_attachment_for(…),
 /// content_attachment_for(…)]`, each of which ends in
 /// `attachment_from(…)`, which ends in `from_node`.
-struct Builders {
+pub(crate) struct Builders {
     one: std::collections::HashSet<Symbol>,
     many: std::collections::HashSet<Symbol>,
 }
@@ -92,7 +97,7 @@ impl Builders {
     }
 }
 
-fn attachment_builders(helpers: &[crate::dialect::MethodDef]) -> Builders {
+pub(crate) fn attachment_builders(helpers: &[crate::dialect::MethodDef]) -> Builders {
     let mut b = Builders { one: Default::default(), many: Default::default() };
     loop {
         let before = (b.one.len(), b.many.len());
@@ -138,7 +143,7 @@ fn builds_attachment(tail: &Expr) -> bool {
 /// Locals in `body` holding an attachment: assigned from a call to a
 /// one-attachment builder, or the block parameter of `.map` / `.each`
 /// over a call to an Array one (`attachments_for(…).map do |attachment|`).
-fn attachment_locals(body: &Expr, builders: &Builders) -> std::collections::HashSet<Symbol> {
+pub(crate) fn attachment_locals(body: &Expr, builders: &Builders) -> std::collections::HashSet<Symbol> {
     let mut out = std::collections::HashSet::new();
     if builders.is_empty() {
         return out;
@@ -164,13 +169,21 @@ fn attachment_locals(body: &Expr, builders: &Builders) -> std::collections::Hash
     out
 }
 
-type Contracts = std::collections::HashMap<
+fn rewrite(expr: &mut Expr, contracts: &Contracts, attachment_locals: &std::collections::HashSet<Symbol>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, contracts, attachment_locals));
+    rewrite_node(expr, contracts, attachment_locals);
+}
+
+pub(crate) type Contracts = std::collections::HashMap<
     (String, String),
     crate::lower::view_to_library::PartialCallContract,
 >;
 
-fn rewrite(expr: &mut Expr, contracts: &Contracts, attachment_locals: &std::collections::HashSet<Symbol>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, contracts, attachment_locals));
+pub(crate) fn rewrite_node(
+    expr: &mut Expr,
+    contracts: &Contracts,
+    attachment_locals: &std::collections::HashSet<Symbol>,
+) {
     // `render_action_text_attachment(attachment)` — Action Text's own
     // helper for the same render: `ActionText::ContentHelper`'s, which
     // renders the attachment's partial with the attachment as its local.

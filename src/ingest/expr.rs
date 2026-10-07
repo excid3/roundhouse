@@ -60,6 +60,22 @@ fn multi_write_target(node: &Node<'_>, file: &str) -> IngestResult<crate::expr::
         let recv = ingest_expr(&it.receiver(), file)?;
         let index = ingest_index_argument(it.arguments(), file)?;
         Ok(crate::expr::LValue::Index { recv, index })
+    } else if let Some(ct) = node.as_constant_target_node() {
+        // `A, B = pair` — class-scoped constants, as `A = …` writes.
+        Ok(crate::expr::LValue::Const { path: vec![Symbol::from(constant_id_str(&ct.name()))] })
+    } else if let Some(cp) = node.as_constant_path_target_node() {
+        // `Foo::A, Foo::B = pair` — qualified constants.
+        let mut path: Vec<Symbol> = cp
+            .parent()
+            .and_then(|p| crate::ingest::util::constant_path_segments_strs(&p))
+            .unwrap_or_default()
+            .into_iter()
+            .map(Symbol::from)
+            .collect();
+        if let Some(id) = cp.name() {
+            path.push(Symbol::from(constant_id_str(&id)));
+        }
+        Ok(crate::expr::LValue::Const { path })
     } else {
         Err(IngestError::Unsupported {
             file: file.into(),
@@ -225,6 +241,13 @@ pub(super) fn sorbet_assertion_argument<'pr>(node: &Node<'pr>) -> Option<Node<'p
     call.arguments()?.arguments().iter().next()
 }
 
+/// Whether the sorbet assertion `node` (see [`sorbet_assertion_argument`])
+/// raises on nil, and so answers its argument with nil ruled out.
+fn sorbet_assertion_rules_out_nil(node: &Node<'_>) -> bool {
+    node.as_call_node()
+        .is_some_and(|c| matches!(constant_id_str(&c.name()), "must" | "must_because"))
+}
+
 /// The argument of a `T.absurd(x)`, which raises rather than
 /// evaluating to it. See the call site in `ingest_expr_strict`.
 fn sorbet_absurd_argument<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
@@ -327,7 +350,64 @@ fn ingest_defined_operand(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     })
 }
 
+/// Whether a trailing `#:` comment after `node` can be a type
+/// ascription of the value it evaluates to.
+///
+/// Writes carry theirs on the assigned value (see the write arms), and
+/// definitions have no value to ascribe. A call whose name ends in `=`
+/// is an attribute or index write, and `attr_reader :x #: Integer`
+/// documents the attribute rather than the call's result.
+fn takes_trailing_ascription(node: &Node<'_>) -> bool {
+    if let Some(call) = node.as_call_node() {
+        let name = call.name();
+        let name = constant_id_str(&name);
+        let is_write = name.ends_with('=')
+            && !matches!(name, "==" | "!=" | "<=" | ">=" | "===");
+        let is_attr = call.receiver().is_none()
+            && matches!(name, "attr_reader" | "attr_writer" | "attr_accessor");
+        return !is_write && !is_attr;
+    }
+    node.as_parentheses_node().is_some()
+        || node.as_local_variable_read_node().is_some()
+        || node.as_instance_variable_read_node().is_some()
+        || node.as_and_node().is_some()
+        || node.as_or_node().is_some()
+        || node.as_super_node().is_some()
+        || node.as_forwarding_super_node().is_some()
+        || node.as_yield_node().is_some()
+}
+
 fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
+    if !takes_trailing_ascription(node) {
+        return ingest_expr_node(node, file);
+    }
+    // `x || y #: T`: both `y` and the OrNode share the same end offset.
+    // Only the outermost eligible expression may consume the comment.
+    let end = node.location().end_offset();
+    let outermost = super::type_ascription::push_trailing_ascription_claim(end);
+    // Drop-guard: ingest paths can panic (`expect` in constant_id_str);
+    // a skipped pop would leave a stale end on the thread-local stack
+    // and silently drop later trailing `#:` ascriptions at that offset.
+    struct PopClaim;
+    impl Drop for PopClaim {
+        fn drop(&mut self) {
+            super::type_ascription::pop_trailing_ascription_claim();
+        }
+    }
+    let expr = {
+        let _pop = PopClaim;
+        ingest_expr_node(node, file)
+    }?;
+    if !outermost {
+        return Ok(expr);
+    }
+    Ok(super::type_ascription::ascribe_trailing(
+        expr,
+        super::type_ascription::trailing_ascription(file, end),
+    ))
+}
+
+fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Byte offsets into the text registered for `file` (the exact text
     // prism is parsing). FileId(0) when the entry point didn't
     // register — spans then render message-only downstream.
@@ -337,21 +417,18 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         start: loc.start_offset() as u32,
         end: loc.end_offset() as u32,
     };
-    // sorbet-runtime's value-level assertions evaluate to their first
-    // argument: `T.let(x, String)` IS `x` at run time, and so is
-    // `T.must(x)` / `T.cast(x, T)` / `T.bind(self, T)`. Unwrapping here
-    // keeps the wrapped expression's own type flowing downstream;
-    // without it the site dispatches a method on `T` — a module no gem
-    // in the catalog defines — and every use of the value below it is
-    // untyped from there on.
-    //
-    // Deliberately lossy: the declared type is discarded rather than
-    // read. Turning an annotation into a SEED is a separate question
-    // with its own policy (whether it wins over inference, what a
-    // contradiction means, what `T.untyped` does), and the unwrap has
-    // to be able to land without answering any of it.
+    // Type ascriptions retain the value and its declared type. Nil assertions
+    // are behavior: until a shared nil-check lowerer exists, retain their
+    // explicit Unsupported annotation instead of erasing a possible raise.
     if let Some(inner) = sorbet_assertion_argument(node) {
-        return ingest_expr_strict(&inner, file);
+        let declared = super::type_ascription::sorbet_declared_type(node);
+        let value = ingest_expr_strict(&inner, file)?;
+        let value = if sorbet_assertion_rules_out_nil(node) {
+            super::type_ascription::not_nil(value)
+        } else {
+            value
+        };
+        return Ok(super::type_ascription::ascribe(value, declared));
     }
 
     // `T.absurd(x)` is NOT an assertion that evaluates to its argument:
@@ -393,7 +470,22 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 vec![]
             };
             let recv = match c.receiver() {
-                Some(r) => Some(ingest_expr(&r, file)?),
+                Some(r) => {
+                    let value = ingest_expr(&r, file)?;
+                    // `self #: as untyped` above a leading-dot line:
+                    // the assertion sits after the receiver and before
+                    // the `.method` it is the receiver of.
+                    // Receivers that read their own trailing comment
+                    // (see `takes_trailing_ascription`) already did.
+                    if takes_trailing_ascription(&r) {
+                        Some(value)
+                    } else {
+                        Some(super::type_ascription::ascribe_trailing(
+                            value,
+                            super::type_ascription::receiver_rbs_assertion(file, r.location().end_offset()),
+                        ))
+                    }
+                }
                 None => None,
             };
             let block = match c.block() {
@@ -909,6 +1001,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
+            refuse_block_capture(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
@@ -983,6 +1076,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = raw.strip_prefix('@').unwrap_or(raw);
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Ivar { name: Symbol::from(name) },
                 value,
@@ -992,6 +1086,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_local_variable_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::Assign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 value,
@@ -1132,6 +1227,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = Symbol::from(raw.strip_prefix('@').unwrap_or(raw));
             let value = ingest_expr(&w.value(), file)?;
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Ivar { name },
                 op: crate::expr::OpAssignOp::OrOr,
@@ -2045,6 +2141,20 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                     .into(),
             });
         }
+        // `class << self … end` at expression position (inside an
+        // `included do` / `Class.new do` block, where no class-body walk
+        // classifies it). Ruby evaluates the body with `self` the
+        // singleton class and the block's value is its last statement
+        // (nil when empty). The `def`s in it lift to nil exactly as a
+        // bare `def` does above; the statements around them keep their
+        // own expressions, so a constant or call in the block is not lost.
+        n if n.as_singleton_class_node().is_some() => {
+            let sc = n.as_singleton_class_node().unwrap();
+            match sc.body() {
+                Some(body) => return ingest_expr(&body, file),
+                None => ExprNode::Lit { value: Literal::Nil },
+            }
+        }
         other => {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -2660,6 +2770,7 @@ fn ingest_call_block(
             // standalone-lambda-vs-attached-block distinction is lost,
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
+                refuse_block_capture(lam.parameters(), file)?;
                 let params = block_param_names(lam.parameters());
                 let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
@@ -2726,6 +2837,7 @@ fn ingest_call_block(
 /// hands this the same `BlockNode` shape one level deeper (inside the
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
+    refuse_block_capture(b.parameters(), file)?;
     let params = block_param_names(b.parameters());
     let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
@@ -2775,6 +2887,20 @@ fn block_style_from_opening(bytes: &[u8]) -> crate::expr::BlockStyle {
     } else {
         BlockStyle::Do
     }
+}
+
+/// Authored block captures are not retained by the Lambda ingest below.
+/// Refuse before dropping a binding that could shadow an outer local.
+fn refuse_block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<()> {
+    if params_node.and_then(|node| node.as_block_parameters_node())
+        .and_then(|node| node.parameters()).is_some_and(|params| params.block().is_some())
+    {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "block parameter capture requires preserved Lambda signature semantics".into(),
+        });
+    }
+    Ok(())
 }
 
 fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {

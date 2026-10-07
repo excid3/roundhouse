@@ -61,7 +61,10 @@ pub fn apply_global_id_locate_lowering(app: &mut App) {
 
 fn rewrite(expr: &mut Expr, models: &mut BTreeSet<Symbol>) {
     expr.node.for_each_child_mut(&mut |child| rewrite(child, models));
+    rewrite_node(expr, models);
+}
 
+pub(crate) fn rewrite_node(expr: &mut Expr, models: &mut BTreeSet<Symbol>) {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else {
         return;
     };

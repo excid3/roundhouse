@@ -33,6 +33,50 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
             cls.instance_methods.entry(m.clone()).or_insert_with(|| ty.clone());
         }
     }
+    // Beyond what the runtime implements, the connection a program gets is
+    // Rails' `AbstractAdapter`, and code that reaches for the adapter
+    // (`quote_column_name` in a hand-built query, `transaction_open?` in a
+    // guard) calls its documented surface. Those names were reported as
+    // unknown methods of `ActiveRecord::Connection`. The runtime's own
+    // signatures above win where both speak; what is added has plain Ruby
+    // result types, and the adapter objects it hands out (the transaction
+    // manager, the pool, the current transaction) stay untyped.
+    let str = Ty::Str;
+    let untyped_rows = Ty::Array { elem: Box::new(Ty::Array { elem: Box::new(Ty::Untyped) }) };
+    let untyped_list = Ty::Array { elem: Box::new(Ty::Untyped) };
+    let cls = classes.entry(ClassId(Symbol::from("ActiveRecord::Connection"))).or_default();
+    for (name, ty) in [
+        ("quote_column_name", str.clone()),
+        ("quote_table_name", str.clone()),
+        ("quoted_date", str.clone()),
+        ("quoted_true", str.clone()),
+        ("quoted_false", str.clone()),
+        ("transaction_open?", Ty::Bool),
+        ("table_exists?", Ty::Bool),
+        ("column_exists?", Ty::Bool),
+        ("index_exists?", Ty::Bool),
+        ("active?", Ty::Bool),
+        ("supports_json?", Ty::Bool),
+        ("open_transactions", Ty::Int),
+        ("select_rows", untyped_rows),
+        ("select_values", untyped_list.clone()),
+        ("select_one", Ty::Untyped),
+        ("select_value", Ty::Untyped),
+        ("tables", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("columns", untyped_list.clone()),
+        ("indexes", untyped_list),
+        ("insert", Ty::Untyped),
+        ("update", Ty::Int),
+        ("delete", Ty::Int),
+        ("transaction", Ty::Untyped),
+        ("current_transaction", Ty::Untyped),
+        ("transaction_manager", Ty::Untyped),
+        ("pool", Ty::Untyped),
+        ("raw_connection", Ty::Untyped),
+        ("database_version", Ty::Untyped),
+    ] {
+        cls.instance_methods.entry(Symbol::from(name)).or_insert(ty);
+    }
 }
 
 pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
@@ -50,18 +94,28 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // real `active_record/base.rb` library file (none in practice)
     // would still win.
     {
-        let mut base = ClassInfo::default();
+        // Prefer `entry().or_default()` so later registration cannot
+        // drop methods we seed here. Raw-SQL helpers live in
+        // `connection.rbs` / `connection.rb` (`sanitize_sql`,
+        // `sanitize_sql_array`, …) — without them on Base, app calls
+        // fail `send_dispatch` even though the runtime defines them
+        // (#400).
+        let base = classes
+            .entry(ClassId(Symbol::from("ActiveRecord::Base")))
+            .or_default();
         for m in [
             "transaction",
             "connection_pool",
             "establish_connection",
         ] {
-            base.class_methods.insert(Symbol::from(m), Ty::Untyped);
+            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
         }
-        base.class_methods.insert(Symbol::from("connection"), connection_ty());
-        classes
-            .entry(ClassId(Symbol::from("ActiveRecord::Base")))
-            .or_insert(base);
+        base.class_methods
+            .entry(Symbol::from("connection"))
+            .or_insert_with(connection_ty);
+        for m in ["sanitize_sql", "sanitize_sql_array"] {
+            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
     }
 
     // CollectionProxy — the runtime helper transpiled models use
@@ -335,6 +389,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         uploaded.instance_methods.insert(Symbol::from("content_type"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("read"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("size"), Ty::Int);
+        // The file behind the part, as Rack hands it over: the Tempfile
+        // (`params[:file].tempfile`) and its path on disk. The Tempfile
+        // is not modelled, so it is a gradual boundary.
+        uploaded.instance_methods.insert(Symbol::from("tempfile"), Ty::Untyped);
+        uploaded.instance_methods.insert(Symbol::from("path"), Ty::Str);
         uploaded.instance_methods.insert(Symbol::from("to_s"), Ty::Str);
         let uploaded_id = ClassId(Symbol::from("ActionDispatch::Http::UploadedFile"));
         uploaded.class_methods.insert(

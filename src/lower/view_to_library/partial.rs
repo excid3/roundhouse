@@ -1,15 +1,18 @@
 //! Render-partial dispatch + yield handling — both are output-position
 //! dispatches from `emit_io_append`.
 
-use crate::expr::{Arm, BlockStyle, Expr, ExprNode, Literal, Pattern};
-use crate::ident::Symbol;
+use crate::expr::{
+    Arm, BlockStyle, Expr, ExprNode, InterpPart, Literal, LValue, Pattern,
+};
+use crate::ident::{Symbol, VarId};
 use crate::naming::{camelize_path, last_segment, singularize, snake_case};
 use crate::span::Span;
 
 use crate::lower::view::RenderPartial;
 
 use super::{
-    accumulator_append_call, lit_sym, nil_lit, send, var_ref, view_helpers_call, ViewCtx,
+    accumulator_append_call, assign_accumulator_string_new, lit_sym, nil_lit, send, seq,
+    var_ref, view_helpers_call, ViewCtx,
 };
 
 pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Option<Expr> {
@@ -90,54 +93,18 @@ pub(super) fn emit_render_partial(rp: &RenderPartial<'_>, ctx: &ViewCtx) -> Opti
         // local. Like emit_partial_each but the partial module/method come
         // from the explicit name, and the block var from `as:` (default:
         // the partial's base name).
-        RenderPartial::CollectionNamed { collection, partial, as_name, locals } => {
-            let (module_dir, base_name) = match partial.rsplit_once('/') {
-                Some((dir, name)) => (dir.to_string(), name.to_string()),
-                None => (ctx.resource_dir.clone(), (*partial).to_string()),
-            };
-            if module_dir.is_empty() {
-                return None;
+        RenderPartial::CollectionNamed {
+            collection,
+            partial,
+            as_name,
+            locals,
+            cached,
+        } => {
+            if *cached {
+                wrap_cached_collection(collection, partial, *as_name, *locals, ctx)
+            } else {
+                emit_named_collection_each(collection, partial, *as_name, *locals, ctx)
             }
-            let module_camel = camelize_path(&snake_case(&module_dir));
-            let method_sym = base_name.trim_start_matches('_').to_string();
-            let var_name = Symbol::from(crate::naming::safe_local(
-                &as_name
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| base_name.trim_start_matches('_').to_string()),
-            ));
-
-            let mut call_args = vec![var_ref(var_name.clone())];
-            call_args.extend(partial_extra_args(ctx, &module_camel, &method_sym));
-            call_args.extend(locals_extra_args(*locals, &module_camel, &method_sym, ctx));
-            let render_call = send(
-                Some(Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Const {
-                        path: vec![Symbol::from("Views"), Symbol::from(module_camel)],
-                    },
-                )),
-                crate::lower::view::view_method_name(&method_sym).as_str(),
-                call_args,
-                None,
-                true,
-            );
-            let inner = accumulator_append_call(render_call, ctx);
-            let block_lambda = Expr::new(
-                Span::synthetic(),
-                ExprNode::Lambda { rest_param: None,
-                    params: vec![var_name],
-                    block_param: None,
-                    body: inner,
-                    block_style: BlockStyle::Brace,
-                },
-            );
-            Some(send(
-                Some((*collection).clone()),
-                "each",
-                Vec::new(),
-                Some(block_lambda),
-                false,
-            ))
         }
         // `render partial: @above` — the name is a runtime value. Emit a
         // `case @above` whose arms are the pooled candidate partials (the
@@ -314,6 +281,351 @@ fn partial_extra_args(ctx: &ViewCtx, module: &str, method: &str) -> Vec<Expr> {
                 // Caller bodies are post-ivar-rewrite: a reserved-word
                 // ivar (`@for`) lives there as its `safe_local` form.
                 .map(|n| var_ref(Symbol::from(crate::naming::safe_local(n.as_str()))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `render partial: "…", collection: xs, as: :x` — iterate `xs`, calling
+/// the named partial per element.
+fn emit_named_collection_each(
+    collection: &Expr,
+    partial: &str,
+    as_name: Option<&str>,
+    locals: Option<&[(Expr, Expr)]>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    let (module_dir, base_name) = match partial.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (ctx.resource_dir.clone(), partial.to_string()),
+    };
+    if module_dir.is_empty() {
+        return None;
+    }
+    let module_camel = camelize_path(&snake_case(&module_dir));
+    let method_sym = base_name.trim_start_matches('_').to_string();
+    let var_name = Symbol::from(crate::naming::safe_local(
+        &as_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| base_name.trim_start_matches('_').to_string()),
+    ));
+
+    let mut call_args = vec![var_ref(var_name.clone())];
+    call_args.extend(partial_extra_args(ctx, &module_camel, &method_sym));
+    call_args.extend(locals_extra_args(locals, &module_camel, &method_sym, ctx));
+    let render_call = send(
+        Some(Expr::new(
+            Span::synthetic(),
+            ExprNode::Const {
+                path: vec![Symbol::from("Views"), Symbol::from(module_camel)],
+            },
+        )),
+        crate::lower::view::view_method_name(&method_sym).as_str(),
+        call_args,
+        None,
+        true,
+    );
+    let inner = accumulator_append_call(render_call, ctx);
+    let block_lambda = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            rest_param: None,
+            params: vec![var_name],
+            block_param: None,
+            body: inner,
+            block_style: BlockStyle::Brace,
+        },
+    );
+    Some(send(
+        Some(collection.clone()),
+        "each",
+        Vec::new(),
+        Some(block_lambda),
+        false,
+    ))
+}
+
+/// Rails' collection cache: one `read_str` of the concatenated partials,
+/// keyed by each element's `cache_key_with_version`. A miss still walks
+/// the collection (inner `<% cache %>` fragments still apply).
+///
+/// Key shape (aligned with Rails' item key + template digest intent):
+/// `views/coll/<cache_scope><view>/<partial>/<name>=<stable>/…/<record versions>`.
+/// Explicit `locals:` and the partial's threaded closure ivars are named
+/// segments; records use `cache_key_with_version`, scalars use `inspect`
+/// (quoted, so `a/b`+`c` cannot collide with `a`+`b/c`). A local whose
+/// name is not a literal Symbol/String cannot be keyed safely — fall
+/// back to the uncached each path.
+fn wrap_cached_collection(
+    collection: &Expr,
+    partial: &str,
+    as_name: Option<&str>,
+    locals: Option<&[(Expr, Expr)]>,
+    ctx: &ViewCtx,
+) -> Option<Expr> {
+    let span = collection.span;
+    let (module_dir, base_name) = match partial.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (ctx.resource_dir.clone(), partial.to_string()),
+    };
+    if module_dir.is_empty() {
+        return emit_named_collection_each(collection, partial, as_name, locals, ctx);
+    }
+    let module_camel = camelize_path(&snake_case(&module_dir));
+    let method_sym = base_name.trim_start_matches('_').to_string();
+
+    let mut named_inputs: Vec<(String, Expr)> = Vec::new();
+    if let Some(entries) = locals {
+        for (k, v) in entries {
+            let Some(name) = local_key_name(k) else {
+                // Name is dynamic — cannot build a stable key segment.
+                return emit_named_collection_each(collection, partial, as_name, locals, ctx);
+            };
+            named_inputs.push((name, v.clone()));
+        }
+    }
+    for (name, expr) in partial_extra_named_args(ctx, &module_camel, &method_sym) {
+        named_inputs.push((name, expr));
+    }
+
+    let uniq = span.start;
+    let key_name = Symbol::from(format!("__cc_key_{uniq}"));
+    let hit_name = Symbol::from(format!("__cc_hit_{uniq}"));
+    let rec_name = Symbol::from(format!("__cc_r_{uniq}"));
+    let cap = format!("__cc_io_{uniq}");
+
+    let prefix = Expr::new(
+        span,
+        ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Text {
+                    value: "views/coll/".to_string(),
+                },
+                InterpPart::Expr {
+                    expr: view_helpers_call("cache_scope", Vec::new()),
+                },
+                InterpPart::Text {
+                    value: format!("{}/{}/", ctx.view_name, partial),
+                },
+            ],
+        },
+    );
+    let assign_key = Expr::new(
+        span,
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: key_name.clone(),
+            },
+            value: prefix,
+        },
+    );
+    let str_lit = |value: &str| {
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Str {
+                    value: value.to_string(),
+                },
+            },
+        )
+    };
+    let mut local_key_parts: Vec<Expr> = Vec::new();
+    for (name, v) in &named_inputs {
+        let append_name = send(
+            Some(var_ref(key_name.clone())),
+            "<<",
+            vec![str_lit(&format!("/{name}="))],
+            None,
+            false,
+        );
+        local_key_parts.push(send(
+            Some(append_name),
+            "<<",
+            vec![stable_cache_fragment(v.clone())],
+            None,
+            false,
+        ));
+    }
+    let rec_ref = var_ref(rec_name.clone());
+    let version = send(
+        Some(rec_ref),
+        "cache_key_with_version",
+        Vec::new(),
+        None,
+        false,
+    );
+    let append_slash = send(
+        Some(var_ref(key_name.clone())),
+        "<<",
+        vec![str_lit("/")],
+        None,
+        false,
+    );
+    let append_version = send(Some(append_slash), "<<", vec![version], None, false);
+    let key_lambda = Expr::new(
+        span,
+        ExprNode::Lambda {
+            rest_param: None,
+            params: vec![rec_name],
+            block_param: None,
+            body: append_version,
+            block_style: BlockStyle::Brace,
+        },
+    );
+    let build_key = send(
+        Some(collection.clone()),
+        "each",
+        Vec::new(),
+        Some(key_lambda),
+        false,
+    );
+
+    let store = || {
+        send(
+            Some(Expr::new(
+                span,
+                ExprNode::Const {
+                    path: vec![Symbol::from("Rails")],
+                },
+            )),
+            "cache",
+            Vec::new(),
+            None,
+            false,
+        )
+    };
+    let key_ref = || var_ref(key_name.clone());
+    let hit_ref = || var_ref(hit_name.clone());
+    let read = Expr::new(
+        span,
+        ExprNode::Assign {
+            target: LValue::Var {
+                id: VarId(0),
+                name: hit_name.clone(),
+            },
+            value: send(
+                Some(store()),
+                "read_str",
+                vec![key_ref()],
+                None,
+                true,
+            ),
+        },
+    );
+
+    let miss_ctx = ViewCtx {
+        accumulator: cap.clone(),
+        ..ctx.clone()
+    };
+    let miss_each = emit_named_collection_each(collection, partial, as_name, locals, &miss_ctx)?;
+    let miss = vec![
+        assign_accumulator_string_new(&cap),
+        miss_each,
+        accumulator_append_call(
+            send(
+                Some(store()),
+                "write_str",
+                vec![
+                    key_ref(),
+                    super::accumulator_result_ref(&cap),
+                    Expr::new(span, ExprNode::Lit {
+                        value: Literal::Int { value: 0 },
+                    }),
+                ],
+                None,
+                true,
+            ),
+            ctx,
+        ),
+    ];
+    let mut prelude = vec![assign_key];
+    prelude.extend(local_key_parts);
+    prelude.push(build_key);
+    prelude.push(read);
+    prelude.push(Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(hit_ref()), "nil?", Vec::new(), None, false),
+            then_branch: seq(miss),
+            else_branch: seq(vec![accumulator_append_call(hit_ref(), ctx)]),
+        },
+    ));
+    Some(seq(prelude))
+}
+
+/// Literal Symbol/String name of a `locals:` key, or None when dynamic.
+fn local_key_name(key: &Expr) -> Option<String> {
+    match &*key.node {
+        ExprNode::Lit {
+            value: Literal::Sym { value },
+        } => Some(value.as_str().to_string()),
+        ExprNode::Lit {
+            value: Literal::Str { value },
+        } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// `v.respond_to?(:cache_key_with_version) ? v.cache_key_with_version : v.inspect`
+/// — records get a stable versioned key; scalars get a quoted `inspect`
+/// so slash-bearing values cannot fuse adjacent key segments.
+fn stable_cache_fragment(v: Expr) -> Expr {
+    let span = v.span;
+    let cond = send(
+        Some(v.clone()),
+        "respond_to?",
+        vec![lit_sym(Symbol::from("cache_key_with_version"))],
+        None,
+        false,
+    );
+    let then_branch = send(
+        Some(v.clone()),
+        "cache_key_with_version",
+        Vec::new(),
+        None,
+        false,
+    );
+    let else_branch = send(Some(v), "inspect", Vec::new(), None, false);
+    Expr::new(
+        span,
+        ExprNode::If {
+            cond,
+            then_branch,
+            else_branch,
+        },
+    )
+}
+
+/// Threaded closure ivars the partial receives, with their names — the
+/// request/view context Rails would otherwise leave out of a bare
+/// collection key. Included so two renders of the same records with
+/// different closure values cannot share markup.
+fn partial_extra_named_args(
+    ctx: &ViewCtx,
+    module: &str,
+    method: &str,
+) -> Vec<(String, Expr)> {
+    let record_name = singularize(&snake_case(last_segment(module)));
+    let key = (module.to_string(), method.to_string());
+    let strict = ctx.strict_locals.get(&key);
+    let declared: std::collections::HashSet<&str> = strict
+        .map(|ps| ps.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    let is_strict = strict.is_some();
+    ctx.partial_ivars
+        .get(&key)
+        .map(|ivars| {
+            ivars
+                .iter()
+                .filter(|n| {
+                    (is_strict || n.as_str() != record_name)
+                        && !declared.contains(n.as_str())
+                })
+                .map(|n| {
+                    let safe = crate::naming::safe_local(n.as_str());
+                    (safe.clone(), var_ref(Symbol::from(safe)))
+                })
                 .collect()
         })
         .unwrap_or_default()

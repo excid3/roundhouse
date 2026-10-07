@@ -111,11 +111,12 @@ fn a_sig_declares_the_method_the_analyzer_could_not_infer() {
 
 #[test]
 fn a_signature_outside_the_grammar_is_dropped_whole() {
-    // `T.type_parameter` is Sorbet's generics, which this reader does
-    // not model. The method keeps whatever inference makes of it; what
+    // A shape with string keys (`{ "id" => Integer }`) is a hash whose keys
+    // are known, which a record with symbol-named fields cannot say. The
+    // method keeps whatever inference makes of it; what
     // must not happen is a half-read signature.
     let controller = r#"class ReportsController < ApplicationController
-  sig { type_parameters(:U).params(item: T.type_parameter(:U)).returns(T.type_parameter(:U)) }
+  sig { params(item: { "id" => Integer }).returns(Integer) }
   def echo(item)
     item
   end
@@ -182,7 +183,7 @@ fn the_annotation_wins_a_disagreement_with_the_body() {
     // and the disagreement is not reported today.
     //
     // It follows from the table rather than from anything this reader
-    // does. `insert_inferred_return` (`src/analyze/mod.rs`) never
+    // does. `insert_inferred_return` (`src/analyze/harvest_return.rs`) never
     // overwrites an existing `Ty::Fn`, which is the rule the
     // `sig/**/*.rbs` sidecar has always relied on — a seed is a seed
     // wherever it was written. That function is also where a

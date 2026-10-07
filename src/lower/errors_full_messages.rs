@@ -51,7 +51,7 @@ pub fn apply_errors_full_messages_lowering(app: &mut App) {
 /// Does any app class define its own `full_messages`? Then the name
 /// doesn't mean Rails' and the pass stands down, rather than folding
 /// away a real call. Mirrors `exclude_predicate`'s guard.
-fn app_defines_full_messages(app: &App) -> bool {
+pub(crate) fn app_defines_full_messages(app: &App) -> bool {
     let is_fm = |n: &Symbol| n.as_str() == "full_messages";
     app.models.iter().any(|m| {
         m.body.iter().any(|item| {
@@ -66,6 +66,10 @@ fn app_defines_full_messages(app: &App) -> bool {
 
 fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
+    rewrite_node(expr);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr) {
     // `<recv>.errors.full_messages` — zero-arg, block-free on both hops.
     // The receiver being an `errors` reader is what makes this our
     // accumulator rather than some other object's method of the same

@@ -165,9 +165,8 @@ end
 }
 
 #[test]
-fn an_assertion_still_unwraps_rather_than_raising() {
-    // `T.absurd` is the exception among the `T.` calls, not the rule:
-    // the assertions still evaluate to their argument.
+fn an_unimplemented_assertion_emits_a_named_refusal() {
+    // A nil assertion is behavior, so it cannot become an unchecked read.
     let emitted = emitted(
         r#"class Gauge
   def label(kind)
@@ -177,6 +176,7 @@ end
 "#,
         "gauge.rb",
     );
-    assert!(!emitted.contains("raise"), "got:\n{emitted}");
-    assert!(emitted.contains("kind.to_s"), "got:\n{emitted}");
+    assert!(emitted.contains("raise"), "got:\n{emitted}");
+    assert!(!emitted.contains("T.must"), "got:\n{emitted}");
+    assert!(emitted.contains("non-nil assertion"), "got:\n{emitted}");
 }

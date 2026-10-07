@@ -1059,7 +1059,11 @@ pub(super) fn emit_expr(e: &Expr) -> String {
     super::printer::render_expr(&js_expr(e))
 }
 
+/// Build a JavaScript expression with its source span and shared primitive behavior.
 pub(super) fn js_expr(e: &Expr) -> Js {
+    if let Some(s) = crate::emit::shared::string_bytes::emit(e, crate::emit::shared::string_bytes::Target::TypeScript, emit_expr) {
+        return Js::new(e.span, JsExpr::Raw(s));
+    }
     // Analyzer-set diagnostic annotations short-circuit to a target
     // raise-equivalent (preserves Ruby's runtime-raise semantics).
     if let Some(kind) = &e.diagnostic {
