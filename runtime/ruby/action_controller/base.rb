@@ -24,12 +24,15 @@ module ActionController
 
   # Empty until `authenticity_token.rb` reopens these: strict-target
   # emit of this file must not call `Current.session` or XOR bytes.
+  # Strict targets therefore issue no token and check none (see
+  # docs/guide/rails-coverage.md): an empty session secret means
+  # "no minting on this lane," not "fail closed."
   def self.masked_authenticity_token
     ""
   end
 
   def self.csrf_token_valid?(given, expected)
-    return false if expected.empty?
+    return true if expected.empty?
     given.length > 0 && given == expected
   end
 
@@ -610,7 +613,14 @@ module ActionController
       return true unless ActionController.forgery_flag
       verb = @request_method.to_s
       return true if verb == "" || verb == "GET" || verb == "HEAD"
-      expected = session[:_csrf_token].to_s
+      # Nil-then-`to_s` — not `session[:k].to_s` alone. Strict-target
+      # emit turns a missing key into JS `undefined`, and `String(undefined)`
+      # is `"undefined"`, which would fail closed even when no secret was
+      # minted. The ternary keeps an absent secret as `""` so the stub
+      # `csrf_token_valid?` can check-none; ruby-family
+      # `AuthenticityToken.valid?` still fails closed on empty.
+      raw = session[:_csrf_token]
+      expected = raw.nil? ? "" : raw.to_s
       # `.fetch(k, "")` — not bare `params[k]`. Crystal Hash#[] raises
       # KeyError on a missing key; Python's `.get(k)` returns None and
       # `.to_s` then AttributeErrors. Cross-target nil-safe read.

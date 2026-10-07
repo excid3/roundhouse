@@ -807,7 +807,10 @@ impl<'f> RouteWalker<'f> {
         let mut entries: Vec<RouteSpec> = Vec::new();
         for leaf in &leaves {
             if leaf.is_root {
-                entries.push(RouteSpec::Root { target: "root#index".to_string() });
+                entries.push(RouteSpec::Root {
+                    target: "root#index".to_string(),
+                    as_name: None,
+                });
                 continue;
             }
             let controller_stem = leaf.controller.clone().unwrap_or_else(|| "root".into());

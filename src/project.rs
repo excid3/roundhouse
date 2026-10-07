@@ -7597,6 +7597,7 @@ mod tests {
             vec![crate::ident::ClassId(crate::ident::Symbol::from("Current"))];
         app.routes.entries.push(crate::dialect::RouteSpec::Root {
             target: "articles#index".to_string(),
+            as_name: None,
         });
 
         let mut files = vec![
@@ -7674,7 +7675,10 @@ mod tests {
         }
 
         // With a root the table keeps it, first.
-        app.routes.entries.push(crate::dialect::RouteSpec::Root { target: "widgets#index".to_string() });
+        app.routes.entries.push(crate::dialect::RouteSpec::Root {
+            target: "widgets#index".to_string(),
+            as_name: None,
+        });
         let mut files = scaffold();
         apply_route_table_root(&mut files, &app);
         for (path, content) in &files {

@@ -6917,3 +6917,81 @@ end
         .run_ruby("raise 'qualified lowered constants' unless CollectionConstants.values == ['bb', true]")
         .assert_passes();
 }
+
+/// `invisible_captcha only: :create` → before_action that heads :ok when
+/// a honeypot field is filled (invariant 6: the survey gap closing is a
+/// claim the emitted gate runs).
+#[test]
+fn invisible_captcha_blocks_spam_posts() {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\n  protect_from_forgery with: :exception\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"users\", force: :cascade do |t|\n    t.string \"email\"\n  end\nend\n")
+        .write("app/models/user.rb", "class User < ApplicationRecord\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  post \"/users\", to: \"users#create\"\nend\n")
+        .write(
+            "app/controllers/users_controller.rb",
+            "class UsersController < ApplicationController\n  invisible_captcha only: :create\n\n  def create\n    render plain: \"created\"\n  end\nend\n",
+        )
+        .run_ruby(r#"
+require_relative "app/controllers/users_controller"
+ActionController::Base.allow_forgery_protection = false
+controller = UsersController.new
+ActionController::Current.controller = controller
+req = ActionDispatch::TestRequest.create("HTTP_HOST" => "app.example", "REQUEST_METHOD" => "POST")
+controller.request = req
+ActionController::Current.request = req
+controller.request_method = "POST"
+controller.params = { "subtitle" => "http://spam.example" }
+controller.process_action(:create)
+raise "honeypot did not block: #{controller.status} #{controller.body}" unless controller.status == 200 && controller.body.to_s.empty?
+controller = UsersController.new
+ActionController::Current.controller = controller
+req = ActionDispatch::TestRequest.create("HTTP_HOST" => "app.example", "REQUEST_METHOD" => "POST")
+controller.request = req
+ActionController::Current.request = req
+controller.request_method = "POST"
+controller.params = { "email" => "ok@example.com" }
+controller.process_action(:create)
+raise "clean post failed: #{controller.status} #{controller.body}" unless controller.status == 200 && controller.body == "created"
+puts "invisible_captcha passed"
+"#)
+        .assert_passes();
+}
+
+/// `impersonates :user` wraps `current_user` and exposes pretender's
+/// impersonate / stop helpers (invariant 6).
+#[test]
+fn impersonates_switches_current_user() {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write(
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  def current_user\n    User.find_by(id: session[:signed_in_user_id])\n  end\n\n  impersonates :user\nend\n",
+        )
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"users\", force: :cascade do |t|\n    t.string \"email\"\n  end\nend\n")
+        .write("app/models/user.rb", "class User < ApplicationRecord\nend\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  get \"/who\", to: \"who#show\"\nend\n")
+        .write(
+            "app/controllers/who_controller.rb",
+            "class WhoController < ApplicationController\n  def show\n    render plain: [true_user&.email, current_user&.email].join(\",\")\n  end\nend\n",
+        )
+        .run_ruby(r#"
+require_relative "app/controllers/who_controller"
+admin = User.create!(email: "admin@example.com")
+other = User.create!(email: "other@example.com")
+controller = WhoController.new
+ActionController::Current.controller = controller
+req = ActionDispatch::TestRequest.create("HTTP_HOST" => "app.example")
+controller.request = req
+ActionController::Current.request = req
+controller.session[:signed_in_user_id] = admin.id
+raise "baseline true=#{controller.true_user&.email} current=#{controller.current_user&.email}" unless controller.true_user&.email == "admin@example.com" && controller.current_user&.email == "admin@example.com"
+controller.impersonate_user(other)
+raise "impersonating true=#{controller.true_user&.email} current=#{controller.current_user&.email}" unless controller.true_user&.email == "admin@example.com" && controller.current_user&.email == "other@example.com"
+controller.stop_impersonating_user
+raise "stopped true=#{controller.true_user&.email} current=#{controller.current_user&.email}" unless controller.true_user&.email == "admin@example.com" && controller.current_user&.email == "admin@example.com"
+puts "impersonates passed"
+"#)
+        .assert_passes();
+}

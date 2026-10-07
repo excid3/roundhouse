@@ -446,6 +446,9 @@ const TYPESCRIPT_RUNTIME: &[RuntimeEntry] = &[
         // `ActionController.masked_authenticity_token` backs
         // `form_authenticity_token` (Masked CSRF); the namespace
         // class lives alongside Base in action_controller_base.ts.
+        // Without this import the worker throws `ActionController is
+        // not defined` on any layout that renders csrf_meta_tags /
+        // authenticity_token fields.
         imports: &[
             ("type Base", "./active_record_base.js"),
             ("ActionController", "./action_controller_base.js"),

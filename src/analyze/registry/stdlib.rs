@@ -51,6 +51,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     limiter.class_methods.insert(Symbol::from("exceeded?"), Ty::Bool);
     classes.insert(ClassId(Symbol::from("ActionController::RateLimiter")), limiter);
 
+    // `ActionController::InvisibleCaptcha.spam?(params)` — the honeypot
+    // gate `ingest::invisible_captcha` synthesizes into a controller
+    // body; runtime/ruby/action_controller/invisible_captcha.rb answers
+    // it. Registered for the same reason as RateLimiter / BrowserBlocker.
+    let mut captcha = ClassInfo::default();
+    captcha.class_methods.insert(Symbol::from("spam?"), Ty::Bool);
+    classes.insert(ClassId(Symbol::from("ActionController::InvisibleCaptcha")), captcha);
+
     // Time singleton — `Time.now` (Ruby core) / `Time.current`
     // (Rails) / `Time.at` all yield a Time *value*, and `Time.zone`
     // is a TimeZone whose `.now`/`.at`/`.local` likewise yield Time,

@@ -1730,6 +1730,8 @@ end
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
     super::rate_limit::lower_rate_limit(&mut app);
+    super::invisible_captcha::lower_invisible_captcha(&mut app);
+    super::impersonates::lower_impersonates(&mut app);
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so
