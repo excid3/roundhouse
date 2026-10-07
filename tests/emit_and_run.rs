@@ -1167,9 +1167,14 @@ fn an_app_without_jobs_runs_its_tests() {
 fn the_job_queue_keeps_its_thread_safe_methods() {
     emit_and_run::real_blog()
         .run_ruby(
-            r#"%i[enqueue drain pending_count record_performed performed].each do |m|
+            r#"%i[drain pending_count performed enqueue_locked record_performed_for_tests].each do |m|
   file = ActiveJob.method(m).source_location[0]
   raise "ActiveJob.#{m} comes from #{file}" unless file.end_with?("runtime/thread_state.rb")
+end
+# The serving drain wraps these two, and calls the locked ones above.
+%i[enqueue record_performed].each do |m|
+  file = ActiveJob.method(m).source_location[0]
+  raise "ActiveJob.#{m} comes from #{file}" unless file.end_with?("runtime/active_job_cruby.rb")
 end
 puts "ok"
 "#,
@@ -3381,6 +3386,45 @@ fn method_ref_block_arg_runs() {
              end\n",
         )
         .run_test("test/models/doubler_test.rb")
+        .assert_passes();
+}
+
+/// A `T::Struct` nested in a controller concern must lower and run:
+/// keyword construction, readers, and a writable `prop`. Taking that
+/// nested class as the controller used to drop the declarations as
+/// unrecognized macros and skip the concern's module path entirely.
+#[test]
+fn a_t_struct_nested_in_a_controller_concern_runs() {
+    emit_and_run::real_blog()
+        .write(
+            "app/controllers/concerns/window_settings.rb",
+            concat!(
+                "module WindowSettings\n",
+                "  extend ActiveSupport::Concern\n",
+                "\n",
+                "  class Span < T::Struct\n",
+                "    const :from_date, String\n",
+                "    const :to_date, String\n",
+                "    prop :label, String, default: \"window\"\n",
+                "  end\n",
+                "end\n",
+            ),
+        )
+        .edit(
+            "app/controllers/articles_controller.rb",
+            "class ArticlesController < ApplicationController\n",
+            "class ArticlesController < ApplicationController\n  include WindowSettings\n",
+        )
+        .run_ruby(
+            concat!(
+                "span = WindowSettings::Span.new(from_date: \"2026-01-01\", to_date: \"2026-01-31\")\n",
+                "raise \"from\" unless span.from_date == \"2026-01-01\"\n",
+                "raise \"to\" unless span.to_date == \"2026-01-31\"\n",
+                "raise \"default\" unless span.label == \"window\"\n",
+                "span.label = \"quarter\"\n",
+                "raise \"prop\" unless span.label == \"quarter\"\n",
+            ),
+        )
         .assert_passes();
 }
 

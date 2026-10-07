@@ -1176,12 +1176,13 @@ end
                         app.library_classes.extend(nested_under(&outer, classes));
                     }
                 } else {
-                    // No class in the file — a module: a concern under
-                    // app/controllers/concerns/ (`AccountOwnedConcern`)
-                    // or a mixin like `Authorization`. Ingest as a
-                    // library class so its methods register and
+                    // Not a controller file: a module-only concern under
+                    // app/controllers/concerns/, a mixin like
+                    // `Authorization`, or a concern whose only classes
+                    // are Sorbet value objects (nested `T::Struct`).
+                    // Ingest as library classes so methods register and
                     // `include X` dispatch (ClassInfo.includes) can
-                    // resolve into it, and capture its `included do`
+                    // resolve into them, and capture `included do`
                     // filter declarations for every includer's chain.
                     if let Some(classes) =
                         unwrap_or_record(ingest_library_classes(&source, &path_str))?
@@ -2853,12 +2854,34 @@ fn report_unrecognized_controller_macros(app: &App) {
         return;
     }
     for controller in &app.controllers {
+        // `sources::drain` already ran; use the App snapshot via the
+        // canonical FileId helper (thread-local `sources::path_of` misses).
+        let file_of = |file_id: crate::span::FileId| {
+            crate::ide::source(app, file_id)
+                .map(|s| s.path.clone())
+                .unwrap_or_else(|| controller.name.0.as_str().to_string())
+        };
         for item in &controller.body {
             let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv: None, method, block: None, .. } = &*expr.node else {
                 continue;
             };
             if CONSUMED_CONTROLLER_MACROS.contains(&method.as_str()) {
+                continue;
+            }
+            // `const` / `prop` belong to a lowered `T::Struct` (or a
+            // gem base the sidecar expands). On a real controller they
+            // are leftover Sorbet props with no runtime in the emitted
+            // tree — name that, rather than the generic "macro not
+            // recognized" bucket that also covers unmodeled app DSL.
+            if matches!(method.as_str(), "const" | "prop") {
+                survey::record(&IngestError::Unsupported {
+                    file: file_of(expr.span.file),
+                    message: format!(
+                        "Sorbet `{}` outside a lowered T::Struct (its effect is dropped from the output)",
+                        method.as_str()
+                    ),
+                });
                 continue;
             }
             // `before_action -> { … }, only: […]` (233 controllers) and
@@ -2873,8 +2896,7 @@ fn report_unrecognized_controller_macros(app: &App) {
             if super::controller::lambda_filter_target(expr).is_some() {
                 continue;
             }
-            let file = super::sources::path_of(expr.span.file)
-                .unwrap_or_else(|| controller.name.0.as_str().to_string());
+            let file = file_of(expr.span.file);
             if REFINEMENT_MACROS.contains(&method.as_str()) {
                 // `using SomeRefinement` — name the refinement in the
                 // ledger so the gap is actionable, rather than folding

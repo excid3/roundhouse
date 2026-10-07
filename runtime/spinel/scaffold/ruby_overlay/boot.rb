@@ -162,6 +162,8 @@ require_relative "runtime/active_storage_previewer"
 # String-identity case, and this overlay's polymorphic is_a? version
 # must redefine it for CRuby's residual dynamic sites.
 require_relative "runtime/action_view_safe_buffer"
+# Set lookup, one regexp scan and appends for the attribute helpers.
+require_relative "runtime/action_view_helpers_cruby"
 # `sanitize` / `strip_tags` / `auto_link` on the REAL rails-html-sanitizer
 # (guarded — an app that never sanitizes boots without the gem, and the
 # shared runtime's scanner stands). AFTER the safe buffer: these return
@@ -203,6 +205,9 @@ require_relative "runtime/active_job"
 # Per-request state per THREAD -- reopens Current, the view slots, the
 # broadcast log, the job queue and the store memo (see the file).
 require_relative "runtime/thread_state"
+# A drain thread per serving process, registered by config.ru. After
+# thread_state: it wraps that file's locked queue methods.
+require_relative "runtime/active_job_cruby"
 # `Turbo::StreamsChannel` — the channel a `<turbo-cable-stream-source>`
 # names, AND the `broadcast_*_to` class methods a model's after_commit
 # reaches (and an app's own tests mock). One constant, both halves, the

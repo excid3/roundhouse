@@ -45,6 +45,8 @@ pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
+mod dirty_retype;
+mod typing_mode;
 mod inferred_types;
 pub mod inquiry;
 pub use inferred_types::inferred_types;
@@ -136,29 +138,26 @@ pub struct Analyzer {
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
     data_factories: HashMap<crate::span::Span, Ty>,
+    /// The controller/mailer→view channel as the last production
+    /// typing pass harvested it. See [`ViewSeeds`].
+    view_seeds: Option<ViewSeeds>,
+    /// Reverse call graph, class-level: which classes call
+    /// `(receiver class, method)`. Rebuilt from scratch by every
+    /// `unify_params_from_call_sites` — same reason
+    /// `inferred_params` is, it is a function of the trees the last
+    /// typing pass wrote. Read by `dirty_classes_for_retype` to take
+    /// a round's changed returns back to the bodies that read them.
+    callers_by_target: HashMap<(ClassId, Symbol), std::collections::HashSet<ClassId>>,
+    /// Per-controller concern/action bindings and bodies from the last
+    /// round that retyped that controller. Reused when a clean
+    /// controller still rebuilds channel metadata but skips concern
+    /// `analyze_expr` walks.
+    controller_action_meta_cache:
+        HashMap<ClassId, (HashMap<Symbol, HashMap<Symbol, Ty>>, HashMap<Symbol, Expr>)>,
 }
 
-/// Snapshot of the data the fixpoint refines: per-class instance/class
-/// method return types plus `inferred_params`. HashMap equality is
-/// order-independent, so this matches the previous sorted-string
-/// fingerprint without `Debug`-formatting every `Ty` on every round.
-#[derive(Clone)]
-struct InferenceSig {
-    instance: HashMap<ClassId, HashMap<Symbol, Ty>>,
-    class_methods: HashMap<ClassId, HashMap<Symbol, Ty>>,
-    params: HashMap<(ClassId, Symbol), Vec<Ty>>,
-}
-
-/// Which call-site trees `unify_params_from_call_sites` walks.
-/// Production rounds skip views/tests/seeds: those trees are still
-/// ingest-shaped until after the production fixpoint (wave 12).
-/// Test sites are overlaid separately so later test-only rounds can
-/// reuse a production+view param snapshot.
-#[derive(Clone, Copy)]
-enum UnifyScope {
-    Production,
-    WithViews,
-}
+use dirty_retype::{DirtyHints, InferenceSig, dirty_classes_for_retype};
+use typing_mode::{TypingMode, UnifyScope, ViewSeeds};
 
 impl Analyzer {
     /// Build an analyzer with the default database adapter
@@ -955,6 +954,9 @@ impl Analyzer {
             source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
             data_factories,
+            view_seeds: None,
+            callers_by_target: HashMap::new(),
+            controller_action_meta_cache: HashMap::new(),
         }
     }
 
@@ -1082,7 +1084,7 @@ impl Analyzer {
                 &module_methods,
                 &module_includes,
                 &parent_link_by_name,
-                false,
+                TypingMode::Production { dirty: None },
             )
         });
 
@@ -1098,7 +1100,7 @@ impl Analyzer {
         // `with_pagination_info` → `get` → `paginate` → the
         // `get_from_cache` block → its return → the destructuring, which
         // settles on round 9.
-        let mut prev_sig = self.capture_inference_sig();
+        let mut prev_hints = self.capture_dirty_hints();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
                 self.harvest_returns_to_registry(app, false)
@@ -1106,13 +1108,27 @@ impl Analyzer {
             crate::timings::phase(format_args!("round {round}: unify params"), || {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
-            if self.inference_matches(&prev_sig) {
+            // Returns+params settle independently of block-value
+            // verdicts (`DirtyHints`); both must be quiet before the
+            // loop stops, or a newly block-valued method leaves its
+            // callers on the registered return instead of the block.
+            if self.inference_matches(&prev_hints.sig)
+                && self.block_value_matches(&prev_hints)
+            {
                 break;
             }
-            prev_sig = self.capture_inference_sig();
-            // Re-type the whole app with the refined registry. Idempotent
-            // BodyTyper means a second pass simply resolves dispatches
-            // and Var bindings the first pass couldn't.
+            // Re-type with the refined registry. Idempotent BodyTyper
+            // means a second pass simply resolves dispatches and Var
+            // bindings the first pass couldn't — which is also why a
+            // class the harvest did not move is a class whose bodies
+            // this round would retype to exactly what they already say.
+            // Campfire's rounds shrink 191 → 89 → 44 → 29 → 13 → 2
+            // classes, ending on the Opengraph/Current/Nokogiri chain,
+            // so the later rounds retype the whole app for a handful of
+            // returns. `dirty_classes_for_retype` is that handful plus
+            // everything that reads it.
+            let dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            prev_hints = self.capture_dirty_hints();
             crate::timings::phase(format_args!("round {round}: typing passes"), || {
                 self.run_typing_passes(
                     app,
@@ -1121,7 +1137,7 @@ impl Analyzer {
                     &module_methods,
                     &module_includes,
                     &parent_link_by_name,
-                    false,
+                    TypingMode::Production { dirty: dirty.as_ref() },
                 )
             });
         }
@@ -1141,7 +1157,7 @@ impl Analyzer {
         // params as Var. After helper returns absorb those params,
         // views are typed once more so template calls see the
         // harvested helper surface rather than leftover untyped.
-        let production_sig = prev_sig.clone();
+        let production_sig = prev_hints.sig.clone();
         let mut production_view_params = None;
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(
@@ -1152,6 +1168,11 @@ impl Analyzer {
                 },
                 || {
                     if round == 0 {
+                        // Views only. The loop above broke because its
+                        // harvest+unify moved nothing, so the production
+                        // bodies are exactly what the last round typed —
+                        // retyping them here was a pass spent confirming
+                        // a fixpoint the loop had already proved.
                         self.run_typing_passes(
                             app,
                             &dynamic_render_ivars,
@@ -1159,7 +1180,7 @@ impl Analyzer {
                             &module_methods,
                             &module_includes,
                             &parent_link_by_name,
-                            true,
+                            TypingMode::ViewsAndTests,
                         );
                     } else {
                         self.type_tests_only(app);
@@ -1183,13 +1204,21 @@ impl Analyzer {
                     }
                 },
             );
-            if self.inference_matches(&prev_sig) {
+            if self.inference_matches(&prev_hints.sig)
+                && self.block_value_matches(&prev_hints)
+            {
                 break;
             }
-            prev_sig = self.capture_inference_sig();
+            prev_hints = self.capture_dirty_hints();
         }
         if !self.inference_matches(&production_sig) {
-            let mut absorb_sig = self.capture_inference_sig();
+            let mut absorb_hints = self.capture_dirty_hints();
+            // The view/test rounds above moved signatures that
+            // production bodies read, and the last production pass
+            // predates every one of them — so the first absorb pass is
+            // a full retype. Only the rounds after it can be narrowed
+            // to what their predecessor moved.
+            let mut absorb_dirty: Option<std::collections::HashSet<ClassId>> = None;
             for round in 0..FIXPOINT_CAP {
                 crate::timings::phase(
                     if round == 0 {
@@ -1205,7 +1234,7 @@ impl Analyzer {
                             &module_methods,
                             &module_includes,
                             &parent_link_by_name,
-                            false,
+                            TypingMode::Production { dirty: absorb_dirty.as_ref() },
                         )
                     },
                 );
@@ -1215,10 +1244,13 @@ impl Analyzer {
                     snapshot.clone_from(&self.inferred_params);
                 }
                 self.overlay_test_params(app);
-                if self.inference_matches(&absorb_sig) {
+                if self.inference_matches(&absorb_hints.sig)
+                    && self.block_value_matches(&absorb_hints)
+                {
                     break;
                 }
-                absorb_sig = self.capture_inference_sig();
+                absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
+                absorb_hints = self.capture_dirty_hints();
             }
         } else {
             // View unify did not move production signatures, but helper
@@ -1233,10 +1265,26 @@ impl Analyzer {
                     &module_methods,
                     &module_includes,
                     &parent_link_by_name,
-                    false,
+                    TypingMode::Production { dirty: None },
                 )
             });
             self.harvest_returns_to_registry(app, true);
+            // …and that harvest can still move a helper's return, which
+            // production bodies read. The absorb branch above ends on a
+            // signature check, so it leaves production converged; this
+            // branch does not, so it pays the production pass the views
+            // stamp below no longer carries.
+            crate::timings::phase("typing passes (production after helper harvest)", || {
+                self.run_typing_passes(
+                    app,
+                    &dynamic_render_ivars,
+                    &existing_view_names,
+                    &module_methods,
+                    &module_includes,
+                    &parent_link_by_name,
+                    TypingMode::Production { dirty: None },
+                )
+            });
         }
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
@@ -1252,7 +1300,7 @@ impl Analyzer {
                 &module_methods,
                 &module_includes,
                 &parent_link_by_name,
-                true,
+                TypingMode::ViewsAndTests,
             )
         });
         // Effects are a function of the converged typed trees, not of
@@ -1746,20 +1794,67 @@ impl Analyzer {
         module_methods: &HashMap<ClassId, Vec<MethodDef>>,
         module_includes: &HashMap<ClassId, Vec<ClassId>>,
         parent_link_by_name: &HashMap<ClassId, Option<ClassId>>,
-        type_views_and_tests: bool,
+        mode: TypingMode<'_>,
     ) {
         // Source-backed constant reads use Rubydex declaration IDs.
         // A bare-name fallback remains for generated expressions without
-        // a Ruby source reference.
+        // a Ruby source reference. Built in either mode: a views pass
+        // stamps templates against the same constant scope the
+        // production bodies were typed with.
         let (fallback, resolved_values) = crate::timings::phase("typing: constants", || {
             self.build_constant_registry(app)
         });
         self.typed_constants = resolved_values;
         let global_constants = body::ConstScope::global(fallback);
+        match mode {
+            TypingMode::Production { dirty } => {
+                self.type_production_bodies(
+                    app,
+                    dynamic_render_ivars,
+                    existing_view_names,
+                    module_methods,
+                    module_includes,
+                    parent_link_by_name,
+                    &global_constants,
+                    dirty,
+                );
+            }
+            TypingMode::ViewsAndTests => {
+                debug_assert!(self.view_seeds.is_some());
+                self.type_views_and_tests(app, &global_constants);
+            }
+        }
+    }
+
+    /// The production half: models, controllers and library classes,
+    /// plus the controller/mailer→view channel their bodies feed.
+    /// Handed to the views half through `Analyzer::view_seeds`.
+    ///
+    /// `dirty`, when present, names the classes whose bodies this pass
+    /// retypes — the ones whose inference moved last round and the ones
+    /// that read them, per `dirty_classes_for_retype`. Only the
+    /// `analyze_expr` calls are gated: every harvest below still walks
+    /// the whole app, so a class the fixpoint has finished with
+    /// contributes the types the last pass wrote rather than nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn type_production_bodies(
+        &mut self,
+        app: &mut App,
+        dynamic_render_ivars: &std::collections::HashSet<Symbol>,
+        existing_view_names: &std::collections::HashSet<Symbol>,
+        module_methods: &HashMap<ClassId, Vec<MethodDef>>,
+        module_includes: &HashMap<ClassId, Vec<ClassId>>,
+        parent_link_by_name: &HashMap<ClassId, Option<ClassId>>,
+        global_constants: &body::ConstScope,
+        dirty: Option<&std::collections::HashSet<ClassId>>,
+    ) {
         // Type the actual initializer trees, not only registry clones.
         // Their lexical class references become load-time dependencies
         // when a source file's nested declarations emit into separate files.
         for class in &mut app.library_classes {
+            if dirty.is_some_and(|d| !d.contains(&class.name)) {
+                continue;
+            }
             let ctx = Ctx {
                 self_ty: Some(Ty::Class { id: class.name.clone(), args: vec![] }),
                 constants: global_constants.clone(),
@@ -1851,6 +1946,13 @@ impl Analyzer {
         // into controller bodies. Dispatch reads the registry.
         let _typing_models = crate::timings::begin("typing: models");
         for model in &mut app.models {
+            // A model the round did not move feeds nothing but the
+            // registry, and the harvest at the top of the round already
+            // wrote what its (unchanged) trees say. Nothing below is a
+            // seed anyone else reads, so the whole body is skippable.
+            if dirty.is_some_and(|d| !d.contains(&model.name)) {
+                continue;
+            }
             // Seed class ivars for the body-typer. Three shapes in play:
             // 1. `@attributes` — the legacy Hash-storage access path
             //    (some transpiled patterns still use it).
@@ -1999,6 +2101,14 @@ impl Analyzer {
         // ── once per controller, with no parent inheritance.
         let _typing_controllers_a = crate::timings::begin("typing: controllers A");
         for controller in &mut app.controllers {
+            // A controller the round did not move still has to produce
+            // its metadata: Phase B resolves a dirty child's filters by
+            // walking its ancestors' entries, and the view channel is
+            // a union over every controller that feeds a template. So
+            // only the `analyze_expr` calls are gated; the harvest below
+            // reads the trees as the last pass that did walk them left
+            // them, which is the same answer a retype would produce.
+            let retype = dirty.is_none_or(|d| d.contains(&controller.name));
             // Phase 0: type the controller's `Unknown` body items so
             // in-class constants (`COMMENTS_PER_PAGE = 20`,
             // `TOTP_SESSION_TIMEOUT = (60 * 15)`, etc.) get
@@ -2022,9 +2132,11 @@ impl Analyzer {
                 constants: global_constants.clone(),
                 annotate_self_dispatch: false, in_view: false, class_side: false,
             };
-            for item in controller.body.iter_mut() {
-                if let ControllerBodyItem::Unknown { expr, .. } = item {
-                    self.body_typer().analyze_expr(expr, &const_ctx);
+            if retype {
+                for item in controller.body.iter_mut() {
+                    if let ControllerBodyItem::Unknown { expr, .. } = item {
+                        self.body_typer().analyze_expr(expr, &const_ctx);
+                    }
                 }
             }
             // Own constants layered over the global registry — a same-named
@@ -2063,39 +2175,45 @@ impl Analyzer {
             // rows and seed nothing.
             let ctrl_id = controller.name.clone();
             let spliced_from = app.concern_spliced_actions.get(&ctrl_id).cloned();
-            for action in controller.actions_mut() {
-                // A concern method spliced into this controller carries
-                // its call-site observations under the MODULE's key
-                // (`fold_concern_param_sites`), whichever includer the
-                // sites were in.
-                let origin = spliced_from.as_ref().and_then(|m| m.get(&action.name));
-                let mctx = self.seed_action_params(
-                    &ctx,
-                    &ctrl_id,
-                    origin,
-                    &action.name,
-                    &action.params,
-                    &action.kw_params,
-                    action.block_param.as_ref(),
-                );
-                self.body_typer().analyze_expr(&mut action.body, &mctx);
+            if retype {
+                for action in controller.actions_mut() {
+                    // A concern method spliced into this controller carries
+                    // its call-site observations under the MODULE's key
+                    // (`fold_concern_param_sites`), whichever includer the
+                    // sites were in.
+                    let origin = spliced_from.as_ref().and_then(|m| m.get(&action.name));
+                    let mctx = self.seed_action_params(
+                        &ctx,
+                        &ctrl_id,
+                        origin,
+                        &action.name,
+                        &action.params,
+                        &action.kw_params,
+                        action.block_param.as_ref(),
+                    );
+                    self.body_typer().analyze_expr(&mut action.body, &mctx);
+                }
             }
 
             // The class-side methods (`def self.x`, `class << self`),
             // typed with `self` the class itself. Nothing reads their
             // ivars into a view; typing them is what resolves their own
             // bodies and their harvested return types.
-            for method in controller.body.iter_mut().filter_map(|item| match item {
-                ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } => Some(method),
-                _ => None,
-            }) {
-                for p in &mut method.params {
-                    if let Some(default) = &mut p.default {
-                        self.body_typer().analyze_expr(default, &ctx);
+            if retype {
+                for method in controller.body.iter_mut().filter_map(|item| match item {
+                    ControllerBodyItem::ClassMethod { method, configuration_slot: None, .. } => {
+                        Some(method)
                     }
+                    _ => None,
+                }) {
+                    for p in &mut method.params {
+                        if let Some(default) = &mut p.default {
+                            self.body_typer().analyze_expr(default, &ctx);
+                        }
+                    }
+                    let mctx = self.seed_method_params(&ctx, &ctrl_id, method);
+                    self.body_typer().analyze_expr(&mut method.body, &mctx);
                 }
-                let mctx = self.seed_method_params(&ctx, &ctrl_id, method);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
             }
 
             // Snapshot each action's ivar bindings (this controller's
@@ -2171,25 +2289,52 @@ impl Analyzer {
                     }
                 }
             }
-            for module_id in &mixed_in {
-                let Some(methods) = module_methods.get(module_id) else { continue };
-                for method in methods {
-                    if action_bindings.contains_key(&method.name) {
-                        continue;
+            if retype {
+                for module_id in &mixed_in {
+                    let Some(methods) = module_methods.get(module_id) else { continue };
+                    for method in methods {
+                        if action_bindings.contains_key(&method.name) {
+                            continue;
+                        }
+                        let mut body = method.body.clone();
+                        self.body_typer().analyze_expr(&mut body, &ctx);
+                        let mut ivars = HashMap::new();
+                        extract_ivar_assignments(&body, &mut ivars);
+                        if !ivars.is_empty() {
+                            action_bindings.insert(method.name.clone(), ivars);
+                        }
+                        // Unconditional, unlike `action_bindings` above: a
+                        // concern method with no DIRECT write of its own
+                        // (`authorize`) still needs its typed body on hand
+                        // as a resolution target for
+                        // `collect_transitive_filter_ivars`.
+                        action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
                     }
-                    let mut body = method.body.clone();
-                    self.body_typer().analyze_expr(&mut body, &ctx);
-                    let mut ivars = HashMap::new();
-                    extract_ivar_assignments(&body, &mut ivars);
-                    if !ivars.is_empty() {
-                        action_bindings.insert(method.name.clone(), ivars);
+                }
+                self.controller_action_meta_cache.insert(
+                    controller.name.clone(),
+                    (action_bindings.clone(), action_bodies.clone()),
+                );
+            } else if let Some((cached_bindings, cached_bodies)) =
+                self.controller_action_meta_cache.get(&controller.name)
+            {
+                for module_id in &mixed_in {
+                    let Some(methods) = module_methods.get(module_id) else { continue };
+                    for method in methods {
+                        if action_bindings.contains_key(&method.name) {
+                            continue;
+                        }
+                        if let Some(ivars) = cached_bindings.get(&method.name) {
+                            if !ivars.is_empty() {
+                                action_bindings.insert(method.name.clone(), ivars.clone());
+                            }
+                        }
+                        if let Some(body) = cached_bodies.get(&method.name) {
+                            action_bodies
+                                .entry(method.name.clone())
+                                .or_insert_with(|| body.clone());
+                        }
                     }
-                    // Unconditional, unlike `action_bindings` above: a
-                    // concern method with no DIRECT write of its own
-                    // (`authorize`) still needs its typed body on hand
-                    // as a resolution target for
-                    // `collect_transitive_filter_ivars`.
-                    action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
                 }
             }
 
@@ -2257,6 +2402,10 @@ impl Analyzer {
         for controller in &mut app.controllers {
             let ctrl_name = controller.name.clone();
             let Some(meta) = meta_by_name.get(&ctrl_name) else { continue };
+            // Same gate as Phase A, for the same reason: the chained
+            // tables, the resolution record and the view channel are
+            // this pass's output whether or not the bodies moved.
+            let retype = dirty.is_none_or(|d| d.contains(&ctrl_name));
 
             // Walk the parent chain to collect ancestor metadata,
             // using the pre-built `parent_link_by_name` map (built
@@ -2489,7 +2638,7 @@ impl Analyzer {
                 // base seed plus any before_action-specific overlay. Every
                 // method (routed action or private helper) is re-analyzed
                 // so cross-method ivar reads resolve.
-                if !controller_wide.is_empty() || !chained_filters.is_empty() {
+                if retype && (!controller_wide.is_empty() || !chained_filters.is_empty()) {
                     for action in controller.actions_mut() {
                         let mut seed = controller_wide.clone();
                         // Overlay the action's precise before_action seed:
@@ -2934,6 +3083,13 @@ impl Analyzer {
             }
         }
 
+        // The union of every includer's ivar environment, per concern.
+        // Derived here because `controller_ivar_env` is only complete
+        // now, and derived ONCE because both readers below — Phase B′
+        // and the library-class loop — want the same answer and neither
+        // writes `controller_ivar_env` again.
+        let concern_ivar_env = concern_ivar_env_of(app, &controller_ivar_env, module_includes);
+
         // ── Phase B′: re-type the concern methods spliced into each
         // ── includer, against the CONCERN's ivar environment.
         //
@@ -2958,11 +3114,12 @@ impl Analyzer {
         // only names the includer lacks are filled from the concern.
         if !app.concern_spliced_actions.is_empty() {
             let _typing_concerns = crate::timings::begin("typing: concern splice");
-            let concern_env =
-                concern_ivar_env_of(app, &controller_ivar_env, &module_includes);
             let origins = app.concern_spliced_actions.clone();
             for controller in &mut app.controllers {
                 let Some(by_method) = origins.get(&controller.name) else { continue };
+                if dirty.is_some_and(|d| !d.contains(&controller.name)) {
+                    continue;
+                }
                 let own_env = controller_ivar_env.get(&controller.name).cloned()
                     .unwrap_or_default();
                 let self_ty = Ty::Class { id: controller.name.clone(), args: vec![] };
@@ -2975,7 +3132,7 @@ impl Analyzer {
                     global_constants.with_own(extract_controller_const_assignments(&controller.body));
                 for action in controller.actions_mut() {
                     let Some(module) = by_method.get(&action.name) else { continue };
-                    let Some(from_concern) = concern_env.get(module) else { continue };
+                    let Some(from_concern) = concern_ivar_env.get(module) else { continue };
                     let mut seed = own_env.clone();
                     let mut filled = false;
                     for (k, v) in from_concern {
@@ -3061,9 +3218,6 @@ impl Analyzer {
                 .collect()
         };
 
-        let concern_ivar_env =
-            concern_ivar_env_of(app, &controller_ivar_env, &module_includes);
-
         // A `CurrentAttributes` ivar is written from OUTSIDE the class,
         // through the class-level forwarder `ingest::current_attributes`
         // synthesizes (`Current.session = session`). The syntactic
@@ -3077,9 +3231,20 @@ impl Analyzer {
         // Survey the app for those writes and let their VALUE types be
         // the seed. This is evidence, not convention: the type is
         // whatever the app actually assigns.
+        //
+        // The survey is a whole-app walk, so it is scoped to the
+        // classes the loop below will actually read it for. Narrowed
+        // dirty sets already include every `current_attribute_classes`
+        // entry (see `dirty_retype`); mailers stay surveyed either way
+        // because their ivar harvest feeds views.
         let current_attribute_writes: HashMap<ClassId, HashMap<Symbol, Ty>> = {
-            let targets: std::collections::HashSet<&ClassId> =
-                app.current_attribute_classes.iter().collect();
+            let targets: std::collections::HashSet<&ClassId> = app
+                .current_attribute_classes
+                .iter()
+                .filter(|id| {
+                    dirty.is_none_or(|d| d.contains(id)) || mailer_names.contains(id)
+                })
+                .collect();
             let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
             if !targets.is_empty() {
                 let mut collect = |body: &crate::expr::Expr| {
@@ -3117,6 +3282,27 @@ impl Analyzer {
         // the fixpoint re-runs this with refined types) into one row
         // per mailer, union per key across sites.
         let mailer_with_params = harvest_mailer_with_params(app, &mailer_names);
+        // `.with` rows advance from (possibly retyped) callers without
+        // marking the mailer dirty via the caller-closure. Force body
+        // retype when the params row moved so `@x = params[:x]` ivars
+        // in ViewSeeds stay aligned with template `params`.
+        let params_sym = Symbol::from("params");
+        let mailers_needing_retype: std::collections::HashSet<ClassId> = mailer_names
+            .iter()
+            .filter_map(|m| {
+                let row = mailer_with_params.get(m)?;
+                let new_ty = Ty::Record { row: row.clone() };
+                let old = self
+                    .classes
+                    .get(m)
+                    .and_then(|c| c.instance_methods.get(&params_sym));
+                if old == Some(&new_ty) {
+                    None
+                } else {
+                    Some(m.clone())
+                }
+            })
+            .collect();
         let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::new();
 
         let _typing_library = crate::timings::begin("typing: library");
@@ -3126,7 +3312,17 @@ impl Analyzer {
                     .entry(lc.name.clone())
                     .or_default()
                     .instance_methods
-                    .insert(Symbol::from("params"), Ty::Record { row: row.clone() });
+                    .insert(params_sym.clone(), Ty::Record { row: row.clone() });
+            }
+            // Same gate as the controller loops, with one thing it still
+            // owes the views half: a MAILER's ivar harvest seeds its
+            // template, so the `flow_ivars` walk below runs for one even
+            // when its bodies are left alone.
+            let lc_name = lc.name.clone();
+            let retype = dirty.is_none_or(|d| d.contains(&lc_name))
+                || mailers_needing_retype.contains(&lc_name);
+            if !retype && !mailer_names.contains(&lc_name) {
+                continue;
             }
             let self_id = if lc.is_module {
                 sole_includer.get(&lc.name).cloned().unwrap_or_else(|| lc.name.clone())
@@ -3141,28 +3337,29 @@ impl Analyzer {
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
             };
 
-            for initializer in &mut lc.class_ivar_initializers {
-                self.body_typer().analyze_expr(initializer, &class_ctx);
-            }
-            for (_, value) in &mut lc.constants {
-                if self.data_factories.contains_key(&value.span) {
-                    self.body_typer().analyze_expr(value, &class_ctx);
+            if retype {
+                for initializer in &mut lc.class_ivar_initializers {
+                    self.body_typer().analyze_expr(initializer, &class_ctx);
                 }
-            }
-            let lc_name = lc.name.clone();
-            for method in &mut lc.methods {
-                // A default is an expression of the class body too, and
-                // its type is half of what an optional parameter IS:
-                // `for_user = Current.user` is a User whenever the
-                // caller leaves it out. Typed here so `seed_method_params`
-                // and the stamped signature can fold it in.
-                for p in &mut method.params {
-                    if let Some(default) = &mut p.default {
-                        self.body_typer().analyze_expr(default, &class_ctx);
+                for (_, value) in &mut lc.constants {
+                    if self.data_factories.contains_key(&value.span) {
+                        self.body_typer().analyze_expr(value, &class_ctx);
                     }
                 }
-                let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                for method in &mut lc.methods {
+                    // A default is an expression of the class body too, and
+                    // its type is half of what an optional parameter IS:
+                    // `for_user = Current.user` is a User whenever the
+                    // caller leaves it out. Typed here so `seed_method_params`
+                    // and the stamped signature can fold it in.
+                    for p in &mut method.params {
+                        if let Some(default) = &mut p.default {
+                            self.body_typer().analyze_expr(default, &class_ctx);
+                        }
+                    }
+                    let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
+                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                }
             }
 
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
@@ -3248,7 +3445,7 @@ impl Analyzer {
             }
 
             let initialized = ivars_initialized_by(lc.methods.iter());
-            if !flow_ivars.is_empty() {
+            if retype && !flow_ivars.is_empty() {
                 let mut reseeded: HashMap<Symbol, Ty> = HashMap::new();
                 for (name, ty) in flow_ivars {
                     // Nil-widening is right for a class whose ivars are
@@ -3287,9 +3484,34 @@ impl Analyzer {
         }
         drop(_typing_library);
 
-        if !type_views_and_tests {
-            return;
-        }
+        // Hand the channel to the views half. Every production pass
+        // refreshes it, so the pass that stamps templates reads the
+        // seeds of the bodies as they converged — not of the bodies a
+        // round that is still moving happened to leave behind.
+        self.view_seeds = Some(ViewSeeds {
+            action_ivars_by_view,
+            layout_ivars_by_view,
+            content_partial_ivars,
+            mailer_params_by_view,
+            view_feeders,
+            controller_resolutions,
+        });
+    }
+
+    /// The views half: templates, partials, the original test scopes
+    /// and `db/seeds.rb`. Seeds come out of the channel the production
+    /// half harvested rather than from a fresh walk of the controller
+    /// bodies, which is the whole point — by the time templates are
+    /// stamped those bodies have converged.
+    fn type_views_and_tests(&mut self, app: &mut App, global_constants: &body::ConstScope) {
+        let ViewSeeds {
+            action_ivars_by_view,
+            layout_ivars_by_view,
+            content_partial_ivars,
+            mailer_params_by_view,
+            mut view_feeders,
+            controller_resolutions,
+        } = self.view_seeds.take().expect("view seeds after production");
 
         // Partial-locals channel: we need action/top-level views analyzed first
         // so their expression types are known at each `render` call site. We
@@ -3786,6 +4008,19 @@ impl Analyzer {
         }
     }
 
+    fn capture_dirty_hints(&self) -> DirtyHints {
+        let mut block_value = HashMap::with_capacity(self.classes.len());
+        for (id, cls) in &self.classes {
+            if !cls.block_value_methods.is_empty() {
+                block_value.insert(id.clone(), cls.block_value_methods.clone());
+            }
+        }
+        DirtyHints {
+            sig: self.capture_inference_sig(),
+            block_value,
+        }
+    }
+
     fn inference_matches(&self, prev: &InferenceSig) -> bool {
         if self.classes.len() != prev.instance.len() || self.inferred_params != prev.params {
             return false;
@@ -3801,6 +4036,97 @@ impl Analyzer {
             }
         }
         true
+    }
+
+    /// Block-value verdicts stay on [`DirtyHints`], not [`InferenceSig`],
+    /// so convergence fingerprinting cannot accidentally absorb them.
+    /// The fixpoint still waits on them: a missing prior entry matches
+    /// only an empty current set.
+    fn block_value_matches(&self, prev: &DirtyHints) -> bool {
+        for (id, cls) in &self.classes {
+            match prev.block_value.get(id) {
+                Some(methods) if methods == &cls.block_value_methods => {}
+                None if cls.block_value_methods.is_empty() => {}
+                _ => return false,
+            }
+        }
+        for id in prev.block_value.keys() {
+            if !self.classes.contains_key(id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The classes a retype round actually has to walk: `None` for
+    /// "walk everything", `Some(set)` for the change frontier the
+    /// harvest just produced, closed over everything that reads it.
+    ///
+    /// What makes the narrowing sound is that the body typer is a
+    /// function of (body, registry, seeds). A class whose own registry
+    /// entry and param row did not move, and which calls nothing that
+    /// moved, retypes to exactly what it already says — so the pass
+    /// can skip its `analyze_expr` and still harvest the same types
+    /// out of its trees. The frontier is therefore closed over:
+    ///
+    /// * **inheritance and inclusion**, because a class answers its
+    ///   parent's and its modules' methods as its own (only the module
+    ///   side is folded into the registry) and a subclass controller
+    ///   SEEDS its actions from its ancestors' harvested bindings; and
+    /// * **the reverse call graph**, because a caller reads a callee's
+    ///   return. One hop of readers is enough: the registry only moves
+    ///   at harvest time, so a reader's own callers see no new answer
+    ///   until the next round harvests this one.
+    ///
+    /// Campfire's rounds move 191 → 89 → 44 → 29 → 13 → 2 classes, and
+    /// the tail is the Opengraph/Current/Nokogiri chain — a full retype
+    /// per link.
+    fn dirty_classes_for_retype(
+        &self,
+        app: &App,
+        prev: &DirtyHints,
+    ) -> Option<std::collections::HashSet<ClassId>> {
+        dirty_classes_for_retype(
+            app,
+            &self.classes,
+            &self.inferred_params,
+            &self.callers_by_target,
+            prev,
+            |id, parent| self.lexical_parent(id, parent),
+        )
+    }
+
+    /// Record which classes call `(receiver class, method)`, for the
+    /// slice of sites one method body contributed. Keyed by the class
+    /// the receiver typed to rather than by the class whose `def` the
+    /// call reaches, because that is the key the walk in
+    /// `dirty_classes_for_retype` can resolve: dispatch chases the
+    /// receiver's own chain, and so does the frontier.
+    ///
+    /// View and seed trees walked under [`UnifyScope::WithViews`] still
+    /// contribute param observations, but their sends have no owning
+    /// production [`ClassId`] and are intentionally not passed here —
+    /// absorb dirty narrowing is production-class only today.
+    ///
+    /// A class's calls to ITSELF are dropped: when its own answer
+    /// moves it is already dirty, and implicit-self sends are most of
+    /// what a body contains.
+    fn record_callers(
+        &mut self,
+        caller: &ClassId,
+        sites: &[(ClassId, Symbol, Vec<Ty>, SiteKeywords)],
+    ) {
+        let mut seen: std::collections::HashSet<(&ClassId, &Symbol)> =
+            std::collections::HashSet::new();
+        for (class_id, method, _, _) in sites {
+            if class_id == caller || !seen.insert((class_id, method)) {
+                continue;
+            }
+            self.callers_by_target
+                .entry((class_id.clone(), method.clone()))
+                .or_default()
+                .insert(caller.clone());
+        }
     }
 
     /// Walk every model + library_class method body and write its
@@ -4519,27 +4845,43 @@ impl Analyzer {
         let mut sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)> = Vec::new();
         let params_by_method = Self::param_shapes(app);
         let defined = Self::defined_methods(app);
+        // Class-level reverse call graph, rebuilt alongside the param
+        // table off the same walk — each `collect_send_sites` call
+        // already knows the class it is walking, so the edges are the
+        // slice of sites it appended. See `record_callers`.
+        self.callers_by_target.clear();
         for model in &app.models {
             for method in model.methods() {
+                let from = sites.len();
                 self.collect_send_sites(&method.body, Some(&model.name), helpers, &mut sites);
+                self.record_callers(&model.name, &sites[from..]);
             }
             for scope_item in model.scopes() {
+                let from = sites.len();
                 self.collect_send_sites(&scope_item.body, Some(&model.name), helpers, &mut sites);
+                self.record_callers(&model.name, &sites[from..]);
             }
         }
         for lc in &app.library_classes {
             for method in &lc.methods {
+                let from = sites.len();
                 self.collect_send_sites(&method.body, Some(&lc.name), helpers, &mut sites);
+                self.record_callers(&lc.name, &sites[from..]);
             }
         }
         for controller in &app.controllers {
             for action in controller.actions() {
+                let from = sites.len();
                 self.collect_send_sites(&action.body, Some(&controller.name), helpers, &mut sites);
+                self.record_callers(&controller.name, &sites[from..]);
             }
             for method in controller.class_methods() {
+                let from = sites.len();
                 self.collect_send_sites(&method.body, Some(&controller.name), helpers, &mut sites);
+                self.record_callers(&controller.name, &sites[from..]);
             }
         }
+        // WithViews: param sites only — no `record_callers` (no ClassId).
         if matches!(scope, UnifyScope::WithViews) {
             for view in &app.views {
                 self.collect_send_sites(&view.body, None, helpers, &mut sites);
@@ -5077,17 +5419,26 @@ impl Analyzer {
                 // defining helper module is what lets helper params
                 // unify from their template call sites.
                 let mut via_helper_index = false;
-                let recv_class = match recv {
-                    Some(r) => match r.ty.as_ref() {
-                        Some(Ty::Class { id, .. }) => Some(id.clone()),
-                        _ => None,
-                    },
-                    None => self_class.cloned().or_else(|| {
-                        via_helper_index = true;
-                        helpers.get(method).cloned()
-                    }),
+                // Expand Relation / Union / Array elem the way dispatch
+                // chases — the reverse call graph now decides retype,
+                // so Class-only receivers would leave callers of
+                // `records.first.foo` off the frontier.
+                let recv_classes: Vec<ClassId> = match recv {
+                    Some(r) => r
+                        .ty
+                        .as_ref()
+                        .map(class_ids_for_call_receiver)
+                        .unwrap_or_default(),
+                    None => self_class
+                        .cloned()
+                        .or_else(|| {
+                            via_helper_index = true;
+                            helpers.get(method).cloned()
+                        })
+                        .into_iter()
+                        .collect(),
                 };
-                if let Some(class_id) = recv_class {
+                if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
                         .map(|a| {
@@ -5162,17 +5513,19 @@ impl Analyzer {
                     // still answered `Array[untyped]` to every caller.
                     // Only a CONSTANT receiver: an instance answering
                     // `new` is some other method entirely.
-                    if method.as_str() == "new"
-                        && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Const { .. }))
-                    {
-                        out.push((
-                            class_id.clone(),
-                            Symbol::from("initialize"),
-                            arg_tys.clone(),
-                            kw_tys.clone(),
-                        ));
+                    let record_initialize = method.as_str() == "new"
+                        && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Const { .. }));
+                    for class_id in recv_classes {
+                        if record_initialize {
+                            out.push((
+                                class_id.clone(),
+                                Symbol::from("initialize"),
+                                arg_tys.clone(),
+                                kw_tys.clone(),
+                            ));
+                        }
+                        out.push((class_id, method.clone(), arg_tys.clone(), kw_tys.clone()));
                     }
-                    out.push((class_id, method.clone(), arg_tys, kw_tys));
                 }
                 if let Some(r) = recv { self.collect_send_sites(r, self_class, helpers, out); }
                 for a in args { self.collect_send_sites(a, self_class, helpers, out); }
@@ -6372,6 +6725,29 @@ fn association_builder_members(assoc: &crate::dialect::Association) -> Vec<(Symb
     ]
 }
 
+/// Class ids a typed call receiver contributes to param unify and the
+/// reverse call graph. Mirrors the receivers dispatch actually chases:
+/// bare Class, Relation→model, Array elem, and Class arms of a Union.
+fn class_ids_for_call_receiver(ty: &Ty) -> Vec<ClassId> {
+    match ty {
+        Ty::Class { id, .. } => vec![id.clone()],
+        Ty::Relation { of } => vec![of.clone()],
+        Ty::Array { elem } => class_ids_for_call_receiver(elem),
+        Ty::Union { variants } => {
+            let mut out = Vec::new();
+            for v in variants {
+                for id in class_ids_for_call_receiver(v) {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The model-side twin of [`controller_includes`]: modules a model mixes
 /// in via top-level `include X` calls (round-tripped as `Unknown` body
 /// items).
@@ -6405,6 +6781,7 @@ pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     }
     out
 }
+
 
 /// A call's trailing keyword arguments as `collect_send_sites` saw them.
 #[derive(Clone, Debug)]

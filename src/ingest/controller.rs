@@ -14,7 +14,7 @@ use crate::{ClassId, Symbol};
 use super::expr::ingest_expr;
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
-    find_all_classes_with_nesting, find_first_class, flatten_statements, source_has_blank_line,
+    find_all_classes_with_nesting, flatten_statements, source_has_blank_line,
     symbol_list_style, symbol_list_value, symbol_value,
 };
 use super::{IngestError, IngestResult};
@@ -43,8 +43,11 @@ pub(super) fn ingest_controller_with_nesting(
     // is the class whose name ends in `Controller`, not the first
     // class in the file; picking the first ingests an empty error
     // class as the controller and drops every real action (so its
-    // view ivars never resolve). Fall back to the first class when no
-    // name matches the convention.
+    // view ivars never resolve). When no name matches, fall back to
+    // the first class that descends from a controller base — so
+    // nested `Admin::Base < ApplicationController` keeps filter
+    // ancestry, while concern-nested `T::Struct` VOs and other plain
+    // objects return `None` for the library/concern path.
     let all_classes = find_all_classes_with_nesting(&root);
     let chosen_idx = all_classes.iter().position(|(_, _, c)| {
         class_name_path(c)
@@ -93,25 +96,19 @@ pub(super) fn ingest_controller_with_nesting(
             let (s, n, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
             (s, n, Some(c))
         }
-        None => match all_classes.into_iter().next() {
-            Some((s, n, c)) => (s, n, Some(c)),
-            None => (Vec::new(), Vec::new(), find_first_class(&root)),
-        },
+        None => {
+            match all_classes
+                .into_iter()
+                .find(|(_, _, c)| descends_from_controller(c))
+            {
+                Some((s, n, c)) => (s, n, Some(c)),
+                None => (Vec::new(), Vec::new(), None),
+            }
+        }
     };
     let Some(class) = class else {
         return Ok(None);
     };
-    // No `*Controller` class in the file: the first class is only a
-    // controller when it descends from one. `app/controllers/` also
-    // holds plain objects (a redirection strategy, a request-options
-    // struct nested in a concern, a `FormBuilder` subclass), and
-    // ingesting those as controllers types their `initialize` as an
-    // action: no default-value typing, no ivar environment, so every
-    // ivar they assign reads `has no known type`. `Ok(None)` hands the
-    // file to the library-class path, where a class is a class.
-    if chosen_idx.is_none() && !descends_from_controller(&class) {
-        return Ok(None);
-    }
 
     let mut name_path = scope;
     name_path.extend(class_name_path(&class).ok_or_else(|| IngestError::Unsupported {
