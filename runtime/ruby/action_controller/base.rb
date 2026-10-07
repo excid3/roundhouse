@@ -343,6 +343,9 @@ module ActionController
     # dispatcher assigns it; a `url_for` options hash reads it to fill a
     # segment the hash leaves out, as Rails recalls it.
     attr_accessor :path_parameters
+    # Rails' `action_name`, as a String. The synthesized `process_action`
+    # sets it only in a controller that reads it.
+    attr_reader   :action_name
     attr_reader   :status, :body, :location, :content_type
     # Cache-Control, split into two TYPED readers rather than Rails'
     # one mixed Hash. Rails' `response.cache_control` is
@@ -357,6 +360,7 @@ module ActionController
     def initialize
       @params  = {}
       @path_parameters = {}
+      @action_name = ""
       @session = ActionDispatch::Session.new
       @flash   = ActionDispatch::Flash.new
       @status  = 200
@@ -422,6 +426,15 @@ module ActionController
     def assign_http_session(value)
       @session = value
       @session
+    end
+
+    # The dispatcher's seat for `action_name`. The router gives
+    # `process_action` a Symbol, and Rails gives the action a String,
+    # so this method converts it. A framework-only name avoids the
+    # `name=` collision that `assign_http_session` describes.
+    def assign_action_name(name)
+      @action_name = name.to_s
+      @action_name
     end
 
     # Subclasses override. Error message omits `self.class.name` —
@@ -613,20 +626,25 @@ module ActionController
       return true unless ActionController.forgery_flag
       verb = @request_method.to_s
       return true if verb == "" || verb == "GET" || verb == "HEAD"
-      # Nil-then-`to_s` — not `session[:k].to_s` alone. Strict-target
-      # emit turns a missing key into JS `undefined`, and `String(undefined)`
-      # is `"undefined"`, which would fail closed even when no secret was
-      # minted. The ternary keeps an absent secret as `""` so the stub
-      # `csrf_token_valid?` can check-none; ruby-family
-      # `AuthenticityToken.valid?` still fails closed on empty.
-      raw = session[:_csrf_token]
-      expected = raw.nil? ? "" : raw.to_s
-      # `.fetch(k, "")` — not bare `params[k]`. Crystal Hash#[] raises
-      # KeyError on a missing key; Python's `.get(k)` returns None and
-      # `.to_s` then AttributeErrors. Cross-target nil-safe read.
+      # Nil-then-`to_s` lives in `csrf_session_secret` so the secret is
+      # a typed String at this call (Rust `csrf_token_valid?` takes
+      # `&str`; an Untyped local would pass an owned String).
       token = params.fetch("authenticity_token", "")
-      return true if ActionController.csrf_token_valid?(token.to_s, expected)
-      ActionController.csrf_token_valid?(csrf_header_token, expected)
+      return true if ActionController.csrf_token_valid?(token.to_s, csrf_session_secret)
+      ActionController.csrf_token_valid?(csrf_header_token, csrf_session_secret)
+    end
+
+    # Nil-then-`to_s` — not `session[:k].to_s` alone. Strict-target
+    # emit turns a missing key into JS `undefined`, and `String(undefined)`
+    # is `"undefined"`, which would fail closed even when no secret was
+    # minted. The early `nil?` keeps an absent secret as `""` so the
+    # stub `csrf_token_valid?` can check-none; ruby-family
+    # `AuthenticityToken.valid?` still fails closed on empty.
+    # `nil?` / `to_s` stay on the index send: Rust Session `#[]` is
+    # `Option<String>`.
+    def csrf_session_secret
+      return "" if session[:_csrf_token].nil?
+      session[:_csrf_token].to_s
     end
 
     def csrf_header_token

@@ -82,6 +82,7 @@ pub(super) fn external_class_method_param_tys(class: &str, method: &str) -> Opti
         ("ActionController", "location_host") => Some(vec![Ty::Str]),
         ("ActionController", "find_substr") => Some(vec![Ty::Str, Ty::Str]),
         ("ActionController", "find_last") => Some(vec![Ty::Str, Ty::Str]),
+        ("ActionController", "csrf_token_valid?") => Some(vec![Ty::Str, Ty::Str]),
         _ => None,
     }
 }

@@ -315,8 +315,16 @@ fn route_table_literals(app: &App, indent: &str) -> (String, String) {
     let route_lines: Vec<String> = routes
         .iter()
         .map(|r| {
+            // The sixth constructor argument carries the shared router's
+            // digit constraints. Keep the existing req_format default and
+            // the unconstrained four-argument spelling unchanged.
+            let integer_params = if r.int_params.is_empty() {
+                String::new()
+            } else {
+                format!(", nil, {:?}", r.int_params.join(" "))
+            };
             format!(
-                "{indent}Route({:?}, {:?}, {:?}, {:?}),",
+                "{indent}Route({:?}, {:?}, {:?}, {:?}{integer_params}),",
                 verb(&r.method),
                 r.path,
                 r.controller.0.as_str(),

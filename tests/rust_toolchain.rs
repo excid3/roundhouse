@@ -235,3 +235,50 @@ async fn articles_index_is_two_queries_not_n_plus_one() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+/// A block filter and a lambda filter read `action_name`. The dispatcher
+/// then calls `assign_action_name`, and the emitted Rust controller must
+/// have that method and the `action_name` reader.
+#[test]
+#[ignore]
+fn filters_that_read_action_name_compile() {
+    let app_dir = scratch_dir("action-name-app");
+    if app_dir.exists() {
+        std::fs::remove_dir_all(&app_dir).expect("clean app copy");
+    }
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(roundhouse::fixtures::real_blog())
+        .arg(&app_dir)
+        .status()
+        .expect("copy real-blog");
+    assert!(copied.success(), "copy real-blog");
+    let controller = app_dir.join("app/controllers/articles_controller.rb");
+    let source = std::fs::read_to_string(&controller).expect("read controller");
+    let edited = source.replacen(
+        "  before_action :set_article,",
+        "  before_action { @bare = action_name }\n  \
+           before_action -> { @own = self.action_name }\n  \
+           before_action :set_article,",
+        1,
+    );
+    assert_ne!(source, edited, "the filter edit applies");
+    std::fs::write(&controller, edited).expect("write controller");
+
+    let scratch = scratch_dir("action-name");
+    generate_project(&app_dir, &scratch);
+    let output = Command::new("cargo")
+        .arg("check")
+        .arg("--quiet")
+        .current_dir(&scratch)
+        .output()
+        .expect("run cargo check");
+
+    assert!(
+        output.status.success(),
+        "cargo check failed on the emitted project at {}:\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
