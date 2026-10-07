@@ -43,7 +43,7 @@ module ActiveSupport
     date.iso8601
   end
 
-  # Date calendar helpers (`current_date`, `date_*`) live only in
+  # Date calendar helpers (`date_*`) live only in
   # `active_support_date_parsing.rb` (date-gated package). Do not
   # redefine them here — CRuby boot re-injects that file after overlay.
 

@@ -942,8 +942,7 @@ impl<'a> BodyTyper<'a> {
                 // The Date calendar intrinsics `time_calendar` lowers to.
                 if id.0.as_str() == "ActiveSupport" {
                     match method.as_str() {
-                        "current_date"
-                        | "date_current"
+                        "date_current"
                         | "date_from_civil"
                         | "date_days_since"
                         | "date_days_ago"

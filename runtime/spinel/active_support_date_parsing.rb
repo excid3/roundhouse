@@ -34,12 +34,6 @@ module ActiveSupport
     Date.new(now.year, now.month, now.day)
   end
 
-  # Zero-arg form used by Spinel Date-column tests and direct callsites;
-  # lowering prefers `date_current(now)` so the clock is explicit.
-  def self.current_date
-    date_current(ActiveSupport.now)
-  end
-
   def self.date_at_midnight(d)
     local_time(d.year, d.month, d.day, 0, 0, 0, 0)
   end

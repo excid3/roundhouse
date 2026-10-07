@@ -92,7 +92,7 @@ raise ActiveSupport.date_end_of_month(Date.new(2024, 2, 14)).iso8601 unless Acti
 raise ActiveSupport.date_end_of_month(Date.new(2023, 12, 1)).iso8601 unless ActiveSupport.date_end_of_month(Date.new(2023, 12, 1)).iso8601 == "2023-12-31"
 raise ActiveSupport.date_beginning_of_day(Date.new(2024, 2, 14)).strftime("%Y-%m-%d %H:%M:%S") unless ActiveSupport.date_beginning_of_day(Date.new(2024, 2, 14)).strftime("%Y-%m-%d %H:%M:%S") == "2024-02-14 00:00:00"
 raise ActiveSupport.date_end_of_day(Date.new(2024, 2, 14)).strftime("%Y-%m-%d %H:%M:%S") unless ActiveSupport.date_end_of_day(Date.new(2024, 2, 14)).strftime("%Y-%m-%d %H:%M:%S") == "2024-02-14 23:59:59"
-raise ActiveSupport.current_date.inspect unless ActiveSupport.current_date.year >= 2024
+raise ActiveSupport.date_current(ActiveSupport.now).inspect unless ActiveSupport.date_current(ActiveSupport.now).year >= 2024
 puts "Spinel Date column contract passed"
 "#);
     run.assert_passes();
