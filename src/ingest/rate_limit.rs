@@ -50,7 +50,12 @@
 //! `head :too_many_requests`, actionpack's own defaults. `controller_path`
 //! is the class name underscored, which is what Rails derives too.
 //!
-//! WHAT IS LEFT. `store:`, a `by:` or `with:` that is not a lambda, or a
+//! `scope:` written as a symbol or string is that cache-key segment; written
+//! as `OtherController.controller_path` it folds to that controller's path,
+//! derived from the constant's name the way this controller's own path is.
+//!
+//! WHAT IS LEFT. `store:`, a `by:` or `with:` that is not a lambda, a
+//! `scope:` that is any other call, or a
 //! `name:` that is not a literal — the macro stays
 //! where it was and the survey names it, which is the contract for a
 //! class-body macro roundhouse cannot expand (`report_unrecognized_controller_macros`).
@@ -274,17 +279,30 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
 }
 
 /// `scope:` as the cache-key segment Rails joins. A symbol or string is
-/// that segment; a call (`SessionsController.controller_path`) is
-/// evaluated, which is how one controller names another's path.
+/// that segment. `SessionsController.controller_path`, which is how one
+/// controller names another's path to share its budget, folds to that
+/// path at ingest: `controller_path` is the class name underscored with
+/// `Controller` dropped, the same derivation `collect_limits` makes for
+/// this controller, so the segment is known without running anything.
 fn scope_source(v: &Expr) -> Option<String> {
     // A symbol or string is captured when the macro expands, which is
-    // when Rails evaluates `scope:`. A call is not: Rails would run it
-    // once at declaration, and a nil or false result would fall back to
-    // this controller's path. Emitting the call inside the request would
-    // re-run it, and a nil result would collapse unrelated budgets.
+    // when Rails evaluates `scope:`. Any other call is not: Rails would
+    // run it once at declaration, and a nil or false result would fall
+    // back to this controller's path. Emitting the call inside the
+    // request would re-run it, and a nil result would collapse unrelated
+    // budgets.
     match &*v.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(ruby_string_literal(value.as_str())),
         ExprNode::Lit { value: Literal::Str { value } } => Some(ruby_string_literal(value)),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if method.as_str() == "controller_path" && args.is_empty() =>
+        {
+            let ExprNode::Const { path } = &*recv.node else { return None };
+            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            // Only a controller class derives its path from its name.
+            let stem = name.strip_suffix("Controller")?;
+            Some(ruby_string_literal(&crate::naming::underscore(stem)))
+        }
         _ => None,
     }
 }
@@ -420,15 +438,33 @@ mod tests {
         // Two controllers count against one budget when the second names
         // the first's path, a symbol, or a string. Rails joins
         // `scope || controller_path` between `rate-limit` and `name`.
-        // A call is evaluated by Rails when the filter is declared.
-        // Expanding it into the request method would re-run it, and a
-        // nil result would collapse this controller's budget into
-        // another. The macro stays in place.
+        // `OtherController.controller_path` is the class name underscored
+        // without `Controller`, which the constant's name already says,
+        // so it folds to that path at ingest.
         let shared = controller(
             "class Users::Sessions::OtpsController < ApplicationController\n  \
              rate_limit to: 10, within: 3.minutes, only: :create, scope: Users::SessionsController.controller_path\nend\n",
         );
-        assert!(collect_limits(&shared).is_empty());
+        let shared = &collect_limits(&shared)[0].1;
+        assert_eq!(
+            shared.key_src,
+            "\"rate-limit:\" + (\"users/sessions\").to_s + \":\" + (request.remote_ip).to_s"
+        );
+
+        // Any other call is evaluated by Rails when the filter is
+        // declared. Expanding it into the request method would re-run
+        // it, and a nil result would collapse this controller's budget
+        // into another. The macro stays in place.
+        let computed = controller(
+            "class Users::Sessions::OtpsController < ApplicationController\n  \
+             rate_limit to: 10, within: 3.minutes, only: :create, scope: current_budget\nend\n",
+        );
+        assert!(collect_limits(&computed).is_empty());
+        let not_a_controller = controller(
+            "class Users::Sessions::OtpsController < ApplicationController\n  \
+             rate_limit to: 10, within: 3.minutes, only: :create, scope: Users::Budget.controller_path\nend\n",
+        );
+        assert!(collect_limits(&not_a_controller).is_empty());
 
         let symbol = controller(
             "class Api::TokensController < ApplicationController\n  \

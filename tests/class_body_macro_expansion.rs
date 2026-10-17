@@ -1466,6 +1466,42 @@ end
     assert!(!shape.contains("RateLimiter"), "the key lambda was inlined without its parameter:\n{shape}");
 }
 
+#[test]
+fn a_rate_limit_scope_naming_another_controllers_path_folds_to_that_path() {
+    // Jumpstart's OTP controller shares the sessions controller's budget:
+    // `scope: Users::SessionsController.controller_path`. Rails derives
+    // `controller_path` from the class name, so the segment is
+    // `users/sessions` without evaluating anything at request time.
+    let otps = br#"class Users::Sessions::OtpsController < ApplicationController
+  rate_limit to: 10, within: 3.minutes, only: :create, scope: Users::SessionsController.controller_path
+  def create
+    head :ok
+  end
+end
+"#;
+    let sessions = br#"class Users::SessionsController < ApplicationController
+  rate_limit to: 10, within: 3.minutes, only: :create
+  def create
+    head :ok
+  end
+end
+"#;
+    let tree = std::collections::HashMap::from([
+        (std::path::PathBuf::from("app/controllers/users/sessions/otps_controller.rb"), otps.to_vec()),
+        (std::path::PathBuf::from("app/controllers/users/sessions_controller.rb"), sessions.to_vec()),
+        (std::path::PathBuf::from("config/routes.rb"), b"Rails.application.routes.draw do\n  post \"login\" => \"users/sessions#create\"\n  post \"login/otp\" => \"users/sessions/otps#create\"\nend\n".to_vec()),
+    ]);
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let otps = app.controllers.iter().find(|c| c.name.0.as_str() == "Users::Sessions::OtpsController").expect("controller");
+    assert!(
+        otps.body.iter().any(|item| matches!(item, ControllerBodyItem::Filter { .. })),
+        "the macro should expand to a filter"
+    );
+    let shape = format!("{otps:?}");
+    assert!(shape.contains("users/sessions"), "the scope folds to the named controller's path:\n{shape}");
+    assert!(!shape.contains("users/sessions/otps:"), "the host's own path is replaced, not prefixed:\n{shape}");
+}
+
 /// The `setup_mobile!` filters `call` expands to, as their `only` lists.
 /// `has_mobile_version(*actions)` peels its options with
 /// `extract_options!` and reads `options[:if]`.
