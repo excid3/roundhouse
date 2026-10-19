@@ -107,6 +107,13 @@ pub const INHERITED_VISIBILITY: u64 = 1 << 20;
 /// `iso8601`; the other targets keep their time-format mapping.
 pub const GROUNDED_TIME_FORMAT: u64 = 1 << 21;
 
+/// `self.class::NAME`, kept as the bare path `NAME`: Ruby reads it on
+/// the class `self` has at runtime, which `BodyTyper::self_class_constant`
+/// resolves. Placed, the path is qualified and this bit gives way to
+/// [`GENERATED_CONST_REF`]; still bare after typing, the read is the
+/// runtime lookup `lower::self_class_constant` spells.
+pub const SELF_CLASS_CONST_REF: u64 = 1 << 22;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0

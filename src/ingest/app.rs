@@ -3464,6 +3464,10 @@ fn qualify_lexical_consts(
     use crate::expr::ExprNode;
 
     expr.node.for_each_child_mut(&mut |child| qualify_lexical_consts(child, owner, consts));
+    // `self.class::NAME` never meant the concern's own `NAME`.
+    if expr.decisions & crate::expr::SELF_CLASS_CONST_REF != 0 {
+        return;
+    }
     if let ExprNode::Const { path } = &mut *expr.node {
         if let [segment] = &path[..] {
             if consts.contains(segment) {

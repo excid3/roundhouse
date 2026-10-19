@@ -571,6 +571,26 @@ pub(super) fn constant_path_segments(p: &ruby_prism::ConstantPathNode<'_>) -> Ve
         .collect()
 }
 
+/// `self.class::A::B` — a constant path rooted at a `self.class` call:
+/// the segments after it. Ruby resolves the read on the runtime class
+/// of `self`, which no lexical walk can name; the analyzer does, from
+/// the `SELF_CLASS_CONST_REF` bit the expression carries. A path rooted
+/// at any other expression (`klass::X`, `self::X`) is not this shape.
+pub(super) fn self_class_constant_path(p: &ruby_prism::ConstantPathNode<'_>) -> Option<Vec<Symbol>> {
+    let mut root = p.parent()?;
+    while let Some(inner) = root.as_constant_path_node() {
+        root = inner.parent()?;
+    }
+    let call = root.as_call_node()?;
+    let self_class = constant_id_str(&call.name()) == "class"
+        && call.receiver().is_some_and(|r| r.as_self_node().is_some())
+        && call.arguments().is_none()
+        && call.block().is_none();
+    // The segments after the root, which `constant_path_segments` leaves
+    // bare when the root is not a constant.
+    self_class.then(|| constant_path_segments(p))
+}
+
 /// The leading `::` belongs to the innermost path node in `::A::B`.
 pub(super) fn constant_path_is_rooted(p: &ruby_prism::ConstantPathNode<'_>) -> bool {
     match p.parent() {

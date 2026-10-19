@@ -460,6 +460,7 @@ fn rewrite_hook_node(
     super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
+    super::self_class_constant::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
     super::boolean_cast::rewrite_node(e);
     super::values_at_splat::rewrite_node(e);
@@ -509,6 +510,7 @@ fn rewrite_view_node(
     super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
+    super::self_class_constant::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
     super::boolean_cast::rewrite_node(e);
     if !skip_exclude {

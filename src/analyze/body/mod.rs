@@ -894,6 +894,9 @@ impl<'a> BodyTyper<'a> {
 
     fn compute(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
         let expr_span = expr.span;
+        if expr.decisions & crate::expr::SELF_CLASS_CONST_REF != 0 {
+            return self.self_class_constant(expr, ctx);
+        }
         match &mut *expr.node {
             ExprNode::Lit { value } => lit_ty(value),
 
@@ -939,6 +942,19 @@ impl<'a> BodyTyper<'a> {
                     } else {
                         unknown()
                     }
+                };
+                // The value declared at exactly this qualified name, for
+                // a read Rubydex has no answer for: a view, generated IR,
+                // or a path a pass qualified after indexing
+                // (`self_class_constant`).
+                let value_at_full_name = |path: &[Symbol]| -> Option<Ty> {
+                    if path.len() < 2 {
+                        return None;
+                    }
+                    let name = written_class_id(path);
+                    self.typed_constants
+                        .and_then(|values| values.get(&declaration_id_from_lookup_name(name.0.as_str())))
+                        .cloned()
                 };
                 let indexed_source = !expr_span.is_synthetic()
                     && self
@@ -1019,7 +1035,7 @@ impl<'a> BodyTyper<'a> {
                     None if indexed_source
                         && (generated || expr.decisions & crate::expr::UNINDEXED_SCOPE_CONST_REF != 0) =>
                     {
-                        exact_modeled_class(path)
+                        value_at_full_name(path).unwrap_or_else(|| exact_modeled_class(path))
                     }
                     None if indexed_source => unknown(),
                     // Views and generated IR have no Rubydex answer. A
@@ -1035,12 +1051,7 @@ impl<'a> BodyTyper<'a> {
                                 })
                                 .or_else(|| ctx.constants.get_global(name).cloned())
                         } else {
-                            let name = written_class_id(path);
-                            self.typed_constants
-                                .and_then(|values| {
-                                    values.get(&declaration_id_from_lookup_name(name.0.as_str()))
-                                })
-                                .cloned()
+                            value_at_full_name(path)
                         };
                         // Otherwise retain the written class path, but
                         // never guess another class by its suffix.
@@ -3098,6 +3109,127 @@ pub(super) fn lit_ty(lit: &Literal) -> Ty {
 }
 
 /// The class path as written, joined with `::`.
+impl BodyTyper<'_> {
+    /// `self.class::NAME` (`SELF_CLASS_CONST_REF`): the constant on the
+    /// class `self` has at this site, found as `const_get` finds it —
+    /// the class's own, the modules it includes, then up the parents.
+    /// Never the lexical scope: a concern's method names the
+    /// INCLUDER's constant. A module's own view (a concern several
+    /// classes include; see `sole_includer_of_modules`) asks each
+    /// includer.
+    ///
+    /// Three outcomes. One declaring class: the path is qualified to
+    /// it and the bit gives way to `GENERATED_CONST_REF`, so every
+    /// emitter prints one constant and a later pass reads the value by
+    /// that name. Includers that each declare their own: the union of
+    /// their values, the read left as written for
+    /// `lower::self_class_constant` to spell as the runtime lookup it
+    /// is, and a `lower_residue` warning for the strict targets'
+    /// ledger. No declaring class at all (`ApplicationClient`'s
+    /// `BASE_URI`, which only its subclasses define): unsupported, as
+    /// written.
+    fn self_class_constant(&self, expr: &mut Expr, ctx: &Ctx) -> Ty {
+        expr.diagnostic = None;
+        let ExprNode::Const { path } = &mut *expr.node else { return unknown() };
+        let written = written_class_id(path);
+        let unsupported = |expr: &mut Expr| {
+            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                target: None,
+                construct: Symbol::from("constant"),
+                detail: format!("self.class::{}", written.0.as_str()),
+            });
+            unknown()
+        };
+        let Some(Ty::Class { id: self_class, .. }) = &ctx.self_ty else {
+            return unsupported(expr);
+        };
+        let is_module = self.classes().get(self_class).is_some_and(|info| info.is_module);
+        let owners = if is_module { self.includers_of(self_class) } else { vec![self_class.clone()] };
+        let own = (!is_module).then_some(&ctx.constants);
+        let mut answers = Vec::with_capacity(owners.len());
+        for owner in &owners {
+            match self.constant_on_class(owner, &written, own) {
+                Some(answer) => answers.push(answer),
+                None => return unsupported(expr),
+            }
+        }
+        let Some((declaring, _)) = answers.first() else { return unsupported(expr) };
+        if answers.iter().any(|(other, _)| other != declaring) {
+            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::LowerResidue {
+                pass: Symbol::from("self_class_constant"),
+                construct: Symbol::from(format!("self.class::{}", written.0.as_str())),
+                reason: Symbol::from("each includer of the module declares its own"),
+            });
+            return answers.into_iter().map(|(_, ty)| ty).reduce(union_of).unwrap_or_else(unknown);
+        }
+        qualify_resolved_path(path, declaring);
+        expr.decisions = (expr.decisions & !crate::expr::SELF_CLASS_CONST_REF) | crate::expr::GENERATED_CONST_REF;
+        answers.into_iter().next().map(|(_, ty)| ty).unwrap_or_else(unknown)
+    }
+
+    /// `written` looked up on `class` the way `const_get` finds it: the
+    /// class and the modules it includes, then its parent's, up the
+    /// chain (bounded, as `lookup` walks it). `own` is the site class's
+    /// extracted constant scope, consulted for a bare name on that class
+    /// alone. The declaration found comes back by its full name.
+    fn constant_on_class(
+        &self,
+        class: &ClassId,
+        written: &ClassId,
+        own: Option<&ConstScope>,
+    ) -> Option<(ClassId, Ty)> {
+        let leaf = (!written.0.as_str().contains("::")).then_some(&written.0);
+        let mut own = own;
+        let mut current = Some(class);
+        for _ in 0..32 {
+            let class = current?;
+            let info = self.classes().get(class);
+            let candidates = std::iter::once(class).chain(info.into_iter().flat_map(|i| i.includes.iter()));
+            for candidate in candidates {
+                let declaration =
+                    ClassId(Symbol::from(format!("{}::{}", candidate.0.as_str(), written.0.as_str())));
+                let value = self
+                    .typed_constants
+                    .and_then(|values| values.get(&declaration_id_from_lookup_name(declaration.0.as_str())))
+                    .or_else(|| {
+                        let leaf = leaf?;
+                        own.take()
+                            .and_then(|scope| scope.get_own(leaf))
+                            .or_else(|| self.classes().get(candidate)?.constants.get(leaf))
+                    })
+                    .cloned();
+                if let Some(ty) = value {
+                    return Some((declaration, ty));
+                }
+            }
+            current = info.and_then(|i| i.parent.as_ref());
+        }
+        None
+    }
+
+    /// The classes whose instances run `module`'s methods: every class
+    /// that includes it, through modules that include it in turn.
+    fn includers_of(&self, module: &ClassId) -> Vec<ClassId> {
+        let mut pending = vec![module.clone()];
+        let mut seen: std::collections::HashSet<ClassId> = Default::default();
+        let mut out = Vec::new();
+        while let Some(target) = pending.pop() {
+            for (id, info) in self.classes() {
+                if !info.includes.contains(&target) || !seen.insert(id.clone()) {
+                    continue;
+                }
+                if info.is_module {
+                    pending.push(id.clone());
+                } else {
+                    out.push(id.clone());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+}
+
 fn written_class_id(path: &[Symbol]) -> ClassId {
     if let [name] = path {
         return ClassId(name.clone());

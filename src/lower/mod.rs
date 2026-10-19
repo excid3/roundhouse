@@ -187,6 +187,7 @@ pub mod column_ops;
 pub mod generated_write_guard;
 pub mod signed_id;
 pub(crate) mod secure_token;
+pub(crate) mod self_class_constant;
 pub mod rich_text;
 pub mod known_super_forwarding;
 pub mod plain_text_attr;
@@ -355,6 +356,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("range_enumerable", &[]),
     ("csv_generate", &[]),
     ("presence_in", &[]),
+    ("self_class_constant", &[]),
     ("enumerable_ext", &[]),
     ("boolean_cast", &[]),
     ("values_at_splat", &[]),
@@ -844,6 +846,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("range_enumerable");
     ran!("csv_generate");
     ran!("presence_in");
+    ran!("self_class_constant");
     ran!("enumerable_ext");
     ran!("boolean_cast");
     ran!("values_at_splat");

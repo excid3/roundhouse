@@ -836,6 +836,13 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_constant_path_node().is_some() => {
             let p = n.as_constant_path_node().unwrap();
+            // `self.class::ROLES` has no lexical owner to segment: the
+            // bit tells the typer to resolve it on the site's `self`.
+            if let Some(path) = super::util::self_class_constant_path(&p) {
+                let mut expr = Expr::new(span, ExprNode::Const { path });
+                expr.decisions |= crate::expr::SELF_CLASS_CONST_REF;
+                return Ok(expr);
+            }
             // `::StatsD` names the top-level constant from anywhere; an empty
             // first segment keeps that through passes that qualify a bare
             // name into its enclosing namespace (`qualify_lexical_consts`

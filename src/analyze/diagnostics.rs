@@ -122,6 +122,17 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
                 message: format!("no known method `{}` on {}", method.as_str(), render_ty(recv_ty)),
             });
         }
+        // A runtime lookup the typer left in place (`self.class::X` a
+        // module reads under several includers) goes on the residue
+        // ledger the strict targets read, as it would from any body.
+        if let Some(kind @ DiagnosticKind::LowerResidue { .. }) = &expr.diagnostic {
+            out.push(Diagnostic {
+                span: expr.span,
+                severity: Diagnostic::default_severity(kind),
+                kind: kind.clone(),
+                message: Diagnostic::stub_text(kind),
+            });
+        }
         expr.node.for_each_child(&mut |child| collect_constants(child, out));
     }
     // Declaration DSL arguments are handled by the class-body ledger;

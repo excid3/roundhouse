@@ -108,6 +108,14 @@ registries:
   Views and generated expressions have no Rubydex answer. A bare name
   there uses the typed local scope. A qualified name uses only the
   value declared at that full name.
+  `self.class::NAME` has no lexical answer: Ruby looks it up on the
+  class `self` has at runtime. Ingest marks the read
+  (`SELF_CLASS_CONST_REF`) and the typer resolves it on the site's
+  `self` class as `const_get` would, qualifying the path to the
+  declaring class. A concern several classes include is asked per
+  includer: one declaring class qualifies; several leave the runtime
+  lookup in place (`lower::self_class_constant`) as a `lower_residue`
+  warning. A name no class in the chain declares stays unsupported.
 - The analyzer reports an error for an unresolved source constant.
   This includes executable library methods, parameter defaults and
   constant initializers; an unresolved constant cannot check clean and
