@@ -4407,6 +4407,7 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "has_secure_token",
     "has_secure_password",
     "has_json",
+    "store_accessor",
     "typed_store",
     "broadcasts_to",
     "delegate",

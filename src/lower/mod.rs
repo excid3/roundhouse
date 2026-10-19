@@ -134,6 +134,7 @@ pub mod in_predicate;
 pub mod including;
 pub mod enum_symbols;
 pub mod has_json;
+pub(crate) mod store_accessor;
 pub mod serialize;
 pub mod column_slot;
 pub mod assoc_loaded;

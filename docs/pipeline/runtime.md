@@ -789,6 +789,20 @@ runtime, where an `is_a?(Hash)` over an untyped value resolves — is what
 tells the two shapes apart. The lowering cannot, and that is why the
 test lives in the runtime rather than in generated per-model code.
 
+**`store_accessor` is the untyped sibling.** `store_accessor
+:preferences, :theme` over a `json`/`jsonb` column (or a `serialize …,
+coder: JSON` one) expands the same way — one reader/writer pair per key
+flattened onto the model — but the declaration names keys, not types, so
+each pair is registered and emitted GRADUAL, and the calls land on the
+column's existing storage seam (`JsonColumn.read_key` /
+`JsonColumn.write_key`, one key picked out of `load`/`dump`) rather
+than on `SchematizedJson`. A declaration over any other column (Rails'
+`store` with its YAML coder), with a splatted key list, or with an option
+beyond a literal `prefix:`/`suffix:` stays unclaimed and keeps warning;
+the per-key ActiveModel::Dirty methods Rails adds are not synthesized.
+A concern's `included do` carries the declaration to each includer as
+it does `has_json`.
+
 **Where it is still visible.** `attributes` keeps the serialized text
 (the STORAGE view, as `created_at` reads back through it as raw ISO
 text), and an integer key gets no `?` predicate, because Rails'

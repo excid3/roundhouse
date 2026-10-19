@@ -4418,9 +4418,15 @@ fn store_reader_names(
         for (name, _ty) in crate::lower::model_to_library::attribute_api_decls(&m.body) {
             set.insert(name.as_str().to_string());
         }
+        let table = app.schema.tables.get(&m.table.0);
+        // `store_accessor` keys live inside a JSON column the indexer
+        // answers as a whole; the form field wants the one key.
+        for name in crate::lower::store_accessor::store_accessor_names(m, table) {
+            set.insert(name.as_str().to_string());
+        }
         // A real column of the same name wins — the indexer knows it,
         // and the indexer is what applies the column's cast.
-        if let Some(table) = app.schema.tables.get(&m.table.0) {
+        if let Some(table) = table {
             for col in &table.columns {
                 set.remove(col.name.as_str());
             }

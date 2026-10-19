@@ -521,6 +521,13 @@ impl Analyzer {
             // `has_json` schema keys — same situation, JSON instead of
             // YAML, plus the one type the declaration erases.
             register_has_json(&model.body, &mut cls.instance_methods);
+            // `store_accessor` keys — named, untyped slots of a JSON
+            // column; `lower::store_accessor` synthesizes the pair.
+            register_store_accessor(
+                model,
+                app.schema.tables.get(&model.table.0),
+                &mut cls.instance_methods,
+            );
             // `serialize :col, coder: …` — the column reads back as the
             // coder's object, not the storage text.
             register_serialized_columns(&model.body, &mut cls.instance_methods);
@@ -8986,6 +8993,25 @@ fn register_has_json(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, Ty>) 
                 .entry(Symbol::from(format!("{}=", flat.as_str())))
                 .or_insert(ty);
         }
+    }
+}
+
+/// Register the reader/writer pair `lower::store_accessor` synthesizes
+/// for each `store_accessor :col, :key` over a JSON column. Both are
+/// GRADUAL: the declaration names keys, not types, and a key holds
+/// whatever JSON was written — the same honest type the whole column's
+/// reader already has. `or_insert`, so a real column or a user method
+/// of the same name keeps its own type.
+fn register_store_accessor(
+    model: &Model,
+    table: Option<&crate::schema::Table>,
+    methods: &mut HashMap<Symbol, Ty>,
+) {
+    for name in crate::lower::store_accessor::store_accessor_names(model, table) {
+        methods
+            .entry(Symbol::from(format!("{}=", name.as_str())))
+            .or_insert(Ty::Untyped);
+        methods.entry(name).or_insert(Ty::Untyped);
     }
 }
 

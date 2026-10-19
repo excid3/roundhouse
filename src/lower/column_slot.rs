@@ -15,7 +15,7 @@
 use crate::dialect::Model;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
-use crate::schema::{Column, ColumnType};
+use crate::schema::{Column, ColumnType, Table};
 use crate::span::Span;
 use crate::ty::Ty;
 
@@ -325,7 +325,17 @@ fn active_support(span: Span, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
     )
 }
 
-fn json_column(span: Span, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
+/// By name: does `model` read column `name` through `JsonColumn`? The
+/// question `lower::store_accessor` asks before claiming a declaration,
+/// answered by the same classification the column's own reader uses.
+pub(crate) fn is_json_column(model: &Model, table: Option<&Table>, name: &Symbol) -> bool {
+    table
+        .and_then(|t| t.columns.iter().find(|c| c.name == *name))
+        .is_some_and(|col| ColumnSlot::classify(col, model).is_json())
+}
+
+/// `JsonColumn.<method>(args)`, typed `ty`.
+pub(crate) fn json_column(span: Span, method: &str, args: Vec<Expr>, ty: Ty) -> Expr {
     with_ty(
         Expr::new(
             span,

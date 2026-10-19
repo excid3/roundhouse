@@ -860,6 +860,21 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         {
             continue;
         }
+        // `store_accessor :col, :key, …` over a JSON column — claimed
+        // by lower::store_accessor's shared method synthesis. A
+        // declaration over a non-JSON column, with a splatted key list
+        // or an option it cannot read is NOT claimed and keeps warning;
+        // `store_accessor_decls` is the one place that decides.
+        if name == "store_accessor"
+            && crate::lower::store_accessor::store_accessor_decls(
+                model,
+                schema.tables.get(&model.table.0),
+            )
+            .iter()
+            .any(|d| d.span == expr.span)
+        {
+            continue;
+        }
         // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
         // claimed by lower::serialize; accessors go through JsonColumn.
         if name == "serialize"
@@ -1063,6 +1078,11 @@ pub fn writable_field_set(
         for attr in attrs {
             writable.insert(attr.name);
         }
+    }
+    // `store_accessor :col, :key` synthesizes `key=`, so `permit(:key)`
+    // is assignable even though `key` is not a column on this table.
+    for name in crate::lower::store_accessor::store_accessor_names(model, Some(table)) {
+        writable.insert(name);
     }
     if let Some(attr) = crate::lower::secure_password::secure_password_attr(&model.body) {
         writable.insert(Symbol::from(format!("{}_confirmation", attr.as_str())));
@@ -1316,6 +1336,14 @@ fn build_methods_with_finder_inputs(
     // accessor triple per declared key, over the serialized column.
     // Same ordering rationale.
     crate::lower::has_json::push_has_json_methods(&mut methods, model);
+    // `store_accessor` keys — the untyped sibling: one reader/writer
+    // pair per key over the serialized JSON column, through the
+    // column's own `JsonColumn` seam. Same ordering rationale.
+    crate::lower::store_accessor::push_store_accessor_methods(
+        &mut methods,
+        model,
+        schema.tables.get(&model.table.0),
+    );
     // has_secure_password — authenticate + plaintext accessors,
     // against the bcrypt gem's own surface (`BCrypt::Password`). Same
     // ordering rationale.
