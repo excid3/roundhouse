@@ -224,6 +224,11 @@ pub struct ClassInfo {
     /// answers its Array, an unclassified one is assumed to still be a
     /// query and re-wraps as the relation.
     pub materializing_scopes: std::collections::HashSet<Symbol>,
+    /// Scopes proven to answer one ungrouped row set (a readable builder
+    /// chain with no `group`, through siblings proven the same), so an
+    /// extreme over one is a single value. Positive: an unreadable or
+    /// grouping body is absent and the extreme typing declines it.
+    pub scalar_scopes: std::collections::HashSet<Symbol>,
     /// Methods whose every return is the value of the BLOCK they were
     /// called with — `yield` on each path, or the block handed on to
     /// another such method (lobsters' `get_from_cache(opts, &)`, which

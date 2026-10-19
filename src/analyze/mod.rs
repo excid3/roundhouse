@@ -612,6 +612,31 @@ impl Analyzer {
                     cls.materializing_scopes.insert(scope.name.clone());
                 }
             }
+            // A scope answers one row set — so an extreme over it is a
+            // single value — when its chain never groups and every
+            // sibling scope it passes through answers one too. To a
+            // fixpoint, like the materializing seeds above, so a scope
+            // declared before the sibling it chains through is proven
+            // all the same; an unreadable body is never proven.
+            let chains: Vec<(&Symbol, RelationChain)> = model
+                .scopes()
+                .filter_map(|s| relation_chain(&s.body, &model.name, &scope_names).map(|c| (&s.name, c)))
+                .collect();
+            loop {
+                let mut changed = false;
+                for (name, chain) in &chains {
+                    if !chain.grouped
+                        && !cls.scalar_scopes.contains(*name)
+                        && chain.scope_hops.iter().all(|hop| cls.scalar_scopes.contains(hop))
+                    {
+                        cls.scalar_scopes.insert((*name).clone());
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
             // `has_rich_text :body` declares two preload scopes beside
             // the association (`with_rich_text_body`,
             // `with_rich_text_body_and_embeds`). They are relation-
@@ -6639,16 +6664,37 @@ fn body_tail_yields_relation(
     model_id: &ClassId,
     scope_names: &std::collections::HashSet<Symbol>,
 ) -> bool {
+    relation_chain(body, model_id, scope_names).is_some()
+}
+
+/// What [`body_tail_yields_relation`]'s walk learns on the way down,
+/// for the callers that need more than yes/no: whether any hop
+/// `group`s (an extreme over the chain is then a per-group Hash, not
+/// one value), and the same-model scopes the chain passes through
+/// (whose own chains decide what this one answers).
+struct RelationChain {
+    grouped: bool,
+    scope_hops: Vec<Symbol>,
+}
+
+/// The walk behind [`body_tail_yields_relation`]; `None` is that
+/// predicate's `false`.
+fn relation_chain(
+    body: &Expr,
+    model_id: &ClassId,
+    scope_names: &std::collections::HashSet<Symbol>,
+) -> Option<RelationChain> {
+    let mut facts = RelationChain { grouped: false, scope_hops: Vec::new() };
     let mut e = match &*body.node {
         ExprNode::Seq { exprs } => match exprs.last() {
             Some(last) => last,
-            None => return false,
+            None => return None,
         },
         _ => body,
     };
     loop {
         let ExprNode::Send { recv, method, block, .. } = &*e.node else {
-            return false;
+            return None;
         };
         // Name-only builders, including aliases (`where!`, `order!`,
         // `left_joins`, `without`). A Relation builder that is also an
@@ -6663,15 +6709,19 @@ fn body_tail_yields_relation(
         let is_scope = scope_names.contains(method);
         let is_root_call = matches!(method.as_str(), "all" | "unscoped");
         if !(is_builder || is_scope || is_root_call) {
-            return false;
+            return None;
         }
         if block.is_some() {
-            return false;
+            return None;
+        }
+        facts.grouped |= method.as_str() == "group";
+        if is_scope {
+            facts.scope_hops.push(method.clone());
         }
         match recv {
-            None => return true,
+            None => return Some(facts),
             Some(r) => match &*r.node {
-                ExprNode::SelfRef => return true,
+                ExprNode::SelfRef => return Some(facts),
                 // A constant root must name THIS model — a body tail
                 // rooted at another model returns a relation over
                 // that model, which `Relation { of: Self }` would
@@ -6679,7 +6729,7 @@ fn body_tail_yields_relation(
                 // instance-method `UserMethodReturns` family's
                 // territory, not this seed's.)
                 ExprNode::Const { path } => {
-                    return path.last().is_some_and(|last| {
+                    let names_model = path.last().is_some_and(|last| {
                         model_id
                             .0
                             .as_str()
@@ -6687,6 +6737,7 @@ fn body_tail_yields_relation(
                             .next()
                             .is_some_and(|own| own == last.as_str())
                     });
+                    return names_model.then_some(facts);
                 }
                 _ => e = r,
             },
@@ -6731,6 +6782,7 @@ pub(crate) fn scope_return_seed(
     }
     Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: model_id.clone(), args: vec![].into() }) }
 }
+
 
 /// Did [`scope_return_seed`] actually classify this body, or fall back?
 ///

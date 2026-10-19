@@ -329,21 +329,28 @@ impl<'a> BodyTyper<'a> {
             {
                 true
             }
-            ExprNode::Const { path } => {
-                path.iter().map(|part| part.as_str()).collect::<Vec<_>>().join("::")
-                    == model.0.as_str()
-            }
+            ExprNode::Const { path } => super::written_class_id(path) == *model,
             ExprNode::Send { method, .. } if method.as_str() == "group" => false,
-            ExprNode::Send { recv: Some(recv), method, block: None, .. }
+            // A builder hop, a relation root, or a scope of this model
+            // proven to answer one row set (`scalar_scopes`), over a
+            // receiver that is itself such a chain; `self` and the
+            // implicit self of a class method root it, as the model
+            // constant does.
+            ExprNode::Send { recv, method, block: None, .. }
                 if method.as_str() == "all"
                     || method.as_str() == "unscoped"
                     || crate::catalog::lookup(
                         method.as_str(),
                         crate::catalog::ReceiverContext::Relation,
                     )
-                    .is_some_and(|entry| entry.chain == crate::catalog::ChainKind::Builder) =>
+                    .is_some_and(|entry| entry.chain == crate::catalog::ChainKind::Builder)
+                    || self.classes().get(model).is_some_and(|cls| cls.scalar_scopes.contains(method)) =>
             {
-                self.direct_relation_chain(recv, model, instance_self)
+                match recv {
+                    None => true,
+                    Some(owner) if matches!(&*owner.node, ExprNode::SelfRef) => true,
+                    Some(owner) => self.direct_relation_chain(owner, model, instance_self),
+                }
             }
             _ => false,
         }
