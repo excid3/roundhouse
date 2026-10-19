@@ -355,6 +355,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("range_enumerable", &[]),
     ("csv_generate", &[]),
     ("presence_in", &[]),
+    ("generate_unique_secure_token", &[]),
     ("enumerable_ext", &[]),
     ("boolean_cast", &[]),
     ("values_at_splat", &[]),
@@ -844,6 +845,7 @@ pub fn apply_post_analyze_lowerings(
     ran!("range_enumerable");
     ran!("csv_generate");
     ran!("presence_in");
+    ran!("generate_unique_secure_token");
     ran!("enumerable_ext");
     ran!("boolean_cast");
     ran!("values_at_splat");

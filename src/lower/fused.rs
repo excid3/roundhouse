@@ -31,15 +31,16 @@ pub fn apply_fused_independent_rewrites(app: &mut App) {
     let skip_in = super::in_predicate::app_defines_in(app);
     let skip_including = super::including::app_defines_including(app);
     let skip_full_messages = super::errors_full_messages::app_defines_full_messages(app);
+    let skip_unique_token = super::secure_token::app_defines_generate_unique_secure_token(app);
 
     super::for_each_hook_body(app, &mut |body| {
         walk_postorder(body, &mut |e| {
-            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, skip_full_messages, skip_unique_token);
         });
     });
     for view in &mut app.views {
         walk_postorder(&mut view.body, &mut |e| {
-            rewrite_view_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_view_node(e, skip_exclude, skip_in, skip_including, skip_full_messages, skip_unique_token);
         });
     }
     super::for_each_test_body(app, &mut |body| {
@@ -447,6 +448,7 @@ fn rewrite_hook_node(
     skip_in: bool,
     skip_including: bool,
     skip_full_messages: bool,
+    skip_unique_token: bool,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -460,6 +462,9 @@ fn rewrite_hook_node(
     super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
+    if !skip_unique_token {
+        super::secure_token::rewrite_node(e);
+    }
     super::enumerable_ext::rewrite_node(e);
     super::boolean_cast::rewrite_node(e);
     super::values_at_splat::rewrite_node(e);
@@ -497,6 +502,7 @@ fn rewrite_view_node(
     skip_in: bool,
     skip_including: bool,
     skip_full_messages: bool,
+    skip_unique_token: bool,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -509,6 +515,9 @@ fn rewrite_view_node(
     super::range_enumerable::rewrite_node(e);
     super::csv_generate::rewrite_node(e);
     super::presence_in::rewrite_node(e);
+    if !skip_unique_token {
+        super::secure_token::rewrite_node(e);
+    }
     super::enumerable_ext::rewrite_node(e);
     super::boolean_cast::rewrite_node(e);
     if !skip_exclude {

@@ -148,6 +148,8 @@ module ActiveRecord
     # one. The body-typer treats `raise` as divergent; it doesn't
     # contradict the declared return type.
     def self.table_name: () -> String
+
+    def self.generate_unique_secure_token: (Integer length) -> String
     def self._table_sql: () -> String
     def self.primary_key: () -> String
     def self._association_names: () -> Array[Symbol]

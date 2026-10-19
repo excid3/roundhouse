@@ -440,6 +440,16 @@ module ActiveRecord
       table_name
     end
 
+    # `Model.generate_unique_secure_token(length)` — the generator behind
+    # `has_secure_token`, public on every model. Positional where Rails
+    # takes `length:` (`lower::secure_token::rewrite_node` moves the
+    # keyword), since this file carries no keyword parameters into the
+    # strict targets. `alphanumeric` rather than Rails' `base58`, which
+    # is not core Ruby — see docs/pipeline/runtime.md.
+    def self.generate_unique_secure_token(length)
+      SecureRandom.alphanumeric(length)
+    end
+
     def self.schema_columns
       raise NotImplementedError, "#{name}.schema_columns must be overridden"
     end

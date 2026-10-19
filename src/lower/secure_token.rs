@@ -180,6 +180,52 @@ fn assign_token(span: Span, decl: &SecureTokenDecl) -> Expr {
     )
 }
 
+/// `Model.generate_unique_secure_token(length: n)` — Rails' public
+/// generator behind `has_secure_token` (Jumpstart's OAuth models mint
+/// client secrets and refresh tokens with it) — spelled the way the
+/// runtime's `ActiveRecord::Base.generate_unique_secure_token` takes
+/// it: one positional length. `runtime/ruby/active_record/base.rb`
+/// reaches every strict target and carries no keyword parameters, so
+/// the `length:` keyword is moved to the argument here, and the bare
+/// call is given Rails' default. Any length expression goes through —
+/// the runtime, not this pass, computes the token. A call already
+/// positional, or carrying any other option, is left as written.
+///
+/// An app that defines its own `generate_unique_secure_token` keeps
+/// its spelling (`app_defines_generate_unique_secure_token`, checked
+/// by the fused walk), the courtesy `exclude_predicate` extends.
+pub(crate) fn rewrite_node(expr: &mut Expr) {
+    let span = expr.span;
+    let ExprNode::Send { method, args, block: None, parenthesized, .. } = &mut *expr.node else {
+        return;
+    };
+    if method.as_str() != "generate_unique_secure_token" {
+        return;
+    }
+    let length = match args.as_slice() {
+        [] => Expr::new(span, ExprNode::Lit { value: Literal::Int { value: DEFAULT_LENGTH } }),
+        [options] => {
+            let ExprNode::Hash { entries, .. } = &*options.node else { return };
+            let [(key, value)] = entries.as_slice() else { return };
+            if !matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "length") {
+                return;
+            }
+            value.clone()
+        }
+        _ => return,
+    };
+    *args = vec![length];
+    *parenthesized = true;
+}
+
+/// Whether a model or library class defines `generate_unique_secure_token`
+/// itself: then the call means that method, not Rails'.
+pub(crate) fn app_defines_generate_unique_secure_token(app: &crate::app::App) -> bool {
+    let is_it = |n: &Symbol| n.as_str() == "generate_unique_secure_token";
+    app.models.iter().any(|m| m.methods().any(|method| is_it(&method.name)))
+        || app.library_classes.iter().any(|c| c.methods.iter().any(|m| is_it(&m.name)))
+}
+
 /// `self.<attr>`
 fn column_read(span: Span, attr: &Symbol) -> Expr {
     send(span, Some(Expr::new(span, ExprNode::SelfRef)), attr.as_str(), vec![])

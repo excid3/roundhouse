@@ -1670,7 +1670,10 @@ The generator is `SecureRandom.alphanumeric(<length>)`, not Rails'
 `SecureRandom.base58`: base58 is not core Ruby (it arrives with
 `active_support/core_ext/securerandom`, which the emitted app does not
 load), while `alphanumeric` is core and already carried by every target.
-Same length, different alphabet.
+Same length, different alphabet. The runtime's
+`Base.generate_unique_secure_token(length)` — Rails' public spelling of
+the same generator — uses it too; the `length:` keyword is lowered to
+that positional argument (`lower::secure_token::rewrite_node`).
 
 **Why it matters that this expands at all.** A dropped
 `has_secure_token` is not an absent method, it is a wrong column value:

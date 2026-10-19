@@ -329,6 +329,9 @@ impl Analyzer {
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("table_name"), Ty::Str);
             cls.class_methods.insert(Symbol::from("primary_key"), Ty::Str);
+            // Runtime `Base.generate_unique_secure_token(length)`; the
+            // `length:` keyword is lowered by `lower::secure_token`.
+            cls.class_methods.insert(Symbol::from("generate_unique_secure_token"), Ty::Str);
             // Arel entry points: `Model.arel_table` is an `Arel::Table`
             // (`table[:col]` → attribute → predicate node); `Model.arel`
             // (and `relation.arel`, handled in send.rs) is the underlying
